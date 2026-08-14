@@ -1,0 +1,83 @@
+# Packvium for Rust
+
+Deterministic 3D cartonization and rectangular bin packing. No unsafe code, no runtime
+dependencies beyond `serde`, exact integer geometry.
+
+> **Version 0.1.0 — early release.** The public API is not frozen; pin an exact version.
+> Read [docs/GUARANTEES.md](docs/GUARANTEES.md) before relying on a result.
+
+```toml
+[dependencies]
+packvium = "0.1"
+```
+
+## Quick start
+
+The crate's API is a JSON contract — one request in, one result out — the same contract
+every language binding built on this engine speaks:
+
+```rust
+let request = r#"{
+    "items": [
+        {"id": "book", "quantity": 4,
+         "dimensions": {"length": "210", "width": "140", "height": "30"}}
+    ],
+    "containers": [
+        {"id": "box", "inner_dimensions": {"length": "400", "width": "300", "height": "250"}}
+    ]
+}"#;
+
+let result = packvium_core::pack_json(request)?;
+```
+
+`use packvium_core::...` is correct even though the package is `packvium` in
+`Cargo.toml` — that is the crate's own internal name, kept stable across the release.
+
+```bash
+cargo run --example basic
+```
+
+## What it does
+
+- **Exact arithmetic.** Length is measured in ticks of 1/16000 mm and weight in 1/8 µg.
+  No coordinate is ever a float, so no placement decision depends on rounding.
+- **Real constraints.** Weight and payload limits, permitted rotations, keep-upright,
+  floor-only, non-stackable, top-load limits, minimum support ratio, tag incompatibility,
+  clearance and rectangular obstacles.
+- **A solver portfolio, not one algorithm.** Regular-grid, layer, extreme-point,
+  maximal-space and bounded exact search, selected by problem shape and profile.
+- **Answers you can check.** Every solution is re-validated by logic independent of the
+  search. Unplaced items come back with a reason code, not silently missing.
+- **Deterministic.** The same input and seed produce the same result, always.
+- **Multi-container and nested.** Split across containers, or pack containers into
+  containers.
+- **Extensible.** Register your own constraints, item orderings, candidate scorers,
+  container selectors or complete solvers.
+- **`#![forbid(unsafe_code)]`.** The engine itself contains no `unsafe`.
+
+## Documentation
+
+| Document | Covers |
+| --- | --- |
+| [docs/GUARANTEES.md](docs/GUARANTEES.md) | What is promised and what is not. Start here. |
+| [docs/PUBLIC-API.md](docs/PUBLIC-API.md) | Inputs, outputs and status semantics. |
+| [docs/UNITS-AND-NUMERICS.md](docs/UNITS-AND-NUMERICS.md) | Units, accepted input forms, rounding policy. |
+
+## Requirements
+
+Rust 1.88 or newer (edition 2024).
+
+## Two other ports exist
+
+The same request and result contract is implemented independently in Python and PHP, and
+all three are held to producing identical placements on a shared fixture set. If your
+stack spans languages, you can compute a packing on any of them and get the same answer.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security reports go through the process in
+[SECURITY.md](SECURITY.md), not public issues.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

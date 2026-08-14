@@ -1,0 +1,28 @@
+[package]
+name = "packvium"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Deterministic, extensible 3D cartonization and rectangular bin-packing engine"
+readme = "README.md"
+keywords = ["3d-bin-packing", "cartonization", "packaging", "container-loading"]
+categories = ["algorithms"]
+authors = ["Packvium contributors"]
+
+# The published package name is `packvium`, matching the Python and PHP packages.
+# The library keeps its internal name, `packvium_core`, so `use packvium_core::...`
+# is what every example and every downstream caller writes -- only the line that pulls
+# it into Cargo.toml (`packvium = "0.1"`) mentions the published name.
+[lib]
+name = "packvium_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+web-time = "1.1.0"
+
+[dev-dependencies]
+serde_json = "1.0.151"

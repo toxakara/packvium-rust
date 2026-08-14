@@ -1,0 +1,76 @@
+name: release
+
+# crates.io does not yet support OIDC trusted publishing the way PyPI does (see
+# SECURITY.md), so this workflow holds one long-lived secret: CARGO_REGISTRY_TOKEN,
+# scoped to this crate only and rotated on the schedule SECURITY.md describes. Everything
+# else about the release is still tag-driven and re-verified from a clean checkout before
+# anything is uploaded, and the `crates-io` environment is what turns "anyone who can push
+# a tag" into "a release a named person approved".
+#
+# Before the first run: create a crates.io API token scoped to this crate only, store it
+# as CARGO_REGISTRY_TOKEN in a GitHub environment named `crates-io` with whatever
+# reviewers the project wants.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # The tag and the packaged version must agree. Without this, `git tag v0.2.0` on a
+      # tree that still says 0.1.0 publishes 0.1.0 under a name that claims otherwise,
+      # and the mistake is only visible after it is public and immutable.
+      - name: The tag must match the version in Cargo.toml
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          built=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$tagged" != "$built" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $built" >&2
+            exit 1
+          fi
+
+      - name: The tag must have a changelog entry
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^## \[${tagged}\]" CHANGELOG.md; then
+            echo "CHANGELOG.md has no '## [${tagged}]' section for tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+      - run: cargo test
+      - run: cargo package --locked
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crate
+          path: target/package/*.crate
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      id-token: write      # build provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: crate
+          path: target/package/
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: target/package/*.crate
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
