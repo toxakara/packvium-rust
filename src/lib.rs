@@ -2,6 +2,7 @@
 #![deny(missing_debug_implementations)]
 
 mod api;
+pub mod commerce;
 mod contact_graph;
 mod deadline;
 mod error;

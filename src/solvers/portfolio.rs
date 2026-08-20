@@ -1,7 +1,7 @@
 use super::extreme::{explain_unfit, score_solution};
 use super::{
     pack_exact_one, pack_homogeneous_blocks, pack_layer_order, pack_maximal_order, pack_order,
-    try_grid,
+    try_grid, unpriceable_container,
 };
 use crate::deadline::Deadline;
 use crate::error::PackResult;
@@ -366,9 +366,14 @@ pub(crate) fn solve_portfolio_with_deadline(
         .first()
         .cloned()
         .expect("portfolio always contains at least one result");
+    // The sentinel is a search device, never an answer -- alternatives included. A
+    // runner-up whose tariff cannot price it is dropped before the slice, so the caller
+    // still receives up to top_k-1 usable packings when priceable runners exist beyond
+    // an unpriceable one ( review).
     best.alternatives = results
         .into_iter()
         .skip(1)
+        .filter(|result| unpriceable_container(&result.containers, &request.config).is_none())
         .take(request.config.top_k.saturating_sub(1))
         .collect();
     Ok(best)
@@ -502,12 +507,36 @@ fn run_one_order(
         && (request.config.profile == SolverProfile::Quality || !request.config.solvers.is_empty())
         && !deadline.expired()
         && order.iter().all(|item| item.item.group.is_none())
+        // The maximal-space walk opens the first container in a static order and never
+        // consults a tariff, so under `lowest_landed_cost` it can commit to the one
+        // container the caller cannot buy -- and its unpriceable packings were exactly
+        // what leaked the sentinel through `alternatives`. Like the lattice (
+        // precedent), it stands down for this objective; an explicit pin falls back to
+        // the money-ranked greedy below, the way `grid:fallback` does ( review).
+        && request.config.objective != "lowest_landed_cost"
     {
         results.push(pack_maximal_order(
             request,
             &order,
             constraints,
             scorers,
+            deadline,
+        ));
+    }
+    // An explicit `maximal_spaces` pin under `lowest_landed_cost` still deserves an
+    // answer: the money-ranked greedy stands in, so the pin refuses nothing a priceable
+    // container could ship. Duplicates of an `extreme_points` run dedup by signature.
+    if enabled("maximal_spaces")
+        && !request.config.solvers.is_empty()
+        && request.config.objective == "lowest_landed_cost"
+        && !deadline.expired()
+    {
+        results.push(pack_order(
+            request,
+            &order,
+            constraints,
+            scorers,
+            &format!("maximal_spaces:fallback:{name}"),
             deadline,
         ));
     }

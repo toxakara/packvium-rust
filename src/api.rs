@@ -33,6 +33,18 @@ pub fn rebalance_json(
     validate_request(&request)?;
     let result_value: Value = serde_json::from_str(result_input)?;
     let original = parse_rebalance_result(&request, &result_value)?;
+    // A packing the tariff cannot price is refused here for the same reason
+    // `pack_request_with_policy` refuses one on the way out: rebalancing it would hand
+    // back a shipment with no published price under the caller's own objective (
+    // review). Objective-gated inside the helper.
+    if let Some((container_id, grams, bound)) =
+        crate::solvers::unpriceable_container(&original.containers, &request.config)
+    {
+        return Err(PackError::InvalidInput(format!(
+            "container {container_id:?} bills at {grams} g, above its rate table's last \
+             bracket ({bound} g); the shipment has no published price"
+        )));
+    }
     let balanced = rebalance_weight(&request, &original, max_moves);
     let improved = balanced.improved();
     let mut serialized_result = original.clone();
@@ -405,6 +417,27 @@ pub fn pack_request_with_policy(
                 .join("; "),
         ));
     }
+    // The search ranks an unpriceable packing worst so that any priceable alternative
+    // beats it; reaching here means no alternative existed and the sentinel is about to
+    // be reported as a score. Refusing is the contract the request schema, the
+    // conformance validator and the other two engines already state: a billed weight past
+    // the last bracket has no published price, and quoting one anyway is the failure this
+    // objective exists to prevent.
+    if let Some((container_id, grams, bound)) =
+        crate::solvers::unpriceable_container(&result.containers, &request.config)
+    {
+        return Err(PackError::InvalidInput(format!(
+            "container {container_id:?} bills at {grams} g, above its rate table's last \
+             bracket ({bound} g); the shipment has no published price"
+        )));
+    }
+    // The same contract holds for the runner-up packings a result carries. The
+    // portfolio filters its own alternatives, but a registry-provided solver may attach
+    // ones that never passed through it, and an alternative quoting the sentinel is the
+    //  leak by another door.
+    result.alternatives.retain(|alternative| {
+        crate::solvers::unpriceable_container(&alternative.containers, &request.config).is_none()
+    });
     Ok(result)
 }
 

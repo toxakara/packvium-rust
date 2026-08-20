@@ -209,6 +209,14 @@ pub fn rebalance_weight(
                     destination_index,
                     placement_index,
                 ) {
+                    // A move that prices the destination past its tariff is not an
+                    // improvement: the sentinel must never ride out through a
+                    // rebalanced packing any more than through a packed one (
+                    // review). Objective-gated inside the helper, so every other
+                    // objective is untouched.
+                    if crate::solvers::unpriceable_container(&trial, &request.config).is_some() {
+                        continue;
+                    }
                     committed = Some((
                         trial,
                         WeightMove {

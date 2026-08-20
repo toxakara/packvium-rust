@@ -549,3 +549,20 @@ fn a_solver_error_propagates_instead_of_falling_through_to_the_portfolio() {
         "{error}"
     );
 }
+
+#[test]
+fn a_typed_landed_cost_request_without_a_tariff_is_refused_rather_than_priced() {
+    // `parse_request` refuses a `lowest_landed_cost` request whose containers carry no
+    // `rate_table`, so no JSON caller reaches the packer without one. `pack_request` is
+    // public Rust API and bypasses that admission check entirely -- a consumer assembling
+    // a `PackingRequest` by hand gets no such guarantee. Without the final priceability
+    // guard this returned a `feasible` result whose landed cost was the unpriceable
+    // sentinel, quoting a price no carrier published.
+    let mut scene = request(vec![item("a", 10)], vec![container("box", 100)]);
+    scene.config.objective = "lowest_landed_cost".into();
+    scene.config.dimensional_weight_divisor = Some(5_000);
+    assert!(scene.containers[0].rate_table.is_none());
+
+    let error = pack_request(&scene).expect_err("an untabled container cannot be priced");
+    assert!(error.to_string().contains("no published price"), "{error}");
+}

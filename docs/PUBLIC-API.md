@@ -357,6 +357,38 @@ details. A structural bound takes precedence over a deadline: an oversized item 
 `proven` even if the overall run timed out. Conversely, `time_limit`, `search_exhausted`
 and other unfinished-search outcomes can never carry `proven`.
 
+## Commercial and control-plane API
+
+Three deterministic functions over one canonical JSON document -- a carrier quote, an
+eligibility decision, and catalog version metadata. They are a separate surface from the
+packing API and add no packing-request or packing-result field; the full contract, with
+the document format, every result shape, the closed set of rejection codes, complexity
+and limitations, is [COMMERCE-API.md](COMMERCE-API.md).
+
+| Language | Entry point |
+| --- | --- |
+| Python | `packvium.commerce.quote(document, request)`, `.evaluate_policy(...)`, `.catalog_version_info(...)`, `.canonical_json(result)` |
+| PHP | `Packvium\Commerce\quote(array $document, array $request)`, `evaluatePolicy(...)`, `catalogVersionInfo(...)`, `canonicalJson(...)` |
+| Rust | `packvium_core::commerce::quote_json(&str)`, `evaluate_policy_json(&str)`, `catalog_version_info_json(&str)` |
+| JavaScript | `commerce.quote(document, request)`, `.evaluatePolicy(...)`, `.catalogVersionInfo(...)` on `@packvium/engine`; the same three, async, on `@packvium/browser` |
+| C ABI | `packvium_commerce_quote(call)`, `packvium_commerce_evaluate_policy(call)`, `packvium_commerce_catalog_version_info(call)` |
+
+The Rust, C ABI and WASM entry points take one JSON string, `{"document": ..., "request":
+...}`, and return the result document as a string. Each C ABI function follows the same
+pointer contract as `packvium_solve_json`: a valid, immutable, NUL-terminated UTF-8
+input, and an owned result string the caller releases exactly once with
+`packvium_free_string`. `@packvium/engine` selects the native addon when it is installed
+and the deterministic JavaScript implementation otherwise, the same way `pack` does;
+`commerce.backend()` reports which answered.
+
+Two kinds of failure, and they are not interchangeable. A malformed document or request
+is a caller bug and is raised the way each language raises one (`CommerceInputError`,
+`Packvium\Commerce\CommerceInputException`, `Err(CommerceInputError)`, a thrown
+`CommerceInputError`). A well-formed request the commercial model cannot answer -- no
+tariff effective at that instant, no rate for that zone -- is a successful call returning
+`"status": "rejected"` with a code from a closed set, exactly as an infeasible packing
+request returns a result with a status rather than raising.
+
 ## JSON API
 
 Python, PHP, Rust and the JavaScript fallback accept the same top-level keys: `units`,

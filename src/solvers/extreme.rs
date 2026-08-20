@@ -1937,6 +1937,41 @@ pub(crate) fn dimensional_weight_ticks(container: &Container, config: &PackingCo
                 .expect("shipping_cost divisor is validated at admission"))
 }
 
+/// The first container in a finished answer whose own rate table cannot price it, as
+/// `(container id, billed grams, last bracket)`.
+///
+/// Ranking an unpriceable candidate worst is what makes a priceable alternative win the
+/// round; it is a search device, not an answer. This is the guard that keeps the sentinel
+/// from ever surfacing: a returned packing the tariff cannot price would quote a number
+/// the carrier never published, which is the one outcome `charge_minor` refuses to
+/// invent. Callers turn a hit into the same refusal Python and PHP raise.
+pub(crate) fn unpriceable_container(
+    containers: &[PackedContainer],
+    config: &PackingConfig,
+) -> Option<(String, i64, i64)> {
+    if config.objective != "lowest_landed_cost" {
+        return None;
+    }
+    containers.iter().find_map(|packed| {
+        let dimensional = dimensional_weight_ticks(&packed.container, config);
+        let billed = i128::from(packed.gross_weight().0).max(dimensional);
+        let grams = RateTable::grams(billed as i64);
+        // A container with no table at all is refused at admission, so `parse_request`
+        // callers never reach this arm -- but `pack_request_with_policy` is public, and a
+        // Rust consumer assembling a `PackingRequest` by hand bypasses that check. Report
+        // it rather than skipping it: an untabled container is the one case where "cannot
+        // price" is certain. Python and PHP report the same `0` bracket here.
+        let Some(table) = packed.container.rate_table.as_ref() else {
+            return Some((packed.container.id.clone(), grams, 0));
+        };
+        if table.charge_minor(grams).is_some() {
+            return None;
+        }
+        let last = table.weight_brackets_g.last().copied().unwrap_or(0);
+        Some((packed.container.id.clone(), grams, last))
+    })
+}
+
 /// How good opening this container type would be, ranked the way the finished result
 /// will be ranked.
 ///
@@ -1988,6 +2023,19 @@ fn container_selection_key(
         } else {
             0
         };
+    // The greedy loop commits this trial verbatim -- nothing is added to the container
+    // after it wins the round -- so its billed weight is final here and the tariff can be
+    // read now. `charge_minor` is a bracket walk over a table with a handful of entries,
+    // so pricing every trial costs nothing the round did not already spend packing it.
+    let landed = if config.objective == "lowest_landed_cost" {
+        container
+            .rate_table
+            .as_ref()
+            .and_then(|table| table.charge_minor(RateTable::grams(billable as i64)))
+            .map_or(i128::MAX, i128::from)
+    } else {
+        0
+    };
 
     // `-placed` sits after the objective's *decisive* keys and before its two ratio
     // keys, and the position is deliberate. Container count and cost are what the
@@ -1999,13 +2047,14 @@ fn container_selection_key(
     // `regression-cumulative-weight-never-exceeds-max-payload`.
     let key = match config.objective.as_str() {
         "lowest_cost" => vec![cost, containers_needed, -placed, unused_ppm, height_ppm],
-        // Landed cost shares this key with shipping_cost on purpose: at the moment a
-        // container is opened its final billed weight is not yet known, so the tariff
-        // cannot be applied. Billable weight is the same monotone proxy for it that this
-        // key already uses, and `score_solution` prices the finished answer exactly.
-        "shipping_cost" | "lowest_landed_cost" => {
-            vec![billable, containers_needed, -placed, unused_ppm, height_ppm]
-        }
+        "shipping_cost" => vec![billable, containers_needed, -placed, unused_ppm, height_ppm],
+        // Landed cost ranks by the money `score_solution` will actually charge for this
+        // container, not by the billed weight it is derived from. The two order
+        // candidates identically only while price rises smoothly with weight; a bracket
+        // step or a minimum charge makes the cheaper shipment the heavier one, and an
+        // unpriceable trial is not merely expensive but unshippable, so it sorts behind
+        // every priceable alternative rather than winning on being light.
+        "lowest_landed_cost" => vec![landed, containers_needed, -placed, unused_ppm, height_ppm],
         "open_dimension_height" => vec![top, containers_needed, cost, -placed, unused_ppm],
         // `maximum_value` ranks by value forgone, which is a property of what is left
         // unpacked overall rather than of the container being opened, so a per-round
