@@ -48,7 +48,7 @@ silently — if you need them, they belong in your own layer above this library.
 
 ## Status of this release
 
-Version `0.1.0` is an early release. The public API is not yet frozen: field names,
+Version `0.1.1` is an early release. The public API is not yet frozen: field names,
 status codes and the objective vector may change before `1.0.0`. Pin an exact version.
 
 The algorithm complexities documented in `ALGORITHMS-AND-COMPLEXITY.md` are design

@@ -1,4 +1,4 @@
-use super::extreme::score_solution;
+use super::extreme::{dimensional_weight_ticks, score_solution};
 use super::maximal::{Space, subtract_all};
 use crate::deadline::Deadline;
 use crate::geometry::{Aabb, Dimensions, Point, Rotation};
@@ -92,7 +92,25 @@ pub(crate) fn pack_homogeneous_blocks(
                 continue;
             }
             let unused = container.inner_dimensions.volume() - candidate.used_volume();
+            // Under `lowest_landed_cost` the round ranks in the money the finished
+            // score will charge: the block loader commits this trial verbatim,
+            // so its billed weight is final here and the tariff can simply be read. An
+            // unpriceable trial sorts behind every priceable alternative instead of
+            // winning on progress. Zero for every other objective, leaving the
+            // progress-first key below unchanged.
+            let landed = if request.config.objective == "lowest_landed_cost" {
+                let dimensional = dimensional_weight_ticks(container, &request.config);
+                let billed = i128::from(candidate.gross_weight().0).max(dimensional);
+                container
+                    .rate_table
+                    .as_ref()
+                    .and_then(|table| table.charge_minor(RateTable::grams(billed as i64)))
+                    .map_or(i128::MAX, i128::from)
+            } else {
+                0
+            };
             trials.push((
+                landed,
                 next.len(),
                 container.cost_minor,
                 unused,
@@ -105,9 +123,9 @@ pub(crate) fn pack_homogeneous_blocks(
                 break;
             }
         }
-        let Some((_, _, _, id, candidate, next, _)) = trials
+        let Some((_, _, _, _, id, candidate, next, _)) = trials
             .into_iter()
-            .min_by_key(|trial| (trial.0, trial.1, trial.2, trial.3.clone()))
+            .min_by_key(|trial| (trial.0, trial.1, trial.2, trial.3, trial.4.clone()))
         else {
             break;
         };
@@ -485,5 +503,47 @@ mod tests {
                 .unwrap()
                 .starts_with("homogeneous_blocks:fallback")
         );
+    }
+
+    #[test]
+    fn landed_cost_block_round_chooses_a_priceable_container() {
+        let request = serde_json::json!({
+            "units": {"length": "mm"},
+            "configuration": {
+                "objective": "lowest_landed_cost",
+                "dimensional_weight_divisor": 5000,
+                "dimensional_weight_length_unit": "cm",
+                "dimensional_weight_weight_unit": "kg",
+                "time_limit_ms": 5_000,
+                "solvers": ["homogeneous_blocks"],
+                "container_plan_beam_width": 16,
+                "container_plan_node_limit": 1_000_000
+            },
+            "items": [{
+                "id": "box",
+                "quantity": 8,
+                "weight": "500 g",
+                "dimensions": {"length": "100", "width": "100", "height": "100"}
+            }],
+            "containers": [
+                {
+                    "id": "alpha_unpriceable",
+                    "inner_dimensions": {"length": "300", "width": "300", "height": "300"},
+                    "rate_table": {"weight_brackets_g": [2_000], "prices_minor": [900]}
+                },
+                {
+                    "id": "beta_priceable",
+                    "inner_dimensions": {"length": "400", "width": "400", "height": "400"},
+                    "rate_table": {"weight_brackets_g": [20_000], "prices_minor": [1_500]}
+                }
+            ]
+        });
+        let value: serde_json::Value = serde_json::from_str(
+            &pack_json(&request.to_string()).expect("landed-cost block solve"),
+        )
+        .unwrap();
+
+        assert_eq!(value["containers"][0]["container_type"], "beta_priceable");
+        assert_eq!(value["score"][1], 1_500);
     }
 }

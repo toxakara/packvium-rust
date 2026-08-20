@@ -366,18 +366,12 @@ fn optimistic_completion_score(
     } else {
         0
     };
-    let landed = if config.objective == "lowest_landed_cost" {
-        match container
-            .rate_table
-            .as_ref()
-            .and_then(|table| table.charge_minor(RateTable::grams(billable as i64)))
-        {
-            Some(charge) => i128::from(charge),
-            None => i128::MAX,
-        }
-    } else {
-        0
-    };
+    // A tariff is deliberately allowed to dip at a promotional bracket. Charging the
+    // lightest possible completion is therefore *not* a lower bound on descendants:
+    // a heavier subset can cost less. All published charges are non-negative, so zero
+    // is the tightest generally valid O(1) money floor. This weakens pruning only for
+    // landed cost and keeps the branch-and-bound admissible ( second review).
+    let landed = 0;
 
     match config.objective.as_str() {
         "lowest_cost" => vec![unpacked_floor, cost, 1, unused, height],

@@ -3,7 +3,7 @@
 Deterministic 3D cartonization and rectangular bin packing. No unsafe code, no runtime
 dependencies beyond `serde`, exact integer geometry.
 
-> **Version 0.1.0 — early release.** The public API is not frozen; pin an exact version.
+> **Version 0.1.1 — early release.** The public API is not frozen; pin an exact version.
 > Read [docs/GUARANTEES.md](docs/GUARANTEES.md) before relying on a result.
 
 ```toml
@@ -32,6 +32,22 @@ let result = packvium_core::pack_json(request)?;
 
 `use packvium_core::...` is correct even though the package is `packvium` in
 `Cargo.toml` — that is the crate's own internal name, kept stable across the release.
+
+```bash
+cargo run --example basic
+```
+
+## Examples
+
+Runnable, in [`examples/`](examples). Each one is a single file you can read top to bottom
+and execute without a project around it.
+
+| File | What it shows |
+| --- | --- |
+| [`basic.rs`](examples/basic.rs) | The smallest useful call: items in, placements out. |
+| [`pack-stdin.rs`](examples/pack-stdin.rs) | Read a shared-contract request on stdin and write the result to stdout. |
+| [`commerce.rs`](examples/commerce.rs) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
+| [`commerce-stdin.rs`](examples/commerce-stdin.rs) | The same three functions over stdin/stdout. |
 
 ```bash
 cargo run --example basic

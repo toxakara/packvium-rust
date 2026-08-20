@@ -77,18 +77,13 @@ fn grid_selection_key(
 
     let mut key = match config.objective.as_str() {
         "lowest_cost" => vec![cost, containers_needed, unused_ppm, height_ppm],
-        // Landed cost shares this key with shipping_cost for the same reason
-        // `extreme::container_selection_key` does: the tariff cannot be
-        // applied until the container's final billed weight is known, so billed
-        // weight is the best per-round proxy, and `score_solution` prices the
-        // finished answer exactly. Before this arm existed, `lowest_landed_cost`
-        // fell through to the untagged default below -- ranking candidates by
-        // `cost_minor`/unused volume/height with no reference to price at all,
-        // which could commit the lattice to an unpriceable container over a
-        // priced one before pricing ever entered the decision.
-        "shipping_cost" | "lowest_landed_cost" => {
-            vec![billable, containers_needed, unused_ppm, height_ppm]
-        }
+        // `lowest_landed_cost` never reaches this key: `try_grid` stands down for it
+        // (see below), because a closed-form solver commits to one container with no
+        // alternative to correct a mispriced proxy, and billed weight is exactly such
+        // a proxy -- a bracket step or a minimum charge makes the cheaper shipment the
+        // heavier one. Keeping an arm for it here would invite dropping the
+        // exclusion on the strength of a comment; the exclusion is the fix.
+        "shipping_cost" => vec![billable, containers_needed, unused_ppm, height_ppm],
         "open_dimension_height" => vec![top as i128, containers_needed, cost, unused_ppm],
         _ => vec![containers_needed, cost, unused_ppm, height_ppm],
     };
