@@ -3,7 +3,7 @@
 Deterministic 3D cartonization and rectangular bin packing. No unsafe code, no runtime
 dependencies beyond `serde`, exact integer geometry.
 
-> **Version 0.1.1 — early release.** The public API is not frozen; pin an exact version.
+> **Version 0.1.2 — early release.** The public API is not frozen; pin an exact version.
 > Read [docs/GUARANTEES.md](docs/GUARANTEES.md) before relying on a result.
 
 ```toml
@@ -83,11 +83,21 @@ cargo run --example basic
 
 Rust 1.88 or newer (edition 2024).
 
-## Two other ports exist
+## The Packvium family
 
-The same request and result contract is implemented independently in Python and PHP, and
-all three are held to producing identical placements on a shared fixture set. If your
-stack spans languages, you can compute a packing on any of them and get the same answer.
+One request and result contract, implemented independently in four engines (Rust,
+Python, PHP, JavaScript) and held to identical placements on a shared fixture set.
+Pick the package for your stack; mixing them in one system is safe.
+
+| Package | Install | Source |
+| --- | --- | --- |
+| Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
+| PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "0.1"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
+| Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
+| Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
+| PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |
+| Python native selector — `packvium-native` | from source until the native wheels ship | [packvium-python-adapter](https://github.com/toxakara/packvium-python-adapter) |
 
 ## Contributing
 

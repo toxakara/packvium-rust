@@ -4,6 +4,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/) and thi
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — with the caveat
 that the public API is not frozen until `1.0.0`. Pin an exact version.
 
+## [0.1.2]
+
+An additive documentation and integration release. No packing request/result field or
+solver algorithm changed.
+
+### Added
+
+- **Runnable examples and guided capability maps.** Python, PHP and Node now ship worked
+  examples covering every objective and the major constraint, units, serialization,
+  nested-packing and commerce paths. Their printed answers are retained and checked on
+  every release, and each package executes its own examples in its test suite.
+- **A versioned carrier-connector contract and reference implementation in the public
+  workspace.** Connectors prepare ordinary rate-table data before a deterministic solve;
+  no network call or carrier module enters a packing engine. The contract, offline replay
+  harness, registry and synthetic carrier are application components rather than new
+  packing-package API fields.
+
+### Changed
+
+- Every package README now links the whole Packvium family — Python, PHP, Rust, Node,
+  browser, PHP FFI bridge and Python native selector — and the PyPI, npm, Packagist and
+  crates.io manifests carry repository, homepage and keyword metadata. The PyPI page shows
+  the same README as GitHub and states the real Python floor, 3.9.
+
+### Fixed
+
+- Connector responses are revalidated at runtime and bound to the registered carrier and
+  requested service. Incomplete brackets, cross-currency price comparison and mutable
+  replay/value-object state are refused instead of silently producing a wrong price.
+- Linux x86_64 and ARM64 evidence follows the declared suite version, preventing a
+  current gate from rewriting a previous release's receipt.
+- PHP 7.4 artifact generation safely completes the locked downgrade tool's partial-write
+  case and still fails closed if its single retry does not finish.
+
 ## [0.1.1]
 
 A patch over `0.1.0`. Every package is released together at the new version, including
