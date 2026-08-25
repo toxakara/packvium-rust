@@ -1,16 +1,16 @@
 [package]
 name = "packvium"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 description = "Deterministic, extensible 3D cartonization and rectangular bin-packing engine"
 readme = "README.md"
 repository = "https://github.com/toxakara/packvium-rust"
-homepage = "https://github.com/toxakara/packvium-rust"
+homepage = "https://packvium.com"
 documentation = "https://docs.rs/packvium"
-keywords = ["3d-bin-packing", "cartonization", "packaging", "container-loading"]
-categories = ["algorithms"]
+keywords = ["3d-bin-packing", "cartonization", "packaging", "container-loading", "logistics"]
+categories = ["algorithms", "mathematics", "data-structures"]
 authors = ["Packvium contributors"]
 
 # The published package name is `packvium`, matching the Python and PHP packages.

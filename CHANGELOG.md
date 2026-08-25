@@ -4,6 +4,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/) and thi
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — with the caveat
 that the public API is not frozen until `1.0.0`. Pin an exact version.
 
+## [0.1.3]
+
+An additive release. No packing request/result field or solver algorithm changed.
+
+### Added
+
+- **First-party carrier connectors for UPS, FedEx, DHL Express and USPS**, and a live
+  rate-card contract behind them. Connectors prepare ordinary rate-table data before a
+  deterministic solve; no network call, clock or carrier module enters a packing engine.
+  A rate card records which tariff version priced a quote and when it was fetched, and a
+  card that has gone stale is refused rather than served.
+
+### Fixed
+
+- **`@packvium/browser` now works under Node**, not only in a browser. The WebAssembly
+  loader generated for the `web` target fetches its own `.wasm` from a `file:` URL, which
+  Node's `fetch` refuses — so server-side rendering, a Vitest node environment and
+  `node --test` failed at initialization on 0.1.1 and 0.1.2. The package now selects a
+  Node entry point that reads the module off disk. Browser behaviour is unchanged.
+- **The PHP package's compatibility tree could not autoload a class on old PHP.** Its
+  entry point was the one shipped file the downgrade did not process, and it used a PHP 8
+  function to match the namespace prefix. Three of its solver files also could not be
+  parsed by PHP 8.0 or 8.1, which that tree also serves. Both are fixed, and the tree is
+  installed and loaded on 7.3, 7.4, 8.0 and 8.1 before release.
+- **The compatibility tree did not place items where the canonical engine does on PHP 7.**
+  Several solver comparators were partial and relied on `usort` being stable, which PHP
+  guarantees only from 8.0, so three shared fixtures came back with a different rotation
+  chosen. The tie-breaking is explicit now — identical results on every supported version —
+  and no released package ever carried it, because none was installable below 8.2.
+
+### Changed
+
+- **`packvium/packvium` now requires `php: >=7.3` instead of `>=8.2`.** One package
+  carries both the canonical PHP 8.2+ source and a generated `src-legacy/` tree, and its
+  `autoload.php` selects by `PHP_VERSION_ID`; PHP parses only what it loads.
+  `composer require packvium/packvium` is the right command on 7.3 through 8.5, and every
+  one of those versions is held to the same committed placement results. Nothing changes
+  for an 8.2+ consumer: the same files load, under the same names.
+- Every package's `homepage` now points at <https://packvium.com>.
+
 ## [0.1.2]
 
 An additive documentation and integration release. No packing request/result field or

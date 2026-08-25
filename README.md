@@ -3,7 +3,7 @@
 Deterministic 3D cartonization and rectangular bin packing. No unsafe code, no runtime
 dependencies beyond `serde`, exact integer geometry.
 
-> **Version 0.1.2 — early release.** The public API is not frozen; pin an exact version.
+> **Version 0.1.3 — early release.** The public API is not frozen; pin an exact version.
 > Read [docs/GUARANTEES.md](docs/GUARANTEES.md) before relying on a result.
 
 ```toml
@@ -88,6 +88,9 @@ Rust 1.88 or newer (edition 2024).
 One request and result contract, implemented independently in four engines (Rust,
 Python, PHP, JavaScript) and held to identical placements on a shared fixture set.
 Pick the package for your stack; mixing them in one system is safe.
+
+Documentation, the constraint reference and the benchmarks are at
+[packvium.com](https://packvium.com).
 
 | Package | Install | Source |
 | --- | --- | --- |
