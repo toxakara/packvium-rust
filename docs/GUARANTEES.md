@@ -48,9 +48,16 @@ silently — if you need them, they belong in your own layer above this library.
 
 ## Status of this release
 
-Version `0.1.3` is an early release. The public API is not yet frozen: field names,
-status codes and the objective vector may change before `1.0.0`. Pin an exact version.
+Version `1.0.0` freezes the public API. Field names, status codes, the objective
+vector, the numeric policy and the validation rules do not change without a major
+version, so any `1.x` is a safe upgrade from any earlier `1.x`. A caret or tilde
+constraint on `1.0` is enough; an exact pin is no longer required.
 
-The algorithm complexities documented in `ALGORITHMS-AND-COMPLEXITY.md` are design
-intent that has not yet been confirmed by profiling. Treat them as guidance for choosing
-a solver profile, not as a performance contract.
+What the freeze does not cover: which of several equally valid packings a solver
+returns. That is bounded by the objective vector, not by the placement list, and a minor
+release may return a different arrangement with the same or a better score.
+
+The algorithm complexities documented in `ALGORITHMS-AND-COMPLEXITY.md` are asymptotic
+design bounds held by review, not per-release measurements. They are not a wall-clock
+performance contract either: constants, input shape and host all move the real number.
+Use them to choose a solver profile, not to predict a duration.

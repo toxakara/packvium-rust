@@ -108,6 +108,12 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
         || !request.items[0].tags.is_empty()
         || !request.items[0].eligible_container_tags.is_empty()
         || request.items[0].max_stacked_items.is_some()
+        // The lattice is closed-form over boxes: it counts cells from envelope extents and
+        // caps a column from `max_top_load` arithmetic alone. Neither step can see a hull --
+        // it would tile bounding boxes and call the result exact -- and neither can see
+        // pressure, so a compressible column would be sized without ever asking whether its
+        // bottom item survives. The general solver checks both per candidate.
+        || request.items[0].shape_type != crate::geometry::ShapeType::RigidCuboid
         || !matches!(
             request.items[0].ground_contact_rule.as_deref(),
             None | Some("free")
@@ -464,6 +470,10 @@ mod tests {
                 ground_contact_rule: None,
                 stop_index: None,
                 value: None,
+                shape_type: crate::geometry::ShapeType::RigidCuboid,
+                hull_vertices: None,
+                compression_ratio_ppm: None,
+                max_compression_pressure_kpa: None,
                 eligible_container_tags: BTreeSet::new(),
             }],
             containers: vec![Container {

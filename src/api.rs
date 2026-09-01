@@ -1,5 +1,6 @@
 use crate::error::{PackError, PackResult};
-use crate::geometry::{Aabb, Dimensions, Point, Rotation};
+use crate::geometry::{Aabb, Dimensions, Point, Rotation, ShapeType};
+use crate::hull::{self, Vertex};
 use crate::model::*;
 use crate::policy::{PolicyConstraint, PolicyRuleSet};
 use crate::rebalance::rebalance_weight;
@@ -514,7 +515,17 @@ fn expand_for_validation(result: &PackingResult) -> PackingResult {
 /// conformance corpus assert the rejection instead of merely tolerating it.
 const UNSUPPORTED_REQUEST_FIELDS: &[&str] = &[];
 const UNSUPPORTED_CONFIGURATION_FIELDS: &[&str] = &[];
+// `hull_vertices`, `compression_ratio` and `max_compression_pressure_kpa` left this list in
+// , when this engine gained both the solver behaviour and the independent validation
+// the staged rollout requires. The JavaScript fallback still carries them.
 const UNSUPPORTED_ITEM_FIELDS: &[&str] = &[];
+
+/// `item.shape_type` values this engine does not implement.
+///
+/// Empty since : this engine implements every value the schema defines. The guard stays
+/// because the next reserved value will need it, and because `reject_unsupported` takes its
+/// lists as parameters precisely so it remains testable when they are empty.
+const UNSUPPORTED_SHAPE_TYPES: &[&str] = &[];
 const UNSUPPORTED_CONTAINER_FIELDS: &[&str] = &[];
 
 fn reject_unsupported(object: &Map<String, Value>) -> PackResult<()> {
@@ -524,6 +535,7 @@ fn reject_unsupported(object: &Map<String, Value>) -> PackResult<()> {
         UNSUPPORTED_CONFIGURATION_FIELDS,
         UNSUPPORTED_ITEM_FIELDS,
         UNSUPPORTED_CONTAINER_FIELDS,
+        UNSUPPORTED_SHAPE_TYPES,
     )
 }
 
@@ -537,6 +549,7 @@ fn reject_listed_fields(
     configuration_fields: &[&str],
     item_fields: &[&str],
     container_fields: &[&str],
+    shape_types: &[&str],
 ) -> PackResult<()> {
     let mut found: Vec<String> = Vec::new();
     // Top-level scope: a block such as `policy` is a property of the whole request
@@ -571,6 +584,23 @@ fn reject_listed_fields(
                     found.push(format!("{singular}.{key}"));
                 }
             }
+        }
+    }
+    for entry in object
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        let Some(shape) = entry
+            .as_object()
+            .and_then(|e| e.get("shape_type"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if shape_types.contains(&shape) {
+            found.push(format!("item.shape_type={shape}"));
         }
     }
     if found.is_empty() {
@@ -859,6 +889,10 @@ fn parse_config(value: Option<&Value>, length_unit: &str) -> PackResult<PackingC
             },
         )
         .max(1),
+        // Not read from the request: the schema has no access-directions field, so a
+        // request cannot switch the stop-accessibility rule on. A library caller sets it
+        // on the config directly, as in the Python and PHP engines.
+        access_directions: Vec::new(),
     })
 }
 
@@ -940,6 +974,37 @@ fn parse_item(value: &Value, unit: &str) -> PackResult<Item> {
             "item {id} has no allowed rotations"
         )));
     }
+    let shape_type: ShapeType = match map.get("shape_type").and_then(Value::as_str) {
+        None | Some("rigid_cuboid") => ShapeType::RigidCuboid,
+        Some("convex_hull") => ShapeType::ConvexHull,
+        Some("compressible") => ShapeType::Compressible,
+        Some(other) => {
+            return Err(PackError::InvalidInput(format!(
+                "item.shape_type {other} is not a known shape"
+            )));
+        }
+    };
+    let nesting_height = map
+        .get("nesting_height")
+        .map(|value| Length::parse(value, unit))
+        .transpose()?;
+    let compression_ratio_ppm = match map.get("compression_ratio").and_then(Value::as_f64) {
+        None => None,
+        Some(ratio) => Some(crate::compression::ratio_to_ppm(ratio).ok_or_else(|| {
+            PackError::InvalidInput("compression_ratio must be between zero and one".into())
+        })?),
+    };
+    let max_compression_pressure_kpa = map
+        .get("max_compression_pressure_kpa")
+        .and_then(Value::as_i64);
+    let hull_vertices = admit_shape(
+        shape_type,
+        parse_hull_vertices(map.get("hull_vertices"), unit)?,
+        compression_ratio_ppm,
+        max_compression_pressure_kpa,
+        dimensions,
+        nesting_height,
+    )?;
     Ok(Item {
         id,
         dimensions,
@@ -967,19 +1032,144 @@ fn parse_item(value: &Value, unit: &str) -> PackResult<Item> {
         incompatible_tags: string_set(map.get("incompatible_tags")),
         priority: map.get("priority").and_then(Value::as_i64).unwrap_or(0) as i32,
         metadata: object_map(map.get("metadata")),
-        nesting_height: map
-            .get("nesting_height")
-            .map(|value| Length::parse(value, unit))
-            .transpose()?,
+        nesting_height,
         max_stacked_items: optional_usize(map, "max_stacked_items", "item")?,
         ground_contact_rule: optional_string(map, "ground_contact_rule", "item")?,
-        stop_index: optional_usize(map, "stop_index", "item")?,
+        stop_index: optional_stop_index(map)?,
         eligible_container_tags: optional_string_set(
             map.get("eligible_container_tags"),
             "item.eligible_container_tags",
         )?,
         value: optional_usize(map, "value", "item")?,
+        shape_type,
+        hull_vertices,
+        compression_ratio_ppm,
+        max_compression_pressure_kpa,
     })
+}
+
+/// Parse `hull_vertices` into the integer tick frame before any geometry runs.
+///
+/// Coordinates go through `Length`, which refuses a negative value, so a hull crossing the
+/// wire is authored as non-negative offsets from the corner of its own bounding box. A library
+/// caller may still centre a hull wherever it likes -- `hull::rotate` normalises either way --
+/// but the wire keeps one convention so four engines cannot disagree about where an item's
+/// frame starts.
+fn parse_hull_vertices(value: Option<&Value>, unit: &str) -> PackResult<Option<Vec<Vertex>>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let entries = raw
+        .as_array()
+        .ok_or_else(|| PackError::InvalidInput("item.hull_vertices must be an array".into()))?;
+    let mut vertices = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let point = entry.as_object().ok_or_else(|| {
+            PackError::InvalidInput("item.hull_vertices entries must be objects".into())
+        })?;
+        let mut coordinates = [0i64; 3];
+        for (index, axis) in ["x", "y", "z"].into_iter().enumerate() {
+            let measure = point.get(axis).ok_or_else(|| {
+                PackError::InvalidInput(format!("item.hull_vertices entry needs {axis}"))
+            })?;
+            coordinates[index] = Length::parse(measure, unit)?.0;
+        }
+        vertices.push(coordinates);
+    }
+    Ok(Some(vertices))
+}
+
+/// Admit an item's shape, or refuse it with the reason.
+///
+/// The one rule here spanning four fields at once: which are required, which are forbidden,
+/// and what the survivors must agree with. Mirrors the other engines exactly -- all four must
+/// refuse the same requests.
+fn admit_shape(
+    shape_type: ShapeType,
+    hull_vertices: Option<Vec<Vertex>>,
+    ratio_ppm: Option<i64>,
+    limit_kpa: Option<i64>,
+    dimensions: Dimensions,
+    nesting_height: Option<Length>,
+) -> PackResult<Option<Vec<Vertex>>> {
+    let foreign: &[(&str, bool)] = match shape_type {
+        ShapeType::ConvexHull => &[
+            ("compression_ratio", ratio_ppm.is_some()),
+            ("max_compression_pressure_kpa", limit_kpa.is_some()),
+        ],
+        ShapeType::Compressible => &[("hull_vertices", hull_vertices.is_some())],
+        ShapeType::RigidCuboid => &[
+            ("hull_vertices", hull_vertices.is_some()),
+            ("compression_ratio", ratio_ppm.is_some()),
+            ("max_compression_pressure_kpa", limit_kpa.is_some()),
+        ],
+    };
+    let label = shape_label(shape_type);
+    for (name, present) in foreign {
+        if *present {
+            return Err(PackError::InvalidInput(format!(
+                "{name} is not part of a {label} item"
+            )));
+        }
+    }
+    // Both rewrite occupied height. Choosing an order silently would give four engines four
+    // contracts, so the interaction is refused until a task defines it.
+    if nesting_height.is_some() && shape_type != ShapeType::RigidCuboid {
+        return Err(PackError::InvalidInput(format!(
+            "nesting_height with shape_type {label} is not supported yet"
+        )));
+    }
+    match shape_type {
+        ShapeType::ConvexHull => {
+            let vertices = hull_vertices.ok_or_else(|| {
+                PackError::InvalidInput("a convex_hull item requires hull_vertices".into())
+            })?;
+            let canonical =
+                hull::validate(&vertices).map_err(|error| PackError::InvalidInput(error.0))?;
+            let (low, high) = hull::bounding_extent(&canonical);
+            let declared = [dimensions.length.0, dimensions.width.0, dimensions.height.0];
+            for axis in 0..3 {
+                // `dimensions` stays the broad phase and the candidate-generation envelope, so
+                // a hull poking out of it would be collision-tested against space the solver
+                // never reserved.
+                if high[axis] - low[axis] > declared[axis] {
+                    return Err(PackError::InvalidInput(
+                        "hull_vertices span does not fit inside dimensions".into(),
+                    ));
+                }
+            }
+            Ok(Some(canonical))
+        }
+        ShapeType::Compressible => {
+            let (Some(ratio), Some(limit)) = (ratio_ppm, limit_kpa) else {
+                return Err(PackError::InvalidInput(
+                    "a compressible item requires both compression_ratio and \
+                     max_compression_pressure_kpa"
+                        .into(),
+                ));
+            };
+            if !(0..=crate::compression::PPM as i64).contains(&ratio) {
+                return Err(PackError::InvalidInput(
+                    "compression_ratio must be between zero and one".into(),
+                ));
+            }
+            if limit < 0 {
+                return Err(PackError::InvalidInput(
+                    "max_compression_pressure_kpa cannot be negative".into(),
+                ));
+            }
+            Ok(hull_vertices)
+        }
+        ShapeType::RigidCuboid => Ok(hull_vertices),
+    }
+}
+
+pub(crate) fn shape_label(shape_type: ShapeType) -> &'static str {
+    match shape_type {
+        ShapeType::RigidCuboid => "rigid_cuboid",
+        ShapeType::ConvexHull => "convex_hull",
+        ShapeType::Compressible => "compressible",
+    }
 }
 
 fn parse_container(value: &Value, unit: &str) -> PackResult<Container> {
@@ -1332,6 +1522,32 @@ fn str_field(map: &Map<String, Value>, key: &str) -> PackResult<String> {
         .ok_or_else(|| PackError::InvalidInput(format!("missing {key}")))
 }
 
+/// The largest `stop_index` every engine can carry identically.
+///
+/// Route order is decided by comparing stop indices, and JavaScript holds numbers as
+/// doubles: `JSON.parse` collapses 2**53 + 1 to 2**53 before any constraint sees it, so
+/// two consecutive stops above this bound become one number there while Rust's integers
+/// keep them apart. The JavaScript engine already refuses anything outside the safe
+/// range; this makes the others agree rather than accept a value they would order
+/// differently.
+const MAX_EXACT_STOP_INDEX: u64 = (1u64 << 53) - 1;
+
+fn optional_stop_index(map: &Map<String, Value>) -> PackResult<Option<usize>> {
+    match map.get("stop_index") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|number| *number <= MAX_EXACT_STOP_INDEX)
+            .and_then(|number| usize::try_from(number).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                PackError::InvalidInput(
+                    "stop_index must be a non-negative safe integer".to_string(),
+                )
+            }),
+    }
+}
+
 fn optional_usize(map: &Map<String, Value>, key: &str, scope: &str) -> PackResult<Option<usize>> {
     match map.get(key) {
         None => Ok(None),
@@ -1422,9 +1638,10 @@ fn parse_rotation(value: &str) -> Option<Rotation> {
 mod unsupported_field_tests {
     use super::{
         UNSUPPORTED_CONFIGURATION_FIELDS, UNSUPPORTED_CONTAINER_FIELDS, UNSUPPORTED_ITEM_FIELDS,
-        UNSUPPORTED_REQUEST_FIELDS, reject_listed_fields,
+        UNSUPPORTED_REQUEST_FIELDS, UNSUPPORTED_SHAPE_TYPES, reject_listed_fields,
     };
     use serde_json::{Map, Value, json};
+    use std::collections::BTreeSet;
 
     fn object(value: Value) -> Map<String, Value> {
         value.as_object().expect("a request object").clone()
@@ -1445,6 +1662,7 @@ mod unsupported_field_tests {
             &["tariff"],
             &["hazmat_class"],
             &["rate_table"],
+            &[],
         )
         .expect_err("every listed field should be refused");
         let message = error.to_string();
@@ -1471,7 +1689,7 @@ mod unsupported_field_tests {
             "containers": [{"id": "a", "rate_table": {}}, {"id": "b", "rate_table": {}}],
         }));
 
-        let message = reject_listed_fields(&request, &[], &[], &[], &["rate_table"])
+        let message = reject_listed_fields(&request, &[], &[], &[], &["rate_table"], &[])
             .expect_err("the field is listed")
             .to_string();
 
@@ -1495,7 +1713,8 @@ mod unsupported_field_tests {
                 &["policy"],
                 &["tariff"],
                 &["hazmat_class"],
-                &["rate_table"]
+                &["rate_table"],
+                &[]
             )
             .is_ok()
         );
@@ -1503,16 +1722,169 @@ mod unsupported_field_tests {
 
     #[test]
     fn the_unsupported_lists_match_what_the_field_matrix_records() {
-        // A guard with a non-empty list is a promise that `public-field-matrix.json`
-        // carries a matching `rejected:unsupported_feature` level for Rust. Failing here
-        // is the reminder to record it; it is not a reason to empty the list.
-        // Each name here must carry a rejected:unsupported_feature level for Rust in
-        // conformance/public-field-matrix.json, which is what makes the corpus assert the
-        // rejection rather than merely tolerate it.
-        assert!(UNSUPPORTED_REQUEST_FIELDS.is_empty());
-        assert!(UNSUPPORTED_CONFIGURATION_FIELDS.is_empty());
-        assert!(UNSUPPORTED_ITEM_FIELDS.is_empty());
-        assert!(UNSUPPORTED_CONTAINER_FIELDS.is_empty());
+        // Every refusal this engine makes is recorded in the matrix, and the reverse. The
+        // assertion used to be that all four lists are empty, which was the same thing
+        // while they were -- and stopped being the same thing the moment 
+        // populated one. What the coupling is actually for is that the corpus *asserts*
+        // each rejection instead of merely tolerating it, so read the matrix and compare
+        // both directions.
+        let matrix_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/public-field-matrix.json");
+        let matrix: Value =
+            serde_json::from_str(&std::fs::read_to_string(matrix_path).expect("the matrix"))
+                .expect("matrix JSON");
+        let support_sets = &matrix["support_sets"];
+        let rejected_by_matrix = matrix["fields"]
+            .as_object()
+            .expect("fields")
+            .iter()
+            .filter(|(_, row)| {
+                support_sets[row["support"].as_str().expect("a support set name")]["rust"]
+                    == "rejected:unsupported_feature"
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+
+        let mut declared = BTreeSet::new();
+        declared.extend(
+            UNSUPPORTED_REQUEST_FIELDS
+                .iter()
+                .map(|name| (*name).to_owned()),
+        );
+        declared.extend(
+            UNSUPPORTED_CONFIGURATION_FIELDS
+                .iter()
+                .map(|name| (*name).to_owned()),
+        );
+        declared.extend(
+            UNSUPPORTED_ITEM_FIELDS
+                .iter()
+                .map(|name| format!("items.*.{name}")),
+        );
+        declared.extend(
+            UNSUPPORTED_CONTAINER_FIELDS
+                .iter()
+                .map(|name| format!("containers.*.{name}")),
+        );
+        // A value-keyed refusal is one matrix row for the field itself. `hull_vertices`
+        // is an array of points, so the schema's leaves -- and therefore its rows -- are
+        // the three coordinates, not the array.
+        if !UNSUPPORTED_SHAPE_TYPES.is_empty() {
+            declared.insert("items.*.shape_type".to_owned());
+        }
+        if declared.remove("items.*.hull_vertices") {
+            declared.extend(["x", "y", "z"].map(|axis| format!("items.*.hull_vertices.*.{axis}")));
+        }
+
+        assert_eq!(
+            declared, rejected_by_matrix,
+            "the engine and the matrix disagree about what Rust refuses"
+        );
+    }
+
+    #[test]
+    fn the_default_shape_type_is_served_rather_than_refused() {
+        // `rigid_cuboid` is implemented, so spelling the default out must not be a
+        // rejection. This is why `shape_type` is not in the presence-keyed table: that
+        // table means "this engine does not implement the field at all", and a value-keyed
+        // refusal is a different claim. A caller who writes the default explicitly is
+        // asking for what they already get.
+        let request = object(json!({
+            "units": {"length": "mm"},
+            "items": [{
+                "id": "a",
+                "shape_type": "rigid_cuboid",
+                "dimensions": {"length": "100", "width": "100", "height": "100"},
+            }],
+            "containers": [{
+                "id": "c",
+                "inner_dimensions": {"length": "200", "width": "200", "height": "200"},
+            }],
+        }));
+
+        assert!(
+            reject_listed_fields(&request, &[], &[], &[], &[], UNSUPPORTED_SHAPE_TYPES).is_ok()
+        );
+    }
+
+    #[test]
+    fn an_unimplemented_shape_type_names_the_value_it_refused() {
+        let request = object(json!({"items": [{"id": "a", "shape_type": "convex_hull"}]}));
+        let message = reject_listed_fields(&request, &[], &[], &[], &[], &["convex_hull"])
+            .expect_err("the value is listed")
+            .to_string();
+        assert!(message.contains("item.shape_type=convex_hull"), "{message}");
+    }
+
+    /// What a caller gets wrong about a shape, and what they are told.
+    ///
+    /// These refusals are the request contract, not internal validation: each one is a message
+    /// a caller reads and acts on. The shared rejection corpus checks that all four engines
+    /// agree; these unit tests additionally assert what this engine says.
+    #[test]
+    fn a_shape_refuses_the_data_it_cannot_use() {
+        use super::pack_json;
+
+        let pack = |items: serde_json::Value| {
+            let request = json!({
+                "units": {"length": "mm"},
+                "items": items,
+                "containers": [{
+                    "id": "c",
+                    "inner_dimensions": {"length": "200", "width": "200", "height": "200"},
+                }],
+            });
+            pack_json(&request.to_string())
+                .expect_err("the request is not admissible")
+                .to_string()
+        };
+
+        let dimensions = json!({"length": "100", "width": "100", "height": "100"});
+
+        let message = pack(json!([{
+            "id": "a", "shape_type": "convex_hull", "dimensions": dimensions,
+        }]));
+        assert!(
+            message.contains("a convex_hull item requires hull_vertices"),
+            "{message}"
+        );
+
+        // A vertex is three coordinates, and a missing one is named rather than defaulted to
+        // zero: a hull silently flattened onto a plane encloses no volume and would pass
+        // through everything it meets.
+        let message = pack(json!([{
+            "id": "a", "shape_type": "convex_hull", "dimensions": dimensions,
+            "hull_vertices": [
+                {"x": "0", "y": "0", "z": "0"},
+                {"x": "100", "y": "0"},
+                {"x": "0", "y": "100", "z": "0"},
+                {"x": "0", "y": "0", "z": "100"},
+            ],
+        }]));
+        assert!(
+            message.contains("item.hull_vertices entry needs z"),
+            "{message}"
+        );
+
+        // Four coplanar vertices enclose nothing. Refused rather than repaired, for the same
+        // reason: a zero-volume solid is separated from everything on its own normal.
+        let message = pack(json!([{
+            "id": "a", "shape_type": "convex_hull", "dimensions": dimensions,
+            "hull_vertices": [
+                {"x": "0", "y": "0", "z": "0"},
+                {"x": "100", "y": "0", "z": "0"},
+                {"x": "0", "y": "100", "z": "0"},
+                {"x": "100", "y": "100", "z": "0"},
+            ],
+        }]));
+        assert!(message.contains("coplanar"), "{message}");
+
+        // And the two shapes do not share their data: a `compression_ratio` quietly dropped on
+        // a hull reads back as an item packed to limits it never had.
+        let message = pack(json!([{
+            "id": "a", "dimensions": dimensions, "compression_ratio": 0.25,
+        }]));
+        assert!(message.contains("compression_ratio"), "{message}");
     }
 }
 

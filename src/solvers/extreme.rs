@@ -1,6 +1,9 @@
+use std::rc::Rc;
+
 use crate::contact_graph::ContactGraph;
 use crate::deadline::Deadline;
-use crate::geometry::{Aabb, Dimensions, Point, Rotation};
+use crate::geometry::{self, Aabb, Dimensions, Point, Rotation, ShapeType};
+use crate::hull::{self, HullShape};
 use crate::model::*;
 use crate::solver::{CandidateScorer, PlacementConstraint, SolverContext};
 use crate::spatial_index::SpatialIndex;
@@ -134,6 +137,7 @@ pub struct ContainerState {
     used_volume: i128,
     stack_sensitive: bool,
     route_sensitive: bool,
+    compression_sensitive: bool,
     /// Candidate origins ordered by (z, y, x), matching the reference engines.
     points: BTreeSet<(i64, i64, i64)>,
     spatial_index: SpatialIndex,
@@ -167,6 +171,7 @@ impl ContainerState {
             used_volume: 0,
             stack_sensitive: false,
             route_sensitive: false,
+            compression_sensitive: false,
             points: BTreeSet::new(),
             spatial_index,
         };
@@ -405,10 +410,25 @@ pub fn find_candidates_at_points(
         origin: Point::ZERO,
         dimensions: state.packed.container.inner_dimensions,
     };
-    let rotations = item
+    // A hull is not the same solid under two rotations that happen to give the same box, so
+    // `unique_rotations` -- which keys on the box -- would silently drop orientations that
+    // differ. Cuboids keep the deduplication they have always had.
+    let is_hull = item.item.shape_type == ShapeType::ConvexHull;
+    let exact_hull = item
         .item
-        .dimensions
-        .unique_rotations(&item.item.allowed_rotations)
+        .hull_collision_is_exact(request.config.clearance.0 == 0);
+    let rotation_forms: Vec<(Rotation, Dimensions)> = if is_hull {
+        item.item
+            .allowed_rotations
+            .iter()
+            .map(|rotation| (*rotation, item.item.dimensions.rotated(*rotation)))
+            .collect()
+    } else {
+        item.item
+            .dimensions
+            .unique_rotations(&item.item.allowed_rotations)
+    };
+    let rotations = rotation_forms
         .into_iter()
         .map(|(rotation, physical)| {
             let envelope = if request.config.clearance.0 > 0 {
@@ -416,9 +436,21 @@ pub fn find_candidates_at_points(
             } else {
                 physical
             };
-            (rotation, physical, envelope)
+            let shape = exact_hull
+                .then_some(item.item.hull_vertices.as_ref())
+                .flatten()
+                .and_then(|vertices| hull::shape_for(vertices, hull::source_axes(rotation)));
+            (rotation, physical, envelope, shape)
         })
         .collect::<Vec<_>>();
+    // Built once for the whole sweep: the placed scene does not move, and a hull costs
+    // `O(v^4)` to build, so rebuilding one per candidate would dominate the scan.
+    let placed_hulls: Vec<Option<Rc<HullShape>>> = state
+        .packed
+        .placements
+        .iter()
+        .map(Placement::hull_shape)
+        .collect();
     let payload_exceeded = state
         .packed
         .container
@@ -430,13 +462,62 @@ pub fn find_candidates_at_points(
         .max_items
         .is_some_and(|maximum| state.packed.placements.len() >= maximum);
     let item_incompatible = incompatible(state, item);
+    // The placed boxes do not move for the whole of this item's candidate sweep,
+    // so their contact graph is built once here and every candidate is appended to it
+    // instead of each rebuilding the graph from nothing.
+    //
+    // Two exclusions. The first mirrors `candidate_respects_loads`' own short circuit --
+    // no load rule is active, so no graph is ever asked for and building one would be
+    // pure cost. The second is nesting: a nesting predecessor *replaces* the face edges
+    // of everything in its column, so one new placement can rewrite edges arbitrarily far
+    // from itself and the delta is no longer local. Nesting keeps the from-scratch path.
+    let load_rules_inactive = !state.stack_sensitive
+        && !placement_stack_sensitive(&item.item)
+        && state.packed.container.max_stack_density.is_none();
+    let nesting_present = item.item.nesting_height.is_some()
+        || state
+            .packed
+            .placements
+            .iter()
+            .any(|placement| placement.instance.item.nesting_height.is_some());
+    let load_base = (!load_rules_inactive && !nesting_present).then(|| {
+        // The cell must cover every box hashed into the broad phase or queried against
+        // it, and the candidate is a new item that may be wider than anything placed --
+        // so the hint comes from this item's own rotations, which are known here.
+        let widest = rotations
+            .iter()
+            .map(|(_, _, envelope, _)| envelope.length.0.max(envelope.width.0))
+            .max()
+            .unwrap_or(1);
+        let boxes = state
+            .packed
+            .placements
+            .iter()
+            .map(Placement::envelope_box)
+            .collect::<Vec<_>>();
+        ContactGraph::with_cell_hint(&boxes, widest)
+    });
+    // The placed scene is immutable for this whole candidate sweep. Building its open
+    // corridors once changes the hot-path accessibility check from O(m² * |D|) for every
+    // candidate to O(m * |D|), while preserving the exact same blocker predicate.
+    let stop_accessibility_base = ((state.route_sensitive || item.item.stop_index.is_some())
+        && !request.config.access_directions.is_empty())
+    .then(|| {
+        StopAccessibilityBase::new(
+            item.item.stop_index,
+            &state.packed.placements,
+            state.packed.container.inner_dimensions,
+            &request.config.access_directions,
+        )
+    });
     let mut candidates = CandidateAccumulator::new(limit);
     for (point_index, point) in points.into_iter().enumerate() {
         if point_index > 0 && (deadline.expired() || effort_exhausted(request, metrics)) {
             break;
         }
         metrics.candidate_points_considered = metrics.candidate_points_considered.saturating_add(1);
-        for &(rotation, physical, envelope) in &rotations {
+        for (rotation, physical, envelope, shape) in &rotations {
+            let (rotation, physical, envelope) = (*rotation, *physical, *envelope);
             if effort_exhausted(request, metrics) {
                 break;
             }
@@ -472,10 +553,28 @@ pub fn find_candidates_at_points(
                     .any(|index| {
                         metrics.collision_checks = metrics.collision_checks.saturating_add(1);
                         let existing = &state.packed.placements[index];
-                        envelope_box.intersects(existing.envelope_box())
-                            && !tentative
-                                .as_ref()
-                                .is_some_and(|placement| valid_nesting(existing, placement))
+                        if !envelope_box.intersects(existing.envelope_box()) {
+                            return false;
+                        }
+                        if tentative
+                            .as_ref()
+                            .is_some_and(|placement| valid_nesting(existing, placement))
+                        {
+                            return false;
+                        }
+                        let blocker = placed_hulls[index].as_deref();
+                        // The axis-aligned test is the broad phase and stays mandatory. Only
+                        // when a hull is one of the two solids does the exact test get to
+                        // overrule it, so a request of ordinary boxes never reaches here.
+                        if shape.is_none() && blocker.is_none() {
+                            return true;
+                        }
+                        solids_collide(
+                            shape.as_deref(),
+                            envelope_box,
+                            blocker,
+                            existing.envelope_box(),
+                        )
                     });
             if placement_collision {
                 continue;
@@ -489,6 +588,8 @@ pub fn find_candidates_at_points(
                 .any(|box_| {
                     metrics.collision_checks = metrics.collision_checks.saturating_add(1);
                     envelope_box.intersects(box_)
+                        && (shape.is_none()
+                            || solids_collide(shape.as_deref(), envelope_box, None, box_))
                 });
             if obstacle_collision {
                 continue;
@@ -555,6 +656,16 @@ pub fn find_candidates_at_points(
             {
                 continue;
             }
+            if stop_accessibility_base.as_ref().is_some_and(|base| {
+                !base.allows(
+                    envelope_box,
+                    &state.packed.placements,
+                    state.packed.container.inner_dimensions,
+                    &request.config.access_directions,
+                )
+            }) {
+                continue;
+            }
 
             let candidate = Candidate {
                 envelope_origin: point,
@@ -565,7 +676,13 @@ pub fn find_candidates_at_points(
                 support_ratio,
                 score: 0,
             };
-            if !candidate_respects_loads(state, item, &candidate, nested_support.as_ref()) {
+            if !candidate_respects_loads(
+                state,
+                item,
+                &candidate,
+                nested_support.as_ref(),
+                load_base.as_ref(),
+            ) {
                 continue;
             }
             if exceeds_void_fill_reserve(state, item, &candidate) {
@@ -943,6 +1060,8 @@ fn pack_container_plans(
 
 pub fn apply_candidate(state: &mut ContainerState, item: ItemInstance, candidate: &Candidate) {
     state.payload = state.payload.saturating_add(item.item.weight.0);
+    let compression_sensitive =
+        state.compression_sensitive || item.item.shape_type == ShapeType::Compressible;
     let placement_index = state.packed.placements.len();
     state.spatial_index.add(
         placement_index,
@@ -961,30 +1080,44 @@ pub fn apply_candidate(state: &mut ContainerState, item: ItemInstance, candidate
         support_ratio: candidate.support_ratio,
         top_load: Weight(0),
     };
-    state.used_volume = state
-        .used_volume
-        .saturating_add(used_volume_delta(&state.packed.placements, &placement));
+    if !compression_sensitive {
+        state.used_volume = state
+            .used_volume
+            .saturating_add(used_volume_delta(&state.packed.placements, &placement));
+    }
     state.stack_sensitive |= placement_stack_sensitive(&placement.instance.item);
     state.route_sensitive |= placement.instance.item.stop_index.is_some();
+    state.compression_sensitive = compression_sensitive;
     state.packed.placements.push(placement);
     let envelope_box = state.packed.placements[placement_index].envelope_box();
-    let covered = state
-        .points
-        .iter()
-        .filter(|(z, y, x)| {
-            point_inside(
-                Point {
-                    x: *x,
-                    y: *y,
-                    z: *z,
-                },
-                envelope_box,
-            )
-        })
-        .copied()
-        .collect::<Vec<_>>();
-    for key in covered {
-        state.points.remove(&key);
+    // Retiring a point because it falls inside a solid's box assumes the box *is* the solid.
+    // For a hull it is not: a placement origin is a corner of a bounding box, and a hull
+    // leaves most of that box -- including, for a wedge, the origin itself -- available to the
+    // next item. Pruning them first would mean the engine could describe an interlocking pack
+    // it could never propose, and the exact collision test would be correct and never
+    // consulted.
+    if state.packed.placements[placement_index]
+        .hull_shape()
+        .is_none()
+    {
+        let covered = state
+            .points
+            .iter()
+            .filter(|(z, y, x)| {
+                point_inside(
+                    Point {
+                        x: *x,
+                        y: *y,
+                        z: *z,
+                    },
+                    envelope_box,
+                )
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        for key in covered {
+            state.points.remove(&key);
+        }
     }
     for point in exposed_points(state, envelope_box) {
         absorb_point(state, point);
@@ -993,6 +1126,9 @@ pub fn apply_candidate(state: &mut ContainerState, item: ItemInstance, candidate
         for (placement, load) in state.packed.placements.iter_mut().zip(loads) {
             placement.top_load = Weight(load.clamp(0, i64::MAX as i128) as i64);
         }
+    }
+    if compression_sensitive {
+        state.used_volume = state.packed.used_volume();
     }
 }
 
@@ -1010,6 +1146,10 @@ fn point_inside_any_solid(state: &ContainerState, point: Point) -> bool {
         .packed
         .placements
         .iter()
+        // A hull leaves most of its bounding box free, including -- for a wedge -- the origin
+        // itself, so treating that box as solid would drop exactly the points an interlocking
+        // pack needs. The same rule the retirement path applies.
+        .filter(|placement| placement.hull_shape().is_none())
         .map(Placement::envelope_box)
         .chain(
             state
@@ -1224,6 +1364,7 @@ fn candidate_respects_loads(
     item: &ItemInstance,
     candidate: &Candidate,
     support_view: Option<&CandidateSupportView>,
+    load_base: Option<&ContactGraph>,
 ) -> bool {
     if !state.stack_sensitive
         && !placement_stack_sensitive(&item.item)
@@ -1238,6 +1379,7 @@ fn candidate_respects_loads(
             return false;
         };
         return stack_limits_valid(&support_view.placements, &support_view.graph)
+            && crushed(&support_view.placements, &loads).is_none()
             && stack_density_valid_with_loads(
                 &support_view.placements,
                 state.packed.container.max_stack_density,
@@ -1255,11 +1397,19 @@ fn candidate_respects_loads(
         support_ratio: candidate.support_ratio,
         top_load: Weight(0),
     });
-    let graph = ContactGraph::from_placements(&placements);
+    // With no nesting anywhere in this container, the placement graph *is* the face
+    // graph, so a base prepared for this sweep answers by appending one box. Without one,
+    // the from-scratch build stays authoritative -- and the two are required to agree
+    // exactly, which is what `contact_graph`'s append property test holds them to.
+    let graph = match load_base {
+        Some(base) => base.with_box(placements[placements.len() - 1].envelope_box()),
+        None => ContactGraph::from_placements(&placements),
+    };
     let Some(loads) = calculate_top_loads_with_graph(&placements, &graph) else {
         return false;
     };
     stack_limits_valid(&placements, &graph)
+        && crushed(&placements, &loads).is_none()
         && stack_density_valid_with_loads(
             &placements,
             state.packed.container.max_stack_density,
@@ -1321,6 +1471,188 @@ fn ground_contact_allowed_from_view(
 /// docs/VALIDATION-CONTRACT.md and the shared validator already assume.
 const RIDES_THE_WHOLE_ROUTE: usize = usize::MAX;
 
+/// Corridors that are open in one immutable placement state.
+///
+/// Construction is `O(m² * |D|)` time and `O(m * |D|)` space. Every candidate then costs
+/// `O(m * |D|)` rather than rebuilding the same placed-vs-placed intersections.
+struct StopAccessibilityBase {
+    candidate_stop: usize,
+    stops: Vec<usize>,
+    clear_sweeps: Vec<Vec<geometry::SweptRegion>>,
+    inert: bool,
+}
+
+impl StopAccessibilityBase {
+    fn new(
+        candidate_stop: Option<usize>,
+        placements: &[Placement],
+        container: Dimensions,
+        directions: &[String],
+    ) -> Self {
+        let candidate_stop = candidate_stop.unwrap_or(RIDES_THE_WHOLE_ROUTE);
+        let stops = placements
+            .iter()
+            .map(|placement| {
+                placement
+                    .instance
+                    .item
+                    .stop_index
+                    .unwrap_or(RIDES_THE_WHOLE_ROUTE)
+            })
+            .collect::<Vec<_>>();
+        let inert = directions.is_empty() || stops.iter().all(|stop| *stop == candidate_stop);
+        if inert {
+            return Self {
+                candidate_stop,
+                stops,
+                clear_sweeps: Vec::new(),
+                inert,
+            };
+        }
+
+        let boxes = placements
+            .iter()
+            .map(Placement::envelope_box)
+            .collect::<Vec<_>>();
+        let clear_sweeps = boxes
+            .iter()
+            .enumerate()
+            .map(|(index, box_)| {
+                if stops[index] == RIDES_THE_WHOLE_ROUTE {
+                    return Vec::new();
+                }
+                directions
+                    .iter()
+                    .filter_map(|direction| geometry::swept_volume(*box_, container, direction))
+                    .filter(|sweep| {
+                        !boxes.iter().enumerate().any(|(other, other_box)| {
+                            other != index
+                                && stops[other] > stops[index]
+                                && geometry::sweep_intersects(*sweep, *other_box)
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            candidate_stop,
+            stops,
+            clear_sweeps,
+            inert,
+        }
+    }
+
+    fn allows(
+        &self,
+        candidate: Aabb,
+        placements: &[Placement],
+        container: Dimensions,
+        directions: &[String],
+    ) -> bool {
+        if self.inert {
+            return true;
+        }
+
+        for (index, sweeps) in self.clear_sweeps.iter().enumerate() {
+            if self.candidate_stop <= self.stops[index] {
+                continue;
+            }
+            if !sweeps
+                .iter()
+                .any(|sweep| !geometry::sweep_intersects(*sweep, candidate))
+            {
+                return false;
+            }
+        }
+
+        if self.candidate_stop == RIDES_THE_WHOLE_ROUTE {
+            return true;
+        }
+        directions.iter().any(|direction| {
+            geometry::swept_volume(candidate, container, direction).is_some_and(|sweep| {
+                !placements.iter().zip(&self.stops).any(|(placement, stop)| {
+                    *stop > self.candidate_stop
+                        && geometry::sweep_intersects(sweep, placement.envelope_box())
+                })
+            })
+        })
+    }
+}
+
+/// The horizontal half of route order: nothing due later may stand between an earlier item
+/// and a door.
+///
+/// `route_contact_allowed` above enforces the vertical half -- nothing due later may rest
+/// *above* something due earlier. Both are necessary and neither implies the other;
+/// docs/STOP-ACCESSIBILITY.md derives the rule and the post-validator's whole-scene replay
+/// remains the sufficient check.
+///
+/// Inert unless the caller supplied exit directions, because the request schema has no
+/// field for them: assuming all six walls open would enforce a rule true of no real
+/// vehicle and nearly vacuous besides, since a box is almost always free through *some*
+/// face.
+///
+/// The blocker set is `{q : s(q) > s(p)}` -- strictly later. Items due at the *same* stop
+/// are excluded because the order within a stop is free: whichever is in the way comes off
+/// first. Using `>=` would refuse two same-stop pallets standing one behind the other.
+#[cfg(test)]
+fn stop_accessible(
+    candidate_stop: Option<usize>,
+    candidate: Aabb,
+    placements: &[Placement],
+    container: Dimensions,
+    directions: &[String],
+) -> bool {
+    if directions.is_empty() {
+        return true;
+    }
+    let candidate_stop = candidate_stop.unwrap_or(RIDES_THE_WHOLE_ROUTE);
+    let stop_of = |placement: &Placement| {
+        placement
+            .instance
+            .item
+            .stop_index
+            .unwrap_or(RIDES_THE_WHOLE_ROUTE)
+    };
+    if placements
+        .iter()
+        .all(|placement| stop_of(placement) == candidate_stop)
+    {
+        return true;
+    }
+    for (index, placement) in placements.iter().enumerate() {
+        let stop = stop_of(placement);
+        if candidate_stop <= stop {
+            continue;
+        }
+        let box_ = placement.envelope_box();
+        let open = directions.iter().any(|direction| {
+            geometry::swept_volume(box_, container, direction).is_some_and(|sweep| {
+                !geometry::sweep_intersects(sweep, candidate)
+                    && !placements.iter().enumerate().any(|(other, blocker)| {
+                        other != index
+                            && stop_of(blocker) > stop
+                            && geometry::sweep_intersects(sweep, blocker.envelope_box())
+                    })
+            })
+        });
+        if !open {
+            return false;
+        }
+    }
+    if candidate_stop == RIDES_THE_WHOLE_ROUTE {
+        return true;
+    }
+    directions.iter().any(|direction| {
+        geometry::swept_volume(candidate, container, direction).is_some_and(|sweep| {
+            !placements.iter().any(|blocker| {
+                stop_of(blocker) > candidate_stop
+                    && geometry::sweep_intersects(sweep, blocker.envelope_box())
+            })
+        })
+    })
+}
+
 fn route_contact_allowed(
     candidate_stop: Option<usize>,
     candidate: Aabb,
@@ -1371,15 +1703,49 @@ fn exceeds_void_fill_reserve(
         support_ratio: candidate.support_ratio,
         top_load: Weight(0),
     };
-    state
-        .used_volume
-        .saturating_add(used_volume_delta(&state.packed.placements, &placement))
-        .saturating_add(reserve)
-        > state.packed.container.inner_dimensions.volume()
+    let projected = if state.compression_sensitive
+        || item.item.shape_type == ShapeType::Compressible
+    {
+        // A zero-load candidate is at its largest, while appending it can only shrink
+        // existing compressible supports. When this upper bound fits, an exact graph
+        // refresh cannot turn it into a reserve violation. Only candidates close to the
+        // boundary pay the non-local calculation.
+        let upper_bound = state
+            .used_volume
+            .saturating_add(occupied_volume(&placement));
+        if upper_bound.saturating_add(reserve) <= state.packed.container.inner_dimensions.volume() {
+            upper_bound
+        } else {
+            used_volume_with_current_loads(&state.packed, placement)
+        }
+    } else {
+        state
+            .used_volume
+            .saturating_add(used_volume_delta(&state.packed.placements, &placement))
+    };
+    projected.saturating_add(reserve) > state.packed.container.inner_dimensions.volume()
+}
+
+/// Physical volume after an appended placement changes the support loads in the scene.
+///
+/// Compression makes the delta non-local: an upper item can shrink existing supports.
+/// The ordinary rigid path remains O(1). One composite refresh is
+/// O(n log n + q + e) time and O(n + e) graph space, where q is broad-phase work and e
+/// is the contact-edge count; both are O(n^2) in a physically dense worst case. The
+/// whole-solve sum over candidates and search nodes is documented separately.
+fn used_volume_with_current_loads(packed: &PackedContainer, placement: Placement) -> i128 {
+    let mut projected = packed.clone();
+    projected.placements.push(placement);
+    if let Some(loads) = calculate_top_loads(&projected.placements) {
+        for (placement, load) in projected.placements.iter_mut().zip(loads) {
+            placement.top_load = Weight(load.clamp(0, i64::MAX as i128) as i64);
+        }
+    }
+    projected.used_volume()
 }
 
 fn placement_stack_sensitive(item: &Item) -> bool {
-    !item.stackable || item.max_top_load.is_some() || item.max_stacked_items.is_some()
+    item.is_stack_sensitive()
 }
 
 /// Physical-volume change from appending one placement.
@@ -1389,7 +1755,7 @@ fn placement_stack_sensitive(item: &Item) -> bool {
 /// space. This replaces cloning the whole container and recomputing O(n^2) nesting
 /// volume for every candidate orientation.
 fn used_volume_delta(placements: &[Placement], placement: &Placement) -> i128 {
-    let mut delta = placement.dimensions.volume();
+    let mut delta = occupied_volume(placement);
     let Some(depth) = placement.instance.item.nesting_height else {
         return delta;
     };
@@ -1809,6 +2175,11 @@ fn try_pack_into_beam(
     };
     let mut beam = vec![initial];
     let mut nodes = 0_usize;
+    //: Which batch the loop stopped before, when it stopped early. The surviving beam
+    //: nodes have consumed batches `0..pending_from` and nothing after, so completing one
+    //: of them means adding `batches[pending_from..]` to its unplaced list -- see the
+    //: final selection below for why leaving that out lost items outright.
+    let mut pending_from: Option<usize> = None;
 
     for (position, batch) in batches.iter().enumerate() {
         let future = batches[position + 1..]
@@ -1890,14 +2261,36 @@ fn try_pack_into_beam(
             }
         }
         if expansions.is_empty() || exhausted {
+            pending_from = Some(position);
             break;
         }
         expansions.sort_by_key(|node| container_beam_key(node, &future));
         expansions.truncate(request.config.container_plan_beam_width);
         beam = expansions;
     }
+    // Every node still in the beam has to account for the batches the loop never reached
+    // before it can be compared with the incumbent, or chosen over it.
+    //
+    // On a loop that ran to the end this changes nothing: the beam then holds expansions
+    // of the final batch, each of which was already compared above with an empty future,
+    // so `pending` is empty and the block is the no-op it always was. On a loop that
+    // stopped early -- deadline, `container_plan_node_limit`, or an exhausted effort
+    // budget, all three reachable through public configuration -- the beam holds nodes
+    // from *before* the current batch, and taking one without its tail returned a result
+    // that neither placed those items nor reported them unpacked. They simply
+    // disappeared: 112 requested, 43 placed, 0 unpacked, on a 3-type BR instance at
+    // `container_plan_node_limit: 4`. The engine's own independent validator caught the
+    // accounting hole and refused the whole request, so no wrong answer ever escaped --
+    // but a legal request failed outright, which is why this is a fix and not a tidy-up.
+    let pending: Vec<ItemInstance> = pending_from
+        .map(|from| batches[from..].iter().flatten().cloned().collect())
+        .unwrap_or_default();
     if let Some(completed) = beam
         .into_iter()
+        .map(|mut node| {
+            node.unplaced.extend(pending.iter().cloned());
+            node
+        })
         .min_by_key(|node| container_beam_key(node, &[]))
         && container_beam_key(&completed, &[]) < container_beam_key(&incumbent, &[])
     {
@@ -2325,6 +2718,10 @@ mod tests {
             stop_index: None,
             eligible_container_tags: BTreeSet::new(),
             value: None,
+            shape_type: crate::geometry::ShapeType::RigidCuboid,
+            hull_vertices: None,
+            compression_ratio_ppm: None,
+            max_compression_pressure_kpa: None,
         }
     }
 
@@ -2367,6 +2764,141 @@ mod tests {
             output_weight_unit: "ticks".into(),
             catalog_versions_used: Vec::new(),
         }
+    }
+
+    /// Every instance the beam was handed comes back either placed or unplaced.
+    ///
+    /// The invariant is the whole contract of `try_pack_into_beam`'s return value, and it
+    /// held only while the loop ran to the end. On an early stop -- a node limit here, a
+    /// deadline or an exhausted effort budget in the field -- the surviving beam nodes
+    /// still had every unvisited batch missing from their unplaced list, and choosing one
+    /// of them dropped those items on the floor. It is asserted with a *node limit*
+    /// rather than a short deadline on purpose: this is a counted, clock-free reproduction
+    /// that cannot go quiet on a fast host, and `container_plan_node_limit` is public
+    /// configuration, so the hole was reachable without any timing at all.
+    /// The same accounting invariant, across every shape that reaches the early stop.
+    ///
+    /// The regression test below pins one scene, because one scene is what it took to
+    /// reproduce the defect. That leaves the invariant asserted on a single arrangement of
+    /// item size, beam width and node limit -- and the defect it was written for had
+    /// survived three releases precisely because nobody had varied those.
+    ///
+    /// A node limit of zero and a beam width of one are the two configurations most likely
+    /// to be wrong and least likely to be typed: zero stops the loop before any expansion
+    /// exists, and one leaves the beam holding only its initial empty node.
+    #[test]
+    fn the_beam_accounts_for_every_instance_across_widths_and_limits() {
+        for (extent, width, limit, count) in [
+            (600_i64, 1_usize, 0_usize, 5_usize), // stops before the first expansion
+            (600, 1, 1, 5),
+            (600, 4, 0, 12),
+            (600, 4, 3, 12),
+            (600, 16, 100, 12), // never stops early at all
+            (10, 4, 3, 12),     // everything fits; the incumbent is complete
+            (600, 4, 3, 1),     // one instance, one batch
+            (600, 4, 3, 2),
+        ] {
+            let mut item_type = item("beamed");
+            item_type.dimensions = dimensions(extent, extent, extent);
+            let instances = (1..=count as u32)
+                .map(|sequence| ItemInstance {
+                    item: item_type.clone(),
+                    sequence: sequence as usize,
+                })
+                .collect::<Vec<_>>();
+            let mut request = request(&item_type, &container(), None);
+            request.config.container_plan_beam_width = width;
+            request.config.container_plan_node_limit = limit;
+
+            let mut metrics = SolverMetrics::default();
+            let (state, unplaced) = try_pack_into_beam(
+                &container(),
+                1,
+                &instances,
+                &request,
+                &[],
+                &[],
+                &Deadline::new(request.config.time_limit_ms),
+                &mut metrics,
+            );
+
+            let mut seen = state
+                .packed
+                .placements
+                .iter()
+                .map(|placement| placement.instance.id())
+                .collect::<BTreeSet<_>>();
+            seen.extend(unplaced.iter().map(ItemInstance::id));
+            assert_eq!(
+                seen,
+                instances
+                    .iter()
+                    .map(ItemInstance::id)
+                    .collect::<BTreeSet<_>>(),
+                "extent {extent}, width {width}, limit {limit}, {count} instances: an \
+                 instance was lost, reported twice, or invented",
+            );
+            assert_eq!(
+                state.packed.placements.len() + unplaced.len(),
+                instances.len(),
+                "extent {extent}, width {width}, limit {limit}, {count} instances",
+            );
+        }
+    }
+
+    #[test]
+    fn the_container_beam_accounts_for_every_instance_when_it_stops_early() {
+        // Deliberately too large to share the container: only one instance fits, so the
+        // greedy incumbent carries eleven unplaced items and any beam node not yet offered
+        // a batch it must skip looks perfect beside it. That is the arrangement in which a
+        // truncated node wins the comparison -- in a scene where everything fits the
+        // incumbent is unplaced-free too, the truncated node never wins, and the hole stays
+        // hidden behind an assertion that passes for the wrong reason.
+        let mut narrow = item("beamed");
+        narrow.dimensions = dimensions(600, 600, 600);
+        let instances = (1..=12)
+            .map(|sequence| ItemInstance {
+                item: narrow.clone(),
+                sequence,
+            })
+            .collect::<Vec<_>>();
+        let mut request = request(&narrow, &container(), None);
+        request.config.container_plan_beam_width = 4;
+        request.config.container_plan_node_limit = 3;
+
+        let mut metrics = SolverMetrics::default();
+        let (state, unplaced) = try_pack_into_beam(
+            &container(),
+            1,
+            &instances,
+            &request,
+            &[],
+            &[],
+            &Deadline::new(request.config.time_limit_ms),
+            &mut metrics,
+        );
+
+        assert_eq!(
+            state.packed.placements.len() + unplaced.len(),
+            instances.len(),
+            "the beam stopped early and lost {} instance(s)",
+            instances.len() - state.packed.placements.len() - unplaced.len(),
+        );
+        let mut seen = state
+            .packed
+            .placements
+            .iter()
+            .map(|placement| placement.instance.id())
+            .collect::<BTreeSet<_>>();
+        seen.extend(unplaced.iter().map(ItemInstance::id));
+        assert_eq!(
+            seen,
+            instances
+                .iter()
+                .map(ItemInstance::id)
+                .collect::<BTreeSet<_>>(),
+            "an instance was reported twice or invented",
+        );
     }
 
     fn candidates_with_limit(limit: usize) -> (Vec<Candidate>, SolverMetrics) {
@@ -2489,6 +3021,7 @@ mod tests {
             &state,
             &second,
             &candidate_at(5),
+            None,
             None
         ));
         apply_candidate(&mut state, second, &candidate_at(5));
@@ -2501,6 +3034,7 @@ mod tests {
             &state,
             &third,
             &candidate_at(10),
+            None,
             None
         ));
     }
@@ -2645,5 +3179,123 @@ mod tests {
         assert!(candidates.is_empty());
         assert_eq!(metrics.support_checks, 1);
         assert_eq!(metrics.feasible_candidates, 0);
+    }
+
+    // ------------------------------------------- stop accessibility
+    //
+    // The worked examples in docs/STOP-ACCESSIBILITY.md live in
+    // `conformance/scene/stop-accessibility-fixtures.json` and are read from there, so this
+    // suite and the other three assert one table rather than four transcriptions of it.
+
+    /// Ticks, read straight rather than scaled: all four engines assert the same integers
+    /// instead of each applying its own conversion.
+    fn fixture_dimensions(raw: &serde_json::Value) -> Dimensions {
+        dimensions(
+            raw["length"].as_i64().unwrap(),
+            raw["width"].as_i64().unwrap(),
+            raw["height"].as_i64().unwrap(),
+        )
+    }
+
+    fn fixture_origin(raw: &serde_json::Value) -> Point {
+        Point {
+            x: raw["x"].as_i64().unwrap(),
+            y: raw["y"].as_i64().unwrap(),
+            z: raw["z"].as_i64().unwrap(),
+        }
+    }
+
+    /// An absent stop is `null` in the corpus and `None` here, which both engines then read
+    /// as the latest possible stop.
+    fn fixture_stop(raw: &serde_json::Value) -> Option<usize> {
+        raw["stop_index"].as_u64().map(|stop| stop as usize)
+    }
+
+    fn fixture_placement(raw: &serde_json::Value) -> Placement {
+        let mut placed = item(raw["id"].as_str().unwrap());
+        placed.dimensions = fixture_dimensions(&raw["dimensions"]);
+        placed.stop_index = fixture_stop(raw);
+        let origin = fixture_origin(&raw["origin"]);
+        let dims = placed.dimensions;
+        Placement {
+            instance: ItemInstance {
+                item: placed,
+                sequence: 1,
+            },
+            position: origin,
+            rotation: Rotation::Lwh,
+            dimensions: dims,
+            envelope_origin: origin,
+            envelope_dimensions: dims,
+            support_ratio: 1.0,
+            top_load: Weight(0),
+        }
+    }
+
+    /// Every scene in the shared corpus, with the verdict every engine must reach.
+    ///
+    /// `accessible` is asserted by all four engines and `route_order_allowed` here, in
+    /// Python and in PHP. `code` is not: this engine answers with a verdict rather than a
+    /// reason, and the corpus records which columns each engine can check.
+    #[test]
+    fn shared_four_language_stop_accessibility_scenes() {
+        // A cross-language corpus kept one level above this crate; a published copy does
+        // not carry it.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../../conformance/scene/stop-accessibility-fixtures.json");
+        let Ok(payload_text) = std::fs::read_to_string(&path) else {
+            eprintln!(
+                "skipping: the shared cross-language scene corpus is not part of this package"
+            );
+            return;
+        };
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).unwrap();
+        let scenes = payload["scenes"].as_array().unwrap();
+        assert!(
+            !scenes.is_empty(),
+            "an empty corpus would pass this loop without asserting anything",
+        );
+
+        for scene in scenes {
+            let id = scene["id"].as_str().unwrap();
+            let placements: Vec<Placement> = scene["placements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(fixture_placement)
+                .collect();
+            let raw = &scene["candidate"];
+            let candidate = Aabb {
+                origin: fixture_origin(&raw["origin"]),
+                dimensions: fixture_dimensions(&raw["dimensions"]),
+            };
+            let doors: Vec<String> = scene["directions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|door| door.as_str().unwrap().to_owned())
+                .collect();
+            let container = fixture_dimensions(&scene["container"]);
+            let base =
+                StopAccessibilityBase::new(fixture_stop(raw), &placements, container, &doors);
+
+            assert_eq!(
+                base.allows(candidate, &placements, container, &doors),
+                scene["accessible"].as_bool().unwrap(),
+                "{id}",
+            );
+            assert_eq!(
+                stop_accessible(fixture_stop(raw), candidate, &placements, container, &doors),
+                scene["accessible"].as_bool().unwrap(),
+                "from-scratch and candidate-sweep paths diverged for {id}",
+            );
+            if let Some(expected) = scene["route_order_allowed"].as_bool() {
+                assert_eq!(
+                    route_contact_allowed(fixture_stop(raw), candidate, &placements),
+                    expected,
+                    "{id}",
+                );
+            }
+        }
     }
 }

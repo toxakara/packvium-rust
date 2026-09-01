@@ -88,14 +88,12 @@ impl IndependentValidator {
                     .obstacles
                     .iter()
                     .flat_map(Obstacle::boxes)
-                    .any(|box_| placement.envelope_box().intersects(box_))
+                    .any(|box_| placement_hits_box(placement, box_))
                 {
                     issue(&mut issues, "obstacle_collision", &id);
                 }
                 for other in packed.placements.iter().skip(index + 1) {
-                    if placement.envelope_box().intersects(other.envelope_box())
-                        && !valid_nesting(placement, other)
-                    {
+                    if placements_collide(placement, other) && !valid_nesting(placement, other) {
                         issue(
                             &mut issues,
                             "overlap",
@@ -221,6 +219,11 @@ fn validate_top_loads_with_graph(
                 issue(issues, "top_load", &support.id);
             }
         }
+    }
+    // The same propagated loads in the other currency: a pressure the item itself must
+    // survive, rather than a mass the box below must bear.
+    if let Some((code, detail)) = crushed(&container.placements, &loads) {
+        issue(issues, &code, &detail);
     }
     if let Some(maximum) = container.container.max_stack_density {
         const SQUARE_METRE_TICKS: i128 = 16_000_000_i128 * 16_000_000_i128;
@@ -371,6 +374,10 @@ mod tests {
             stop_index: None,
             eligible_container_tags: BTreeSet::new(),
             value: None,
+            shape_type: crate::geometry::ShapeType::RigidCuboid,
+            hull_vertices: None,
+            compression_ratio_ppm: None,
+            max_compression_pressure_kpa: None,
         };
         let placements = (0..count)
             .map(|index| Placement {

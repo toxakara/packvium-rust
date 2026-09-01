@@ -50,6 +50,10 @@ fn item(id: &str, side_mm: i64) -> Item {
         stop_index: None,
         eligible_container_tags: BTreeSet::new(),
         value: None,
+        shape_type: packvium_core::ShapeType::RigidCuboid,
+        hull_vertices: None,
+        compression_ratio_ppm: None,
+        max_compression_pressure_kpa: None,
     }
 }
 

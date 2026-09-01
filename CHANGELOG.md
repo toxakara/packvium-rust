@@ -1,8 +1,64 @@
 # Changelog
 
 The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project
-adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — with the caveat
-that the public API is not frozen until `1.0.0`. Pin an exact version.
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). As of `1.0.0` the
+public API, the request and result schemas, the numeric and units policy, the validation
+rules and the compatibility policy are frozen: breaking any of them costs a major version.
+
+## [1.0.0]
+
+The stable core release. It freezes the contract that already exists rather than adding a
+feature wave: the public API, the request and result schemas, the numeric and units policy,
+the validation rules and the compatibility policy will not break without a major version.
+
+### Read this before depending on 1.0.0
+
+- **Platforms exercised for this release: Linux x86_64, Linux aarch64 and macOS arm64.**
+  Python wheels are built and installed into a clean Python 3.9 on all three; the PHP FFI
+  bridge is verified against the real shared library on PHP 8.2, 8.3, 8.4 and 8.5 on both
+  Linux architectures. **Windows and macOS x86_64 native binaries are not built and not
+  published.** Without a native binary the pure Python and PHP engines run unchanged — that
+  is the documented default, and it costs speed rather than correctness.
+- **Release artifacts carry no build-provenance attestation.** `gh attestation verify` will
+  not succeed against 1.0.0. The SBOM and SHA-256 manifests are the integrity evidence for
+  this release; check them before installing from anywhere other than the official
+  registry.
+
+### Added
+
+- **A sound lower bound on the objective, in every engine.** Computed from the request
+  alone before a search begins, and identical across the Python, PHP, Rust and JavaScript
+  implementations on 381 corpus cases. It is not a result field: reporting an optimality
+  gap would widen the contract this release exists to freeze.
+- **A declared numeric ceiling shared by all four engines.** A sum too large to stay exact
+  returns a structured refusal instead of a number that one language would round and
+  another would not. The limit is stated by the library rather than inherited from each
+  language, so the four agree about which requests are answerable.
+- **A published coverage frontier for optimality claims.** Where the bound is actually
+  attained is measured and committed, so `optimal` is bounded by evidence rather than used
+  as a label.
+
+### Fixed
+
+- **A bound could be returned that JavaScript cannot represent exactly.** Values above
+  `2^53-1` are now refused rather than silently rounded in one engine and exact in the
+  others.
+- **The prebuilt Node addon had no quality floor.** It is now held to a per-fixture budget
+  like the other independent engines.
+
+### Not claimed
+
+- **Identical placements across engines.** Different engines may return different, equally
+  valid arrangements. This is measured and budgeted, not accidental — and it includes the
+  JavaScript fallback and the prebuilt native addon, which differ on 18 of 397 corpus
+  fixtures.
+- **Optimal packings for arbitrary requests.** 3D packing remains NP-hard; the bound says
+  what is provable, not that every answer is optimal.
+- **Fastest engine.** Measured against other libraries on identical hardware, that claim is
+  false on latency, and no Packvium surface makes it. On the report's separate two-axis
+  time-and-peak-memory frontier, `packvium-rust` is Pareto-optimal in 6 of 9 profiles and
+  the only engine of ten never dominated. The latency result and the trade-off result are
+  reported together; neither is a general speed-leadership claim.
 
 ## [0.1.3]
 

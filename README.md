@@ -3,12 +3,17 @@
 Deterministic 3D cartonization and rectangular bin packing. No unsafe code, no runtime
 dependencies beyond `serde`, exact integer geometry.
 
-> **Version 0.1.3 — early release.** The public API is not frozen; pin an exact version.
+Full documentation, the constraint reference and benchmarks live at
+[packvium.com](https://packvium.com).
+
+> **Version 1.0.0 — the public API is frozen.** Field names, status codes and the
+> objective vector do not change without a major version, so any `1.x` is a safe upgrade
+> from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](docs/GUARANTEES.md) before relying on a result.
 
 ```toml
 [dependencies]
-packvium = "0.1"
+packvium = "1.0"
 ```
 
 ## Quick start
@@ -96,7 +101,7 @@ Documentation, the constraint reference and the benchmarks are at
 | --- | --- | --- |
 | Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
 | PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
-| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "0.1"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.0"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
 | Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
 | Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
 | PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |

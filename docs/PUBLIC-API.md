@@ -3,6 +3,32 @@
 ## Core inputs
 
 - `Item`: id, dimensions, weight, quantity, rotations, upright/floor/stacking rules, top-load limit, support ratio, group, tags, metadata, and an optional `nesting_height` (how much this item sinks into an identical one beneath it when stacked). Only the same item type with the exact same footprint may nest; its adjacent predecessor is one full-footprint direct supporter for support ratio, ground-contact, stack/load and route rules, while non-adjacent same-column face coincidences are shadowed. An optional, exact non-negative integer `value` (no unit or currency — the caller's own economic scale) means nothing to placement or to any other objective; only the `maximum_value` objective reads it.
+- **Item geometry beyond the box.** `shape_type` is an enum —
+  `rigid_cuboid` (the default), `convex_hull`, `compressible` — accompanied by
+  `hull_vertices`, `compression_ratio` and `max_compression_pressure_kpa`. **A request that
+  omits `shape_type` is unaffected**, byte for byte: the default is `rigid_cuboid`, the whole
+  existing golden corpus is unchanged, and writing `"shape_type": "rigid_cuboid"` explicitly
+  is served rather than refused.
+
+  The two other values are rolling out one engine at a time, which is what the fields were
+  reserved before the freeze for, and the rollout is finished: **all four engines implement
+  both**, and are held to byte-identical results on the shared fixtures. The one
+  recorded difference is the JavaScript fallback on a scene whose answer depends on item
+  ordering -- it makes a single ordering pass where the other three run a portfolio, so it can
+  pack validly but less densely; that is pinned in `conformance/native-quality-budget.json`
+  rather than left to drift.
+
+  Where they are implemented: a `convex_hull` item's collisions are decided by an exact
+  integer separating-axis test rather than by its box, and its occupied volume is the hull's
+  own — two complementary wedges share a crate that fits one of their bounding boxes. A
+  `compressible` item loses height linearly with the pressure resting on it, rounded up, and
+  a load above `max_compression_pressure_kpa` is refused as `crush_violation` rather than
+  packed. Three situations deliberately fall back to the bounding box, always over-reserving
+  space: a configured `clearance`, an item on a route (`stop_index`), and the uniform-lattice
+  fast path. Hull coordinates are non-negative offsets from the corner of the item's own
+  bounding box and are capped at 10^8 length ticks -- 6.25 m, beyond ordinary parcel sizes, and the
+  bound that keeps the exact geometry inside a 64-bit integer everywhere it can be.
+  IRREGULAR-ITEMS.md is the model and states why.
 - `Container`: id, inner/outer dimensions, tare/payload, cost, inventory quantity,
   obstacles (each a union of one or more exact boxes — `additional_boxes`
   approximates a non-rectangular zone such as a wheel arch or tapered roof without

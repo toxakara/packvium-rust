@@ -42,6 +42,33 @@ The JavaScript fallback also performs load distribution in `BigInt`: every
 when the intermediate product exceeds `Number` precision. The final tick count is
 converted back to a number only at the existing JSON boundary.
 
+## The bound path's declared ceiling
+
+`docs/OPTIMALITY-CERTIFICATES.md` defines lower bounds on the objective. Their arithmetic is
+integer-only, and the limit at which they refuse is **declared rather than inherited from the
+language**: every sum in that path must stay below `10^30`, and exceeding it is a structured
+refusal in all four engines rather than a number.
+
+The reason is the same one this document already gives for coordinates, taken one step
+further. Python's integers are unbounded, PHP's silently become doubles on overflow,
+JavaScript's `Number` stops being exact past `2^53`, and Rust's `i128` wraps. Four engines
+refusing at four native limits would disagree about which requests are answerable at all --
+a caller would get a number from one and a refusal from another for the same input. So each
+carries the guarded sums in a representation that holds `10^30` exactly: Python's `int`,
+PHP's `BigInt` decimal strings, JavaScript's `BigInt`, Rust's `i128`.
+
+That intermediate ceiling is deliberately not the result ceiling. The five bound keys can
+cross JSON and are returned as JavaScript `Number` values, so every engine also refuses a
+final key above **`2^53 - 1` (`9,007,199,254,740,991`)**. This is the largest integer all four
+bindings can return without changing its value. In particular, an unlimited inventory does
+not make an expensive container count as one during validation: the selected opening costs
+are summed exactly, checked against `10^30`, then checked against the portable result ceiling
+before PHP or JavaScript converts them to a native integer.
+
+The value comes from the widest intermediate the formulas form -- a summed volume times
+`10^6` -- which puts the largest product at `10^36`, about 170-fold inside an `i128`. It never
+binds on a real request: `10^30` cubic ticks is 244 million cubic metres.
+
 ## Decimal rendering
 
 `value` fields (e.g. `Length.decimal()`, `Weight.decimal()`, PHP's `RationalParser::decimalString()`) render an exact `ticks / divisor` rational to a fixed number of digits (8 by default). All four engines round the truncated remainder **ties-to-even**, matching Python's `Decimal.quantize` under its default context — the last kept digit rounds up when the discarded remainder is more than half the divisor, stays put when it's less, and on an exact half rounds to whichever choice makes that digit even.
