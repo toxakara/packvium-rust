@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-Only the latest `0.1.x` release receives fixes. This is an early release; there is no
-long-term support branch yet.
+Only the latest `1.x` release receives fixes. The `0.1.x` line is superseded by `1.0.0`
+and receives none. There is no long-term support branch for older majors.
 
 ## Reporting a vulnerability
 

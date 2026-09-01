@@ -1,6 +1,6 @@
 [package]
 name = "packvium"
-version = "0.1.3"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -16,7 +16,7 @@ authors = ["Packvium contributors"]
 # The published package name is `packvium`, matching the Python and PHP packages.
 # The library keeps its internal name, `packvium_core`, so `use packvium_core::...`
 # is what every example and every downstream caller writes -- only the line that pulls
-# it into Cargo.toml (`packvium = "0.1"`) mentions the published name.
+# it into Cargo.toml (`packvium = "1.0"`) mentions the published name.
 [lib]
 name = "packvium_core"
 path = "src/lib.rs"

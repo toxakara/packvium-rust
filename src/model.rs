@@ -1,4 +1,8 @@
-use crate::geometry::{Aabb, Dimensions, Point, Rotation};
+use std::rc::Rc;
+
+use crate::compression;
+use crate::geometry::{Aabb, Dimensions, Point, Rotation, ShapeType};
+use crate::hull::{self, HullShape, Vertex};
 use crate::units::{Length, Weight};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -81,6 +85,15 @@ pub struct PackingConfig {
     pub container_plan_beam_width: usize,
     /// Counted-work ceiling for partial container-plan nodes.
     pub container_plan_node_limit: usize,
+    /// The container walls an item may be unloaded through, for the
+    /// stop-accessibility rule. Empty (the default) disables the check entirely and
+    /// reproduces every existing result byte-for-byte.
+    ///
+    /// Programmatic only, and deliberately so: the request schema has no
+    /// access-directions field yet, and defaulting to all six walls would enforce a rule
+    /// true of no real vehicle. A caller who wants the check states the doors in code, the
+    /// same way the Python and PHP engines take them.
+    pub access_directions: Vec<String>,
 }
 
 impl Default for PackingConfig {
@@ -107,6 +120,7 @@ impl Default for PackingConfig {
             require_placement_coordinates: true,
             container_plan_beam_width: 1,
             container_plan_node_limit: 1,
+            access_directions: Vec::new(),
         }
     }
 }
@@ -137,6 +151,202 @@ pub struct Item {
     /// item as equally worth leaving behind. `None` never affects placement or
     /// scoring under any objective, `maximum_value` included.
     pub value: Option<usize>,
+    /// How much of `dimensions` this item actually occupies. The default is the
+    /// contract as it stood before this epic -- the item is its box -- and the three fields
+    /// below are the data the two narrower shapes need. Each belongs to exactly one shape;
+    /// setting one against the wrong shape is refused rather than ignored, because a
+    /// `compression_ratio` silently dropped on a `convex_hull` reads as an item packed to
+    /// limits it never had.
+    pub shape_type: ShapeType,
+    pub hull_vertices: Option<Vec<Vertex>>,
+    pub compression_ratio_ppm: Option<i64>,
+    pub max_compression_pressure_kpa: Option<i64>,
+}
+
+impl Placement {
+    /// This placement's rotated hull, or `None` when its box is the honest answer.
+    ///
+    /// `None` for every `rigid_cuboid` and for the cases `Item::hull_collision_is_exact`
+    /// names. Shared rather than owned: building a hull is `O(v^4)`, `hull::shape_for`
+    /// memoises it per item and rotation, and handing back a clone would give a good part of
+    /// that saving straight back to the collision predicate that asks for it.
+    pub fn hull_shape(&self) -> Option<Rc<HullShape>> {
+        let item = &self.instance.item;
+        let same_envelope = self.envelope_dimensions == self.dimensions;
+        if !item.hull_collision_is_exact(same_envelope) {
+            return None;
+        }
+        let vertices = item.hull_vertices.as_ref()?;
+        hull::shape_for(vertices, hull::source_axes(self.rotation))
+    }
+}
+
+/// Do two placed items actually overlap?
+///
+/// The axis-aligned envelope test is the broad phase and stays mandatory; this refines its
+/// answer only when a hull is one of the two solids. One definition, so the solver, the
+/// sequence check and the validator cannot disagree about what "collides" means.
+/// Space one placement actually takes, which is its box only if it is one.
+///
+/// A `convex_hull` item occupies its hull: counting the bounding box is not a conservative
+/// approximation of utilisation but a wrong number, putting two interlocking wedges at 200% of
+/// a crate. A `compressible` item occupies the height left after the load it reports, which is
+/// what makes `compression_ratio` observable at all.
+pub fn occupied_volume(placement: &Placement) -> i128 {
+    let item = &placement.instance.item;
+    if item.shape_type == ShapeType::ConvexHull
+        && let Some(vertices) = &item.hull_vertices
+        && let Some(shape) = hull::shape_for(vertices, hull::source_axes(placement.rotation))
+    {
+        // A route or clearance may make collision use the conservative envelope. Physical
+        // volume remains the authored hull and must not inherit that collision fallback.
+        return shape.volume;
+    }
+    let Some(limit) = item.max_compression_pressure_kpa else {
+        return placement.dimensions.volume();
+    };
+    let footprint = placement.dimensions.base_area();
+    let Ok(pressure) = compression::applied_pressure(placement.top_load.0, footprint) else {
+        return placement.dimensions.volume();
+    };
+    // A crushed item has no meaningful occupied volume, and the arrangement is already invalid
+    // -- the crush check refuses it and the validator reports it. Reporting the uncompressed
+    // figure keeps that one reported issue rather than a second, quieter one.
+    if pressure.exceeds(limit).unwrap_or(true) {
+        return placement.dimensions.volume();
+    }
+    match compression::effective_height(
+        placement.dimensions.height.0,
+        item.compression_ratio_ppm.unwrap_or(0),
+        limit,
+        pressure,
+    ) {
+        Ok(height) => footprint.saturating_mul(i128::from(height)),
+        Err(_) => placement.dimensions.volume(),
+    }
+}
+
+/// First compressible unit carrying more pressure than it declared it can take.
+///
+/// Deliberately shaped like the bearing check and reading the same propagated loads: the two
+/// answer one question in two currencies -- a mass the box below must bear, against a pressure
+/// the item itself must survive. An item can pass one and fail the other, so both are asked.
+pub fn crushed(placements: &[Placement], loads: &[i128]) -> Option<(String, String)> {
+    for (placement, load) in placements.iter().zip(loads) {
+        let item = &placement.instance.item;
+        let Some(limit) = item.max_compression_pressure_kpa else {
+            continue;
+        };
+        let footprint = placement.envelope_dimensions.base_area();
+        let carried = (*load).clamp(0, i128::from(i64::MAX)) as i64;
+        let exceeded = compression::applied_pressure(carried, footprint)
+            .and_then(|pressure| pressure.exceeds(limit))
+            .unwrap_or(true);
+        if exceeded {
+            return Some(("crush_violation".into(), placement.instance.id()));
+        }
+    }
+    None
+}
+
+pub fn placements_collide(left: &Placement, right: &Placement) -> bool {
+    let left_box = left.envelope_box();
+    let right_box = right.envelope_box();
+    if !left_box.intersects(right_box) {
+        return false;
+    }
+    let (left_shape, right_shape) = (left.hull_shape(), right.hull_shape());
+    if left_shape.is_none() && right_shape.is_none() {
+        return true;
+    }
+    solids_collide(
+        left_shape.as_deref(),
+        left_box,
+        right_shape.as_deref(),
+        right_box,
+    )
+}
+
+/// Whether a placed item overlaps a plain box -- an obstacle, or any other fixed solid.
+pub fn placement_hits_box(placement: &Placement, box_: Aabb) -> bool {
+    let envelope = placement.envelope_box();
+    if !envelope.intersects(box_) {
+        return false;
+    }
+    match placement.hull_shape() {
+        None => true,
+        Some(shape) => solids_collide(Some(&shape), envelope, None, box_),
+    }
+}
+
+/// Exact overlap between two solids of which at least one is a hull.
+///
+/// Reached only after the axis-aligned test has said their envelopes overlap, so the cost is
+/// paid on the small set of pairs where a box answer would have been wrong.
+pub fn solids_collide(
+    left: Option<&HullShape>,
+    left_box: Aabb,
+    right: Option<&HullShape>,
+    right_box: Aabb,
+) -> bool {
+    let left_owned;
+    let left_shape = match left {
+        Some(shape) => shape,
+        None => {
+            left_owned = box_shape_of(left_box);
+            &left_owned
+        }
+    };
+    let right_owned;
+    let right_shape = match right {
+        Some(shape) => shape,
+        None => {
+            right_owned = box_shape_of(right_box);
+            &right_owned
+        }
+    };
+    hull::collide(
+        left_shape,
+        [left_box.origin.x, left_box.origin.y, left_box.origin.z],
+        right_shape,
+        [right_box.origin.x, right_box.origin.y, right_box.origin.z],
+    )
+}
+
+fn box_shape_of(box_: Aabb) -> HullShape {
+    HullShape::box_shape(
+        box_.dimensions.length.0,
+        box_.dimensions.width.0,
+        box_.dimensions.height.0,
+    )
+}
+
+impl Item {
+    /// Whether what rests on this item can change a verdict.
+    ///
+    /// The three original reasons are about the item refusing load. The fourth is about the
+    /// item *yielding* to it: a compressible item needs the cumulative mass above it before
+    /// its occupied height -- or its crush limit -- means anything.
+    pub fn is_stack_sensitive(&self) -> bool {
+        !self.stackable
+            || self.max_top_load.is_some()
+            || self.max_stacked_items.is_some()
+            || self.max_compression_pressure_kpa.is_some()
+    }
+
+    /// Whether this item's collisions may be decided by its hull rather than by its box.
+    ///
+    /// Three conditions, each falling back to the box for its own reason: it is not a
+    /// `convex_hull`; a clearance has inflated the envelope past the physical box, and a
+    /// margin around a hull is not a hull; or the item is on a route, where the sequence
+    /// replay reasons with box sweeps only and packing tighter than it can verify would
+    /// produce arrangements the engine then reports as unloadable. Every fallback
+    /// over-reserves space, the only safe direction to be wrong in.
+    pub fn hull_collision_is_exact(&self, envelope_matches_physical: bool) -> bool {
+        self.shape_type == ShapeType::ConvexHull
+            && envelope_matches_physical
+            && self.stop_index.is_none()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -504,11 +714,7 @@ impl PackedContainer {
         if let Some(summary) = &self.lattice_summary {
             return summary.used_volume_ticks();
         }
-        let total = self
-            .placements
-            .iter()
-            .map(|placement| placement.dimensions.volume())
-            .sum::<i128>();
+        let total = self.placements.iter().map(occupied_volume).sum::<i128>();
         let mut overlap = 0_i128;
         for (index, placement) in self.placements.iter().enumerate() {
             for other in self.placements.iter().skip(index + 1) {
@@ -1271,5 +1477,245 @@ impl PackingResult {
             "warnings": self.warnings.clone(),
             "alternatives": alternatives,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The hull-versus-box collision path, and what a placement is counted as occupying.
+    //!
+    //! The shared request corpus compares this engine's answers against the other three.
+    //! What whole-request comparison cannot show is a branch: it exercises
+    //! whole requests, so `solids_collide`'s box fallbacks and `occupied_volume`'s refusal
+    //! paths were reachable from a packing and unreachable from `cargo test`. That is how
+    //! `model.rs` came to sit a point below its coverage baseline while every answer-level
+    //! check was green.
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::*;
+    use crate::geometry::{Dimensions, Point, Rotation, ShapeType};
+    use crate::units::{Length, Weight};
+
+    const SIDE: i64 = 100;
+
+    /// The half-cube that made hulls worth having: it leaves the far top corner of its own
+    /// bounding box empty, which is exactly where a box test and a hull test disagree.
+    fn wedge() -> Vec<Vertex> {
+        vec![
+            [0, 0, 0],
+            [SIDE, 0, 0],
+            [0, SIDE, 0],
+            [0, 0, SIDE],
+            [SIDE, 0, SIDE],
+            [0, SIDE, SIDE],
+        ]
+    }
+
+    fn item(id: &str, shape: ShapeType, vertices: Option<Vec<Vertex>>) -> Item {
+        Item {
+            id: id.into(),
+            dimensions: Dimensions {
+                length: Length(SIDE),
+                width: Length(SIDE),
+                height: Length(SIDE),
+            },
+            weight: Weight(0),
+            quantity: 1,
+            allowed_rotations: vec![Rotation::Lwh],
+            stackable: true,
+            must_be_on_floor: false,
+            max_top_load: None,
+            minimum_support_ratio: 0.0,
+            group: None,
+            tags: BTreeSet::new(),
+            incompatible_tags: BTreeSet::new(),
+            priority: 0,
+            metadata: BTreeMap::new(),
+            nesting_height: None,
+            max_stacked_items: None,
+            ground_contact_rule: None,
+            stop_index: None,
+            value: None,
+            shape_type: shape,
+            hull_vertices: vertices,
+            compression_ratio_ppm: None,
+            max_compression_pressure_kpa: None,
+            eligible_container_tags: BTreeSet::new(),
+        }
+    }
+
+    fn placed(item: Item, at: (i64, i64, i64)) -> Placement {
+        let position = Point {
+            x: at.0,
+            y: at.1,
+            z: at.2,
+        };
+        Placement {
+            instance: ItemInstance {
+                item: item.clone(),
+                sequence: 1,
+            },
+            position,
+            rotation: Rotation::Lwh,
+            dimensions: item.dimensions,
+            envelope_origin: position,
+            envelope_dimensions: item.dimensions,
+            support_ratio: 1.0,
+            top_load: Weight(0),
+        }
+    }
+
+    fn cube_at(at: (i64, i64, i64), side: i64) -> Aabb {
+        Aabb {
+            origin: Point {
+                x: at.0,
+                y: at.1,
+                z: at.2,
+            },
+            dimensions: Dimensions {
+                length: Length(side),
+                width: Length(side),
+                height: Length(side),
+            },
+        }
+    }
+
+    /// The corner a bounding box claims and a wedge does not.
+    #[test]
+    fn a_hull_does_not_hit_a_box_in_the_corner_it_leaves_empty() {
+        let hull = placed(item("w", ShapeType::ConvexHull, Some(wedge())), (0, 0, 0));
+        let empty_corner = cube_at((60, 60, 60), 30);
+        assert!(
+            hull.envelope_box().intersects(empty_corner),
+            "the envelopes must overlap, or the broad phase would answer and prove nothing"
+        );
+        assert!(!placement_hits_box(&hull, empty_corner));
+    }
+
+    #[test]
+    fn a_hull_hits_a_box_inside_its_own_solid() {
+        let hull = placed(item("w", ShapeType::ConvexHull, Some(wedge())), (0, 0, 0));
+        assert!(placement_hits_box(&hull, cube_at((5, 5, 5), 20)));
+    }
+
+    /// A `rigid_cuboid` never reaches the exact test: its box *is* its solid, so the broad
+    /// phase is the whole answer.
+    #[test]
+    fn a_cuboid_hits_any_box_its_envelope_overlaps() {
+        let cuboid = placed(item("c", ShapeType::RigidCuboid, None), (0, 0, 0));
+        assert!(placement_hits_box(&cuboid, cube_at((60, 60, 60), 30)));
+        assert!(!placement_hits_box(&cuboid, cube_at((200, 0, 0), 10)));
+    }
+
+    /// One hull against one cuboid: the cuboid is turned into a shape so the two can be
+    /// compared on the same axes, which is the fallback a box-only request never reaches.
+    #[test]
+    fn a_hull_and_a_cuboid_collide_by_the_hull_rather_than_by_the_boxes() {
+        let hull = placed(item("w", ShapeType::ConvexHull, Some(wedge())), (0, 0, 0));
+        let clear = placed(item("c", ShapeType::RigidCuboid, None), (60, 60, 60));
+        assert!(
+            hull.envelope_box().intersects(clear.envelope_box()),
+            "boxes overlap; only the hull test can tell them apart"
+        );
+        assert!(!placements_collide(&hull, &clear));
+        assert!(!placements_collide(&clear, &hull), "and symmetrically");
+
+        let overlapping = placed(item("c", ShapeType::RigidCuboid, None), (10, 10, 10));
+        assert!(placements_collide(&hull, &overlapping));
+    }
+
+    #[test]
+    fn two_cuboids_never_leave_the_broad_phase() {
+        let left = placed(item("a", ShapeType::RigidCuboid, None), (0, 0, 0));
+        let right = placed(item("b", ShapeType::RigidCuboid, None), (50, 0, 0));
+        assert!(placements_collide(&left, &right));
+        let apart = placed(item("b", ShapeType::RigidCuboid, None), (SIDE, 0, 0));
+        assert!(
+            !placements_collide(&left, &apart),
+            "touching is contact, not collision"
+        );
+    }
+
+    /// Utilisation is the one number a wrong occupancy rule corrupts silently: two
+    /// interlocking wedges counted by their boxes fill a crate twice over.
+    #[test]
+    fn a_hull_occupies_its_hull_and_a_cuboid_its_box() {
+        let hull = placed(item("w", ShapeType::ConvexHull, Some(wedge())), (0, 0, 0));
+        assert_eq!(
+            occupied_volume(&hull),
+            i128::from(SIDE) * i128::from(SIDE) * i128::from(SIDE) / 2
+        );
+        let cuboid = placed(item("c", ShapeType::RigidCuboid, None), (0, 0, 0));
+        assert_eq!(occupied_volume(&cuboid), cuboid.dimensions.volume());
+    }
+
+    /// A hundred-millimetre cube, in ticks.
+    ///
+    /// Named rather than reusing `SIDE`: the geometry tests above only need a consistent
+    /// scale, but a pressure is a load over a *real* area, and a hundred-tick footprint is six
+    /// micrometres across. Every compressible item would crush under any load at all, and the
+    /// test would run through the refusal path while claiming to measure compression.
+    fn millimetres(count: i64) -> Length {
+        Length(count * Length::TICKS_PER_MM)
+    }
+
+    fn compressible_cube(ratio_ppm: i64, limit_kpa: i64) -> Item {
+        let mut compressible = item("s", ShapeType::Compressible, None);
+        compressible.dimensions = Dimensions {
+            length: millimetres(100),
+            width: millimetres(100),
+            height: millimetres(100),
+        };
+        compressible.compression_ratio_ppm = Some(ratio_ppm);
+        compressible.max_compression_pressure_kpa = Some(limit_kpa);
+        compressible
+    }
+
+    #[test]
+    fn a_compressible_item_occupies_the_height_left_under_its_load() {
+        let mut placement = placed(compressible_cube(250_000, 100), (0, 0, 0));
+
+        // Unloaded, it is simply its box.
+        assert_eq!(occupied_volume(&placement), placement.dimensions.volume());
+
+        // Under a load inside its limit it gives up height, and only height.
+        placement.top_load = Weight(4 * Weight::TICKS_PER_KG);
+        let loaded = occupied_volume(&placement);
+        assert!(
+            loaded < placement.dimensions.volume(),
+            "a compressible item under load must occupy less than its uncompressed box"
+        );
+        assert_eq!(
+            loaded % placement.dimensions.base_area(),
+            0,
+            "footprint is unchanged"
+        );
+    }
+
+    /// A crushed item has no meaningful occupied volume, and the arrangement is already
+    /// invalid -- the crush check refuses it. Reporting the uncompressed figure keeps that one
+    /// reported issue rather than adding a second, quieter one.
+    #[test]
+    fn a_crushed_item_reports_its_uncompressed_volume() {
+        let mut placement = placed(compressible_cube(500_000, 1), (0, 0, 0));
+        placement.top_load = Weight(10_000 * Weight::TICKS_PER_KG);
+        assert_eq!(occupied_volume(&placement), placement.dimensions.volume());
+    }
+
+    /// `hull_collision_is_exact` is false for a route item, so the box stands even though the
+    /// item is a hull -- the sequence replay reasons with box sweeps only, and packing tighter
+    /// than it can verify would produce arrangements the engine then calls unloadable.
+    #[test]
+    fn a_hull_on_a_route_falls_back_to_its_box() {
+        let mut routed = item("w", ShapeType::ConvexHull, Some(wedge()));
+        routed.stop_index = Some(2);
+        let placement = placed(routed, (0, 0, 0));
+        assert!(placement.hull_shape().is_none());
+        assert!(placement_hits_box(&placement, cube_at((60, 60, 60), 30)));
+        assert_eq!(
+            occupied_volume(&placement),
+            SIDE as i128 * SIDE as i128 * SIDE as i128 / 2
+        );
     }
 }

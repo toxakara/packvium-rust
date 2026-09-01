@@ -5,13 +5,15 @@
 //! dependencies. Accessibility is checked by sweeping the moving box to one of the
 //! six container walls.
 
-use crate::geometry::{Aabb, Dimensions};
+use crate::geometry::{self, Aabb, Dimensions};
 use crate::model::{Container, PackedContainer, Placement};
 use crate::validation::{ground_contact_valid, validate_stack_counts, validate_top_loads};
 use std::collections::BTreeSet;
 use thiserror::Error;
 
-pub const ALL_DIRECTIONS: [&str; 6] = ["+x", "-x", "+y", "-y", "+z", "-z"];
+/// Re-exported: the vocabulary lives in `geometry` so the solver can share it without
+/// reaching into this module, which is post-hoc analysis rather than search geometry.
+pub const ALL_DIRECTIONS: [&str; 6] = geometry::ALL_DIRECTIONS;
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum SequenceError {
@@ -229,36 +231,8 @@ fn swept_volume(
     container: Dimensions,
     direction: &str,
 ) -> Result<(i64, i64, i64, i64, i64, i64), SequenceError> {
-    let (mut x1, mut y1, mut z1) = (box_.origin.x, box_.origin.y, box_.origin.z);
-    let (mut x2, mut y2, mut z2) = (box_.x2(), box_.y2(), box_.z2());
-    match direction {
-        "+x" => {
-            x1 = x2;
-            x2 = container.length.0;
-        }
-        "-x" => {
-            x2 = x1;
-            x1 = 0;
-        }
-        "+y" => {
-            y1 = y2;
-            y2 = container.width.0;
-        }
-        "-y" => {
-            y2 = y1;
-            y1 = 0;
-        }
-        "+z" => {
-            z1 = z2;
-            z2 = container.height.0;
-        }
-        "-z" => {
-            z2 = z1;
-            z1 = 0;
-        }
-        other => return Err(SequenceError::InvalidDirection(other.to_owned())),
-    }
-    Ok((x1, y1, z1, x2, y2, z2))
+    geometry::swept_volume(box_, container, direction)
+        .ok_or_else(|| SequenceError::InvalidDirection(direction.to_owned()))
 }
 
 fn clear_direction(
@@ -967,6 +941,10 @@ mod tests {
             ground_contact_rule: ground_contact_rule.map(str::to_string),
             stop_index: None,
             value: None,
+            shape_type: crate::geometry::ShapeType::RigidCuboid,
+            hull_vertices: None,
+            compression_ratio_ppm: None,
+            max_compression_pressure_kpa: None,
             eligible_container_tags: Default::default(),
         }
     }

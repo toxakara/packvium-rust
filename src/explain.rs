@@ -149,6 +149,10 @@ mod tests {
             ground_contact_rule: None,
             stop_index: None,
             value: None,
+            shape_type: crate::geometry::ShapeType::RigidCuboid,
+            hull_vertices: None,
+            compression_ratio_ppm: None,
+            max_compression_pressure_kpa: None,
             eligible_container_tags: BTreeSet::new(),
         };
         UnpackedItem::new(
