@@ -516,20 +516,20 @@ fn expand_for_validation(result: &PackingResult) -> PackingResult {
 const UNSUPPORTED_REQUEST_FIELDS: &[&str] = &[];
 const UNSUPPORTED_CONFIGURATION_FIELDS: &[&str] = &[];
 // `hull_vertices`, `compression_ratio` and `max_compression_pressure_kpa` left this list in
-// , when this engine gained both the solver behaviour and the independent validation
+//, when this engine gained both the solver behaviour and the independent validation
 // the staged rollout requires. The JavaScript fallback still carries them.
 const UNSUPPORTED_ITEM_FIELDS: &[&str] = &[];
 
 /// `item.shape_type` values this engine does not implement.
 ///
-/// Empty since : this engine implements every value the schema defines. The guard stays
+/// Empty since: this engine implements every value the schema defines. The guard stays
 /// because the next reserved value will need it, and because `reject_unsupported` takes its
 /// lists as parameters precisely so it remains testable when they are empty.
 const UNSUPPORTED_SHAPE_TYPES: &[&str] = &[];
 // `pallet_overhang_limit` was reserved in the schema by at the 1.1.0 contract freeze
 // and is refused everywhere until an engine implements it from a request: a field a caller
 // can set and the solver ignores is worse than a refusal.
-// `access_directions` left this list in , which wired the reserved field through to
+// `access_directions` left this list in, which wired the reserved field through to
 // the stop-accessibility rule in all four engines at once.
 const UNSUPPORTED_CONTAINER_FIELDS: &[&str] = &["pallet_overhang_limit"];
 

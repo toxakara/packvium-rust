@@ -431,7 +431,7 @@ fn optimistic_completion_score(
     // lightest possible completion is therefore *not* a lower bound on descendants:
     // a heavier subset can cost less. All published charges are non-negative, so zero
     // is the tightest generally valid O(1) money floor. This weakens pruning only for
-    // landed cost and keeps the branch-and-bound admissible ( second review).
+    // landed cost and keeps the branch-and-bound admissible (second review).
     let landed = 0;
 
     match config.objective.as_str() {

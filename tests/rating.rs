@@ -428,7 +428,7 @@ fn two_container_eight_unit_scene(extra_config: Value) -> Value {
 fn a_pinned_maximal_spaces_run_still_buys_the_priceable_container() {
     // The maximal-space walk opens the first container of a static, tariff-blind order,
     // so pinning it used to refuse this request outright -- "no published price" --
-    // although beta ships it at 1500 ( review). Under this objective the pin now
+    // although beta ships it at 1500 (review). Under this objective the pin now
     // falls back to the money-ranked greedy, the same stand-down the lattice uses.
     let request = two_container_eight_unit_scene(json!({"solvers": ["maximal_spaces"]}));
     let result = pack(&request);
@@ -442,7 +442,7 @@ fn a_pinned_maximal_spaces_run_still_buys_the_priceable_container() {
 #[test]
 fn a_pinned_homogeneous_blocks_run_prices_the_round() {
     // The block loader ranked its round progress-first with no reference to the tariff,
-    // so a pin committed the unpriceable container ( review). Its round now ranks
+    // so a pin committed the unpriceable container (review). Its round now ranks
     // in money first, like the general greedy, and keeps its own keys after that. The
     // node budget is raised because a pinned block search under the default plan budget
     // exhausts before committing anything (the starvation, objective-agnostic).
@@ -560,7 +560,7 @@ fn rebalance_refuses_an_unpriceable_input() {
     use packvium_core::rebalance_json;
     // A caller handing rebalance a packing whose container already bills past its
     // bracket gets the same refusal `pack` gives on the way out, not a rebalanced
-    // version of a shipment with no published price ( review).
+    // version of a shipment with no published price (review).
     let request = rebalance_scene();
     let result = pack(&request);
     let mut overweight = request.clone();
