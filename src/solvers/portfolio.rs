@@ -369,7 +369,7 @@ pub(crate) fn solve_portfolio_with_deadline(
     // The sentinel is a search device, never an answer -- alternatives included. A
     // runner-up whose tariff cannot price it is dropped before the slice, so the caller
     // still receives up to top_k-1 usable packings when priceable runners exist beyond
-    // an unpriceable one ( review).
+    // an unpriceable one (review).
     best.alternatives = results
         .into_iter()
         .skip(1)
@@ -512,7 +512,7 @@ fn run_one_order(
         // container the caller cannot buy -- and its unpriceable packings were exactly
         // what leaked the sentinel through `alternatives`. Like the lattice (
         // precedent), it stands down for this objective; an explicit pin falls back to
-        // the money-ranked greedy below, the way `grid:fallback` does ( review).
+        // the money-ranked greedy below, the way `grid:fallback` does (review).
         && request.config.objective != "lowest_landed_cost"
     {
         results.push(pack_maximal_order(
@@ -701,7 +701,7 @@ mod tests {
     use super::swap_index;
     use crate::api::pack_json;
 
-    /// Regression, : the shuffle partner is a property of the seed alone, never of
+    /// Regression,: the shuffle partner is a property of the seed alone, never of
     /// the pointer width of the target the core happens to be compiled for. The second
     /// assertion is what gives the first its teeth -- it shows this very state answers
     /// differently once the top 32 bits are dropped, so a target-width-dependent
