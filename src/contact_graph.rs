@@ -138,6 +138,11 @@ impl ContactGraph {
 
     /// This graph plus one more box, appended at the next index.
     ///
+    /// The solver no longer builds this graph per candidate -- `LoadSweep` reads the same
+    /// two plane queries through `contacts_below`/`contacts_above` and settles only the
+    /// loads the candidate changes -- but the append property tests below still hold the
+    /// delta to the from-scratch build, which is what makes those queries trustworthy.
+    #[cfg(test)]
     /// Adding a box cannot create or destroy contact between two boxes that were already
     /// here: contact is a pairwise geometric predicate over two boxes and nothing else.
     /// That is the whole reason a delta is sound, and it is why only the new box's own
@@ -337,6 +342,30 @@ impl ContactGraph {
 
     pub(crate) fn supporters(&self, index: usize) -> &[ContactEdge] {
         &self.supporters[index]
+    }
+
+    /// The broad-phase cell this graph was built with: a box wider than it cannot be
+    /// queried through `contacts_below`/`contacts_above` (see `with_box`).
+    pub(crate) fn cell(&self) -> i64 {
+        self.cell
+    }
+
+    /// The edges a box appended next would rest on, ascending by index -- exactly what
+    /// `with_box` records as that box's supporters, answered without building the graph.
+    pub(crate) fn contacts_below(&self, box_: Aabb) -> Vec<ContactEdge> {
+        self.overlaps(&self.top_levels, box_.origin.z, box_)
+            .into_iter()
+            .map(|(index, area)| ContactEdge { index, area })
+            .collect()
+    }
+
+    /// The boxes already resting on the plane a box appended next would offer, ascending
+    /// by index -- the edges `with_box` would add to their supporter lists.
+    pub(crate) fn contacts_above(&self, box_: Aabb) -> Vec<ContactEdge> {
+        self.overlaps(self.bottom_levels(), box_.z2(), box_)
+            .into_iter()
+            .map(|(index, area)| ContactEdge { index, area })
+            .collect()
     }
 
     pub(crate) fn support_area(&self, index: usize) -> i128 {

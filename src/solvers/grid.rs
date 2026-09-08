@@ -497,6 +497,7 @@ mod tests {
                 tag_limits: BTreeMap::new(),
                 max_stack_density: None,
                 rate_table: None,
+                access_directions: Vec::new(),
             }],
             config: PackingConfig {
                 profile: SolverProfile::Fast,
@@ -566,6 +567,7 @@ mod tests {
                 tag_limits: BTreeMap::new(),
                 max_stack_density: None,
                 rate_table: None,
+                access_directions: Vec::new(),
             },
         );
         let result = try_grid(&req, &no_deadline()).expect("grid should apply");
@@ -617,6 +619,7 @@ mod tests {
                 tag_limits: BTreeMap::new(),
                 max_stack_density: None,
                 rate_table: None,
+                access_directions: Vec::new(),
             },
         );
         let result = try_grid(&req, &no_deadline()).expect("grid should apply");

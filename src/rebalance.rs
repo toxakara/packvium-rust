@@ -308,6 +308,7 @@ mod tests {
             tag_limits: BTreeMap::new(),
             max_stack_density: None,
             rate_table: None,
+            access_directions: Vec::new(),
         }
     }
 

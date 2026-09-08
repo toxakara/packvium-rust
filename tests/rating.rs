@@ -445,7 +445,7 @@ fn a_pinned_homogeneous_blocks_run_prices_the_round() {
     // so a pin committed the unpriceable container ( review). Its round now ranks
     // in money first, like the general greedy, and keeps its own keys after that. The
     // node budget is raised because a pinned block search under the default plan budget
-    // exhausts before committing anything (the  starvation, objective-agnostic).
+    // exhausts before committing anything (the starvation, objective-agnostic).
     let request = two_container_eight_unit_scene(json!({
         "solvers": ["homogeneous_blocks"],
         "container_plan_node_limit": 1000000,

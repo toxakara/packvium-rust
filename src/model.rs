@@ -237,16 +237,50 @@ pub fn crushed(placements: &[Placement], loads: &[i128]) -> Option<(String, Stri
         let Some(limit) = item.max_compression_pressure_kpa else {
             continue;
         };
-        let footprint = placement.envelope_dimensions.base_area();
-        let carried = (*load).clamp(0, i128::from(i64::MAX)) as i64;
-        let exceeded = compression::applied_pressure(carried, footprint)
-            .and_then(|pressure| pressure.exceeds(limit))
-            .unwrap_or(true);
-        if exceeded {
+        if crush_exceeded(limit, *load, placement.envelope_dimensions.base_area()) {
             return Some(("crush_violation".into(), placement.instance.id()));
         }
     }
     None
+}
+
+/// Whether `load` on a `footprint` presses harder than `limit_kpa`; an unrepresentable
+/// pressure counts as exceeded, the same way `crushed` reads it.
+pub fn crush_exceeded(limit_kpa: i64, load: i128, footprint: i128) -> bool {
+    let carried = load.clamp(0, i128::from(i64::MAX)) as i64;
+    compression::applied_pressure(carried, footprint)
+        .and_then(|pressure| pressure.exceeds(limit_kpa))
+        .unwrap_or(true)
+}
+
+/// Parts per million of a requested support fraction, the one conversion every engine
+/// makes before comparing areas as integers (docs/UNITS-AND-NUMERICS.md).
+pub fn scaled_support_ratio(ratio: f64) -> i64 {
+    (ratio * 1_000_000.0 + 0.5) as i64
+}
+
+/// Exact `floor(base_area * scaled / 10^6)` without forming the overflowing product.
+pub fn required_support_area(base_area: i128, scaled: i64) -> i128 {
+    const SCALE: i128 = 1_000_000;
+    let scaled = i128::from(scaled);
+    (base_area / SCALE) * scaled + ((base_area % SCALE) * scaled) / SCALE
+}
+
+/// The support-ratio rule as the contract states it: a candidate at floor level is fully
+/// supported, a zero requirement never binds, and otherwise the supported area must reach
+/// the integer floor of the requested fraction of the base -- never a float division
+/// checked against an epsilon, which admits a placement one square tick short of the
+/// requirement on any real-sized base.
+pub fn support_area_sufficient(
+    origin_z: i64,
+    supporting_area: i128,
+    base_area: i128,
+    required_ratio: f64,
+) -> bool {
+    if origin_z == 0 || required_ratio <= 0.0 {
+        return true;
+    }
+    supporting_area >= required_support_area(base_area, scaled_support_ratio(required_ratio))
 }
 
 pub fn placements_collide(left: &Placement, right: &Placement) -> bool {
@@ -445,6 +479,18 @@ pub struct Container {
     /// Weight ticks permitted per square metre of supporting footprint.
     pub max_stack_density: Option<Weight>,
     pub rate_table: Option<RateTable>,
+    /// Which walls this container can be unloaded through.
+    ///
+    /// Empty means the horizontal half of route order is not enforced for it -- not that
+    /// it is sealed. Defaulting to all six instead would enforce a rule true of no real
+    /// vehicle: a box is almost always free through *some* face, so six doors is nearly
+    /// the same as none, but it is a *different* nearly-nothing and would change answers
+    /// for every caller who never set the field.
+    ///
+    /// Canonicalised on the way in, so two callers naming the same doors in a different
+    /// order search identically. Overrides `PackingConfig::access_directions`, which
+    /// remains for the library callers who set the doors in code.
+    pub access_directions: Vec<String>,
 }
 
 #[derive(Clone, Debug)]

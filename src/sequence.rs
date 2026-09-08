@@ -973,6 +973,7 @@ mod tests {
             tag_limits: Default::default(),
             max_stack_density: max_stack_density_kg.map(|kg| Weight(kg * TICKS_PER_KG)),
             rate_table: None,
+            access_directions: Vec::new(),
         }
     }
 

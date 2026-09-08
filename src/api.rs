@@ -1,5 +1,5 @@
 use crate::error::{PackError, PackResult};
-use crate::geometry::{Aabb, Dimensions, Point, Rotation, ShapeType};
+use crate::geometry::{ALL_DIRECTIONS, Aabb, Dimensions, Point, Rotation, ShapeType};
 use crate::hull::{self, Vertex};
 use crate::model::*;
 use crate::policy::{PolicyConstraint, PolicyRuleSet};
@@ -435,7 +435,7 @@ pub fn pack_request_with_policy(
     // The same contract holds for the runner-up packings a result carries. The
     // portfolio filters its own alternatives, but a registry-provided solver may attach
     // ones that never passed through it, and an alternative quoting the sentinel is the
-    //  leak by another door.
+    // leak by another door.
     result.alternatives.retain(|alternative| {
         crate::solvers::unpriceable_container(&alternative.containers, &request.config).is_none()
     });
@@ -526,7 +526,12 @@ const UNSUPPORTED_ITEM_FIELDS: &[&str] = &[];
 /// because the next reserved value will need it, and because `reject_unsupported` takes its
 /// lists as parameters precisely so it remains testable when they are empty.
 const UNSUPPORTED_SHAPE_TYPES: &[&str] = &[];
-const UNSUPPORTED_CONTAINER_FIELDS: &[&str] = &[];
+// `pallet_overhang_limit` was reserved in the schema by at the 1.1.0 contract freeze
+// and is refused everywhere until an engine implements it from a request: a field a caller
+// can set and the solver ignores is worse than a refusal.
+// `access_directions` left this list in , which wired the reserved field through to
+// the stop-accessibility rule in all four engines at once.
+const UNSUPPORTED_CONTAINER_FIELDS: &[&str] = &["pallet_overhang_limit"];
 
 fn reject_unsupported(object: &Map<String, Value>) -> PackResult<()> {
     reject_listed_fields(
@@ -1240,7 +1245,44 @@ fn parse_container(value: &Value, unit: &str) -> PackResult<Container> {
             .map(|value| Weight::parse(value, "g"))
             .transpose()?,
         rate_table: parse_rate_table(map.get("rate_table"))?,
+        access_directions: parse_access_directions(map.get("access_directions"))?,
     })
+}
+
+/// The container walls an item may be unloaded through.
+///
+/// Canonicalised into `ALL_DIRECTIONS` order and deduplicated rather than kept as given:
+/// two callers naming the same doors in a different order must search identically, and this
+/// is the one place a request reaches the field. The schema already constrains the values,
+/// so the check here is the engine refusing to trust a schema it does not run.
+fn parse_access_directions(value: Option<&Value>) -> PackResult<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(list) = value.as_array() else {
+        return Err(PackError::InvalidInput(
+            "container.access_directions must be an array".into(),
+        ));
+    };
+    let mut given = Vec::with_capacity(list.len());
+    for entry in list {
+        let Some(direction) = entry.as_str() else {
+            return Err(PackError::InvalidInput(
+                "container.access_directions entries must be strings".into(),
+            ));
+        };
+        if !ALL_DIRECTIONS.contains(&direction) {
+            return Err(PackError::InvalidInput(format!(
+                "unknown movement direction {direction}"
+            )));
+        }
+        given.push(direction);
+    }
+    Ok(ALL_DIRECTIONS
+        .iter()
+        .filter(|direction| given.contains(*direction))
+        .map(|direction| (*direction).to_string())
+        .collect())
 }
 
 fn parse_rate_table(value: Option<&Value>) -> PackResult<Option<RateTable>> {
@@ -1724,25 +1766,54 @@ mod unsupported_field_tests {
     fn the_unsupported_lists_match_what_the_field_matrix_records() {
         // Every refusal this engine makes is recorded in the matrix, and the reverse. The
         // assertion used to be that all four lists are empty, which was the same thing
-        // while they were -- and stopped being the same thing the moment 
+        // while they were -- and stopped being the same thing the moment
         // populated one. What the coupling is actually for is that the corpus *asserts*
         // each rejection instead of merely tolerating it, so read the matrix and compare
         // both directions.
+        // The matrix is vendored one level above this crate, in the binding workspace; a
+        // published copy of the crate alone does not carry it.
         let matrix_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/public-field-matrix.json");
-        let matrix: Value =
-            serde_json::from_str(&std::fs::read_to_string(matrix_path).expect("the matrix"))
-                .expect("matrix JSON");
+        let Ok(matrix_text) = std::fs::read_to_string(&matrix_path) else {
+            eprintln!("skipping: the shared public field matrix is not part of this package");
+            return;
+        };
+        let matrix: Value = serde_json::from_str(&matrix_text).expect("matrix JSON");
+        // An engine refuses a field by name; the matrix is keyed on the schema's leaves,
+        // so one refused field is several rows. The matrix's own `rejection_name` -- the
+        // name the conformance harness demands in the diagnostic -- ties the rows to the
+        // field, so the comparison is made on that and never inferred from the spelling
+        // of a path. A value-keyed template such as `item.shape_type={value}` names the
+        // field before `=`.
+        fn field_of(rejection_name: &str) -> String {
+            rejection_name
+                .split('=')
+                .next()
+                .unwrap_or(rejection_name)
+                .to_owned()
+        }
         let support_sets = &matrix["support_sets"];
-        let rejected_by_matrix = matrix["fields"]
+        let rows = matrix["fields"]
             .as_object()
             .expect("fields")
             .iter()
-            .filter(|(_, row)| {
-                support_sets[row["support"].as_str().expect("a support set name")]["rust"]
-                    == "rejected:unsupported_feature"
+            .map(|(path, row)| {
+                let support =
+                    support_sets[row["support"].as_str().expect("a support set name")]["rust"]
+                        .as_str()
+                        .expect("a support value")
+                        .to_owned();
+                let name = row["rejection_name"].as_str().map(field_of);
+                (path.clone(), name, support)
             })
-            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let rejected_by_matrix = rows
+            .iter()
+            .filter(|(_, _, support)| support == "rejected:unsupported_feature")
+            .map(|(path, name, _)| {
+                name.clone()
+                    .unwrap_or_else(|| panic!("{path}: no rejection_name"))
+            })
             .collect::<BTreeSet<_>>();
 
         let mut declared = BTreeSet::new();
@@ -1754,31 +1825,39 @@ mod unsupported_field_tests {
         declared.extend(
             UNSUPPORTED_CONFIGURATION_FIELDS
                 .iter()
-                .map(|name| (*name).to_owned()),
+                .map(|name| format!("configuration.{name}")),
         );
         declared.extend(
             UNSUPPORTED_ITEM_FIELDS
                 .iter()
-                .map(|name| format!("items.*.{name}")),
+                .map(|name| format!("item.{name}")),
         );
         declared.extend(
             UNSUPPORTED_CONTAINER_FIELDS
                 .iter()
-                .map(|name| format!("containers.*.{name}")),
+                .map(|name| format!("container.{name}")),
         );
-        // A value-keyed refusal is one matrix row for the field itself. `hull_vertices`
-        // is an array of points, so the schema's leaves -- and therefore its rows -- are
-        // the three coordinates, not the array.
         if !UNSUPPORTED_SHAPE_TYPES.is_empty() {
-            declared.insert("items.*.shape_type".to_owned());
-        }
-        if declared.remove("items.*.hull_vertices") {
-            declared.extend(["x", "y", "z"].map(|axis| format!("items.*.hull_vertices.*.{axis}")));
+            declared.insert("item.shape_type".to_owned());
         }
 
         assert_eq!(
             declared, rejected_by_matrix,
             "the engine and the matrix disagree about what Rust refuses"
+        );
+        // A field refused by name is refused on every one of its leaves: a row that names
+        // a refused field while recording this engine as implementing it is a matrix error.
+        let half_recorded = rows
+            .iter()
+            .filter(|(_, name, support)| {
+                name.as_deref().is_some_and(|name| declared.contains(name))
+                    && support != "rejected:unsupported_feature"
+            })
+            .map(|(path, _, _)| path.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            half_recorded.is_empty(),
+            "rows recorded as implemented for a field Rust refuses: {half_recorded:?}"
         );
     }
 

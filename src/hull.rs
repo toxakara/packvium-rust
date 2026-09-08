@@ -760,9 +760,16 @@ mod tests {
     /// so every port reads one shared fixture and compares the complete ordered lists.
     #[test]
     fn the_face_walk_starts_from_a_corner_not_from_a_small_string() {
+        // A cross-language fixture kept one level above this crate; a published copy
+        // does not carry it.
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../../../conformance/scene/hull-internals.json");
-        let text = std::fs::read_to_string(path).expect("the shared hull fixture");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!(
+                "skipping: the shared cross-language scene fixture is not part of this package"
+            );
+            return;
+        };
         let document: serde_json::Value = serde_json::from_str(&text).expect("valid fixture");
         assert_eq!(document["format"], "packvium-hull-internals/v1");
         for case in document["cases"].as_array().expect("fixture cases") {

@@ -6,7 +6,7 @@ dependencies beyond `serde`, exact integer geometry.
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.0.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.1.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](docs/GUARANTEES.md) before relying on a result.
@@ -50,6 +50,7 @@ and execute without a project around it.
 | File | What it shows |
 | --- | --- |
 | [`basic.rs`](examples/basic.rs) | The smallest useful call: items in, placements out. |
+| [`shapes.rs`](examples/shapes.rs) | Items that are not their box: complementary wedges sharing one crate as `convex_hull`, and a cushion that compresses under load until the crush limit refuses it. |
 | [`pack-stdin.rs`](examples/pack-stdin.rs) | Read a shared-contract request on stdin and write the result to stdout. |
 | [`commerce.rs`](examples/commerce.rs) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
 | [`commerce-stdin.rs`](examples/commerce-stdin.rs) | The same three functions over stdin/stdout. |

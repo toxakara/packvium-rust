@@ -22,6 +22,8 @@ Conversion supports floor, ceiling and ties-to-even nearest rounding. Applicatio
 
 Feasibility checks are integer-only, including the support ratio: the requested fraction is converted once to parts per million and compared as `supported_area >= floor(base_area x ratio_ppm / 10^6)`, never as a float division against an epsilon. The independent validator rechecks boundaries and intersections using exact integers.
 
+The Rust solver and validator were the exception until 2026-09-02: both compared `area / base_area + 1e-12 < ratio` in `f64`. On a real-sized base (a square centimetre is `2.56 x 10^10` square ticks) an area one square tick short of the requirement sits well inside that epsilon, so Rust admitted a placement the shared validator refused. Both now go through `support_area_sufficient`, the rule above; the `f64` ratio survives only as the reported `support_ratio` on the placement record.
+
 Ordering keys are exact too. Two volumes that differ by one cubic tick must not collapse onto the same value, or two implementations of one algorithm can order the same items differently.
 
 ## PHP integer limits
