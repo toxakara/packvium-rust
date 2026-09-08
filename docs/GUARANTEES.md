@@ -48,7 +48,7 @@ silently — if you need them, they belong in your own layer above this library.
 
 ## Status of this release
 
-Version `1.0.0` freezes the public API. Field names, status codes, the objective
+Version `1.1.0` freezes the public API. Field names, status codes, the objective
 vector, the numeric policy and the validation rules do not change without a major
 version, so any `1.x` is a safe upgrade from any earlier `1.x`. A caret or tilde
 constraint on `1.0` is enough; an exact pin is no longer required.

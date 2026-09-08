@@ -90,7 +90,13 @@ move backwards. This is a testing seam, not a serialized request field.
 - three independent result facts:
   - `feasibility.code`: `feasible`, `infeasible`, or `unknown`;
   - `termination.code`: `complete`, `time_limit`, `effort_limit`, or `error`;
-  - `optimality.code`: `proven_optimal`, `proven_infeasible`, `best_found`, or `not_proven`;
+  - `optimality.code`: `proven_optimal`, `proven_infeasible`, `best_found`, or `not_proven`.
+    The 1.1.0 freeze reserved and typed `gap_key`, `absolute_gap` and `relative_gap`
+    alongside it. The pre-1.1.0 extension point remains open: closing the object would
+    make a previously valid producer fail a 1.1.0 validator, which is a breaking change
+    and therefore not legal in this minor release. No engine emits the reserved fields
+    yet, so `code` is still the only key any Packvium result carries. See
+    OPTIMALITY-CERTIFICATES.md;
 - legacy `status`: `optimal`, `feasible`, `best_found`, `time_limit`, `infeasible`, or `invalid_result`;
 - packed containers with exact coordinates, dimensions, rotations, and a
   `centre_of_mass_offset_ppm` — the weighted centre of mass's exact-integer Chebyshev

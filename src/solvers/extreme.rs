@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::contact_graph::ContactGraph;
+use crate::contact_graph::{ContactEdge, ContactGraph};
 use crate::deadline::Deadline;
 use crate::geometry::{self, Aabb, Dimensions, Point, Rotation, ShapeType};
 use crate::hull::{self, HullShape};
@@ -480,7 +480,7 @@ pub fn find_candidates_at_points(
             .placements
             .iter()
             .any(|placement| placement.instance.item.nesting_height.is_some());
-    let load_base = (!load_rules_inactive && !nesting_present).then(|| {
+    let load_sweep = (!load_rules_inactive && !nesting_present).then(|| {
         // The cell must cover every box hashed into the broad phase or queried against
         // it, and the candidate is a new item that may be wider than anything placed --
         // so the hint comes from this item's own rotations, which are known here.
@@ -489,25 +489,29 @@ pub fn find_candidates_at_points(
             .map(|(_, _, envelope, _)| envelope.length.0.max(envelope.width.0))
             .max()
             .unwrap_or(1);
-        let boxes = state
-            .packed
-            .placements
-            .iter()
-            .map(Placement::envelope_box)
-            .collect::<Vec<_>>();
-        ContactGraph::with_cell_hint(&boxes, widest)
+        LoadSweep::new(state, widest)
     });
     // The placed scene is immutable for this whole candidate sweep. Building its open
     // corridors once changes the hot-path accessibility check from O(m² * |D|) for every
     // candidate to O(m * |D|), while preserving the exact same blocker predicate.
+    // The container's own doors win; the configured list is what a container that states
+    // none inherits. `access_directions` became a request field at the 1.1.0
+    // freeze and had to be a per-container one -- two doors on one trailer and none on
+    // another is the case that makes the rule worth having -- while `PackingConfig` stays
+    // as the default for the library callers who set the doors in code.
+    let doors: &[String] = if state.packed.container.access_directions.is_empty() {
+        &request.config.access_directions
+    } else {
+        &state.packed.container.access_directions
+    };
     let stop_accessibility_base = ((state.route_sensitive || item.item.stop_index.is_some())
-        && !request.config.access_directions.is_empty())
+        && !doors.is_empty())
     .then(|| {
         StopAccessibilityBase::new(
             item.item.stop_index,
             &state.packed.placements,
             state.packed.container.inner_dimensions,
-            &request.config.access_directions,
+            doors,
         )
     });
     let mut candidates = CandidateAccumulator::new(limit);
@@ -617,15 +621,23 @@ pub fn find_candidates_at_points(
             let nested_support = tentative
                 .as_ref()
                 .map(|placement| placement_support_view(&state.packed.placements, placement));
-            let support_ratio = nested_support
-                .as_ref()
-                .map(|support| support.ratio)
-                .unwrap_or_else(|| support_ratio(state, envelope_box));
+            let (support_area, support_ratio) = match nested_support.as_ref() {
+                Some(support) => (support.area, support.ratio),
+                None => {
+                    let area = supporting_area(state, envelope_box);
+                    (area, support_ratio_of(area, envelope_box))
+                }
+            };
             let required_support = item
                 .item
                 .minimum_support_ratio
                 .max(request.config.minimum_support_ratio);
-            if support_ratio + 1e-12 < required_support {
+            if !support_area_sufficient(
+                point.z,
+                support_area,
+                envelope.base_area(),
+                required_support,
+            ) {
                 continue;
             }
             let ground_contact_allowed = nested_support.as_ref().map_or_else(
@@ -661,7 +673,7 @@ pub fn find_candidates_at_points(
                     envelope_box,
                     &state.packed.placements,
                     state.packed.container.inner_dimensions,
-                    &request.config.access_directions,
+                    doors,
                 )
             }) {
                 continue;
@@ -681,7 +693,7 @@ pub fn find_candidates_at_points(
                 item,
                 &candidate,
                 nested_support.as_ref(),
-                load_base.as_ref(),
+                load_sweep.as_ref(),
             ) {
                 continue;
             }
@@ -1304,21 +1316,28 @@ fn solid_boxes(state: &ContainerState) -> impl Iterator<Item = Aabb> + '_ {
         )
 }
 
-fn support_ratio(state: &ContainerState, box_: Aabb) -> f64 {
-    if box_.origin.z == 0 {
-        return 1.0;
-    }
-    let area = state
+/// Square ticks of placed top faces directly under `box_`'s base plane.
+fn supporting_area(state: &ContainerState, box_: Aabb) -> i128 {
+    state
         .packed
         .placements
         .iter()
         .filter(|placement| placement.envelope_box().z2() == box_.origin.z)
         .map(|placement| placement.envelope_box().overlap_area_xy(box_))
-        .sum::<i128>();
+        .sum::<i128>()
+}
+
+/// The reported fraction, for the placement record only: the feasibility decision reads
+/// the integer area through `support_area_sufficient`.
+fn support_ratio_of(area: i128, box_: Aabb) -> f64 {
+    if box_.origin.z == 0 {
+        return 1.0;
+    }
     (area as f64 / box_.dimensions.base_area() as f64).min(1.0)
 }
 
 struct CandidateSupportView {
+    area: i128,
     ratio: f64,
     supporter_count: usize,
     covered: bool,
@@ -1332,6 +1351,7 @@ fn placement_support_view(existing: &[Placement], candidate: &Placement) -> Cand
     let candidate_index = placements.len() - 1;
     let graph = ContactGraph::from_placements(&placements);
     CandidateSupportView {
+        area: graph.support_area(candidate_index),
         ratio: graph.support_ratio(&placements, candidate_index),
         supporter_count: graph.supporters(candidate_index).len(),
         covered: graph.touches_all_corners(&placements, candidate_index),
@@ -1364,7 +1384,7 @@ fn candidate_respects_loads(
     item: &ItemInstance,
     candidate: &Candidate,
     support_view: Option<&CandidateSupportView>,
-    load_base: Option<&ContactGraph>,
+    sweep: Option<&LoadSweep>,
 ) -> bool {
     if !state.stack_sensitive
         && !placement_stack_sensitive(&item.item)
@@ -1372,19 +1392,21 @@ fn candidate_respects_loads(
     {
         return true;
     }
+    let max_density = state.packed.container.max_stack_density;
     if let Some(support_view) = support_view {
-        let Some(loads) =
-            calculate_top_loads_with_graph(&support_view.placements, &support_view.graph)
-        else {
-            return false;
-        };
-        return stack_limits_valid(&support_view.placements, &support_view.graph)
-            && crushed(&support_view.placements, &loads).is_none()
-            && stack_density_valid_with_loads(
-                &support_view.placements,
-                state.packed.container.max_stack_density,
-                &loads,
-            );
+        return load_rules_hold(&support_view.placements, &support_view.graph, max_density);
+    }
+    let candidate_box = Aabb {
+        origin: candidate.envelope_origin,
+        dimensions: candidate.envelope_dimensions,
+    };
+    // With no nesting anywhere in this container, the placement graph *is* the face
+    // graph, so the sweep prepared for this item answers from the placed scene's settled
+    // loads. With nesting present, the column-aware build stays authoritative, and it
+    // needs the placements themselves -- the two are required to agree exactly, which is
+    // what `contact_graph`'s append property test holds them to.
+    if let Some(sweep) = sweep {
+        return sweep.allows(LoadBody::of(&item.item, candidate_box));
     }
     let mut placements = state.packed.placements.clone();
     placements.push(Placement {
@@ -1397,24 +1419,377 @@ fn candidate_respects_loads(
         support_ratio: candidate.support_ratio,
         top_load: Weight(0),
     });
-    // With no nesting anywhere in this container, the placement graph *is* the face
-    // graph, so a base prepared for this sweep answers by appending one box. Without one,
-    // the from-scratch build stays authoritative -- and the two are required to agree
-    // exactly, which is what `contact_graph`'s append property test holds them to.
-    let graph = match load_base {
-        Some(base) => base.with_box(placements[placements.len() - 1].envelope_box()),
-        None => ContactGraph::from_placements(&placements),
-    };
-    let Some(loads) = calculate_top_loads_with_graph(&placements, &graph) else {
+    let graph = ContactGraph::from_placements(&placements);
+    load_rules_hold(&placements, &graph, max_density)
+}
+
+/// Every bearing rule at once, the way `apply_candidate`'s predecessor checked them.
+fn load_rules_hold<T: LoadSubject>(
+    bodies: &[T],
+    graph: &ContactGraph,
+    max_density: Option<Weight>,
+) -> bool {
+    let Some(loads) = calculate_top_loads_with_graph(bodies, graph) else {
         return false;
     };
-    stack_limits_valid(&placements, &graph)
-        && crushed(&placements, &loads).is_none()
-        && stack_density_valid_with_loads(
-            &placements,
-            state.packed.container.max_stack_density,
-            &loads,
-        )
+    stack_limits_valid(bodies, graph)
+        && crush_free(bodies, &loads)
+        && stack_density_valid_with_loads(bodies, max_density, &loads)
+}
+
+/// The item facts the bearing rules read about one box, and nothing else. `Placement`
+/// answers from its item; `LoadBody` is the same six facts copied out once per sweep, so
+/// a candidate check never clones an `Item` -- its id, tags and metadata -- to read them.
+pub(crate) trait LoadSubject {
+    fn envelope(&self) -> Aabb;
+    fn weight_ticks(&self) -> i64;
+    fn stackable(&self) -> bool;
+    fn max_top_load_ticks(&self) -> Option<i64>;
+    fn max_stacked_items(&self) -> Option<usize>;
+    fn max_compression_pressure_kpa(&self) -> Option<i64>;
+}
+
+impl LoadSubject for Placement {
+    fn envelope(&self) -> Aabb {
+        self.envelope_box()
+    }
+    fn weight_ticks(&self) -> i64 {
+        self.instance.item.weight.0
+    }
+    fn stackable(&self) -> bool {
+        self.instance.item.stackable
+    }
+    fn max_top_load_ticks(&self) -> Option<i64> {
+        self.instance.item.max_top_load.map(|weight| weight.0)
+    }
+    fn max_stacked_items(&self) -> Option<usize> {
+        self.instance.item.max_stacked_items
+    }
+    fn max_compression_pressure_kpa(&self) -> Option<i64> {
+        self.instance.item.max_compression_pressure_kpa
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LoadBody {
+    envelope: Aabb,
+    weight: i64,
+    stackable: bool,
+    max_top_load: Option<i64>,
+    max_stacked_items: Option<usize>,
+    max_compression_pressure_kpa: Option<i64>,
+}
+
+impl LoadBody {
+    fn of(item: &Item, envelope: Aabb) -> Self {
+        Self {
+            envelope,
+            weight: item.weight.0,
+            stackable: item.stackable,
+            max_top_load: item.max_top_load.map(|weight| weight.0),
+            max_stacked_items: item.max_stacked_items,
+            max_compression_pressure_kpa: item.max_compression_pressure_kpa,
+        }
+    }
+}
+
+impl LoadSubject for LoadBody {
+    fn envelope(&self) -> Aabb {
+        self.envelope
+    }
+    fn weight_ticks(&self) -> i64 {
+        self.weight
+    }
+    fn stackable(&self) -> bool {
+        self.stackable
+    }
+    fn max_top_load_ticks(&self) -> Option<i64> {
+        self.max_top_load
+    }
+    fn max_stacked_items(&self) -> Option<usize> {
+        self.max_stacked_items
+    }
+    fn max_compression_pressure_kpa(&self) -> Option<i64> {
+        self.max_compression_pressure_kpa
+    }
+}
+
+/// The placed scene's bearing state, settled once per candidate sweep.
+///
+/// built the contact graph once per sweep and appended each candidate to a
+/// clone of it; the loads were still recomputed from nothing, over a cloned
+/// `Vec<Placement>`, for every candidate. Here the loads are settled once too, and a
+/// candidate is judged by recomputing only the boxes whose load it can change: everything
+/// reachable downward from it, and from whatever already rests on its top face. The
+/// recomputation applies the exact distribution rule `calculate_top_loads_with_graph`
+/// applies -- same supporter order, same floor-and-remainder split -- so the verdict is
+/// the one a from-scratch rebuild gives; the differential test below holds it to that.
+/// Cost per candidate is `O(|affected| * degree)` instead of `O(n log n + e)` plus a
+/// deep clone of the scene.
+struct LoadSweep {
+    graph: ContactGraph,
+    bodies: Vec<LoadBody>,
+    /// `None` when the placed scene breaks a bearing edge on its own.
+    base_loads: Option<Vec<i128>>,
+    /// Whether the placed scene passes every bearing rule by itself. When it does not,
+    /// only a rebuild can say whether a candidate repairs it: one placed under an
+    /// overhang joins that box's supporters and shrinks the shares its other supporters
+    /// carry, and the remainder split is not monotone in the load above it either.
+    base_holds: bool,
+    max_density: Option<Weight>,
+}
+
+impl LoadSweep {
+    fn new(state: &ContainerState, widest_footprint: i64) -> Self {
+        let bodies = state
+            .packed
+            .placements
+            .iter()
+            .map(|placement| LoadBody::of(&placement.instance.item, placement.envelope_box()))
+            .collect::<Vec<_>>();
+        let boxes = bodies.iter().map(|body| body.envelope).collect::<Vec<_>>();
+        let graph = ContactGraph::with_cell_hint(&boxes, widest_footprint);
+        let max_density = state.packed.container.max_stack_density;
+        let base_loads = calculate_top_loads_with_graph(&bodies, &graph);
+        let base_holds = base_loads.as_ref().is_some_and(|loads| {
+            stack_limits_valid(&bodies, &graph)
+                && crush_free(&bodies, loads)
+                && stack_density_valid_with_loads(&bodies, max_density, loads)
+        });
+        Self {
+            graph,
+            bodies,
+            base_loads,
+            base_holds,
+            max_density,
+        }
+    }
+
+    fn allows(&self, candidate: LoadBody) -> bool {
+        let footprint = candidate
+            .envelope
+            .dimensions
+            .length
+            .0
+            .max(candidate.envelope.dimensions.width.0);
+        if footprint > self.graph.cell() || !self.base_holds {
+            return self.rebuilt_with(candidate);
+        }
+        let Some(base_loads) = self.base_loads.as_ref() else {
+            return self.rebuilt_with(candidate);
+        };
+        let below = self.graph.contacts_below(candidate.envelope);
+        let above = self.graph.contacts_above(candidate.envelope);
+        // The only new edges: a non-stackable supporter refuses the candidate, and a
+        // non-stackable candidate refuses whatever already rests on its top face.
+        if below.iter().any(|edge| !self.bodies[edge.index].stackable) {
+            return false;
+        }
+        if !above.is_empty() && !candidate.stackable {
+            return false;
+        }
+        let scene = CandidateScene {
+            sweep: self,
+            candidate,
+            below: &below,
+            above: &above,
+        };
+        let candidate_index = self.bodies.len();
+        let mut affected = BTreeSet::new();
+        let mut pending = above.iter().map(|edge| edge.index).collect::<Vec<_>>();
+        pending.push(candidate_index);
+        while let Some(index) = pending.pop() {
+            if affected.insert(index) {
+                pending.extend(scene.supporters(index).iter().map(|edge| edge.index));
+            }
+        }
+        // The same order `calculate_top_loads_with_graph` settles loads in: top faces
+        // descending, then bases descending, then index -- `affected` is ascending and
+        // the sort is stable, so ties keep index order.
+        let mut order = affected.iter().copied().collect::<Vec<_>>();
+        order.sort_by_key(|index| {
+            let envelope = scene.body(*index).envelope;
+            Reverse((envelope.z2(), envelope.origin.z))
+        });
+        let mut loads = BTreeMap::new();
+        for index in order {
+            let mut children = scene.children(index);
+            children.sort_by_key(|child| {
+                let envelope = scene.body(*child).envelope;
+                (Reverse((envelope.z2(), envelope.origin.z)), *child)
+            });
+            let mut load = 0_i128;
+            for child in children {
+                let downward = i128::from(scene.body(child).weight).saturating_add(
+                    loads
+                        .get(&child)
+                        .copied()
+                        .unwrap_or_else(|| base_loads[child]),
+                );
+                load = load.saturating_add(scene.share(child, index, downward));
+            }
+            if let Some(maximum) = scene.body(index).max_top_load
+                && load > i128::from(maximum)
+            {
+                return false;
+            }
+            loads.insert(index, load);
+        }
+        for (index, load) in &loads {
+            let body = scene.body(*index);
+            let footprint_area = body.envelope.dimensions.base_area();
+            if let Some(limit) = body.max_compression_pressure_kpa
+                && crush_exceeded(limit, *load, footprint_area)
+            {
+                return false;
+            }
+            if let Some(maximum) = self.max_density
+                && !density_within(body.weight, *load, maximum, footprint_area)
+            {
+                return false;
+            }
+        }
+        scene.stack_counts_hold(&affected)
+    }
+
+    /// The from-scratch verdict, for the cases the delta cannot answer.
+    fn rebuilt_with(&self, candidate: LoadBody) -> bool {
+        let mut bodies = self.bodies.clone();
+        bodies.push(candidate);
+        let boxes = bodies.iter().map(|body| body.envelope).collect::<Vec<_>>();
+        let footprint = candidate
+            .envelope
+            .dimensions
+            .length
+            .0
+            .max(candidate.envelope.dimensions.width.0);
+        let graph = ContactGraph::with_cell_hint(&boxes, footprint.max(self.graph.cell()));
+        load_rules_hold(&bodies, &graph, self.max_density)
+    }
+}
+
+/// The placed scene plus one candidate, read as the graph `with_box` would have built:
+/// the candidate takes the next index, rests on `below`, and joins the supporter list of
+/// every box in `above` at the end.
+struct CandidateScene<'a> {
+    sweep: &'a LoadSweep,
+    candidate: LoadBody,
+    below: &'a [ContactEdge],
+    above: &'a [ContactEdge],
+}
+
+impl CandidateScene<'_> {
+    fn candidate_index(&self) -> usize {
+        self.sweep.bodies.len()
+    }
+
+    fn body(&self, index: usize) -> LoadBody {
+        if index == self.candidate_index() {
+            self.candidate
+        } else {
+            self.sweep.bodies[index]
+        }
+    }
+
+    fn supporters(&self, index: usize) -> Vec<ContactEdge> {
+        if index == self.candidate_index() {
+            return self.below.to_vec();
+        }
+        let mut supporters = self.sweep.graph.supporters(index).to_vec();
+        if let Some(edge) = self.above.iter().find(|edge| edge.index == index) {
+            supporters.push(ContactEdge {
+                index: self.candidate_index(),
+                area: edge.area,
+            });
+        }
+        supporters
+    }
+
+    fn children(&self, index: usize) -> Vec<usize> {
+        if index == self.candidate_index() {
+            return self.above.iter().map(|edge| edge.index).collect();
+        }
+        let mut children = self.sweep.graph.children(index).to_vec();
+        if self.below.iter().any(|edge| edge.index == index) {
+            children.push(self.candidate_index());
+        }
+        children
+    }
+
+    /// `upper`'s share of `downward` onto `lower`: proportional by contact area, with
+    /// the last supporter taking the rounding remainder, exactly as the settled loads.
+    fn share(&self, upper: usize, lower: usize, downward: i128) -> i128 {
+        let supporters = self.supporters(upper);
+        let total_area = supporters.iter().map(|edge| edge.area).sum::<i128>();
+        let mut distributed = 0_i128;
+        for (position, edge) in supporters.iter().enumerate() {
+            let share = if position + 1 == supporters.len() {
+                downward.saturating_sub(distributed)
+            } else {
+                downward.saturating_mul(edge.area) / total_area
+            };
+            if edge.index == lower {
+                return share;
+            }
+            distributed = distributed.saturating_add(share);
+        }
+        0
+    }
+
+    /// `max_stacked_items` over the boxes whose stack the candidate joins: those below
+    /// it gain the candidate and everything already resting on it; nothing else changes.
+    fn stack_counts_hold(&self, affected: &BTreeSet<usize>) -> bool {
+        let candidate_index = self.candidate_index();
+        let mut carried_by_candidate = BTreeSet::new();
+        let mut pending = self.above.iter().map(|edge| edge.index).collect::<Vec<_>>();
+        while let Some(index) = pending.pop() {
+            if carried_by_candidate.insert(index) {
+                pending.extend(self.sweep.graph.children(index).iter().copied());
+            }
+        }
+        if let Some(maximum) = self.candidate.max_stacked_items
+            && carried_by_candidate.len() > maximum
+        {
+            return false;
+        }
+        let mut under_candidate = BTreeSet::new();
+        pending = self.below.iter().map(|edge| edge.index).collect();
+        while let Some(index) = pending.pop() {
+            if under_candidate.insert(index) {
+                pending.extend(
+                    self.sweep
+                        .graph
+                        .supporters(index)
+                        .iter()
+                        .map(|edge| edge.index),
+                );
+            }
+        }
+        debug_assert!(under_candidate.iter().all(|index| affected.contains(index)));
+        for root in under_candidate {
+            let Some(maximum) = self.sweep.bodies[root].max_stacked_items else {
+                continue;
+            };
+            let mut stacked = carried_by_candidate.clone();
+            stacked.insert(candidate_index);
+            pending = self.sweep.graph.children(root).to_vec();
+            while let Some(index) = pending.pop() {
+                if stacked.insert(index) {
+                    pending.extend(self.sweep.graph.children(index).iter().copied());
+                }
+            }
+            if stacked.len() > maximum {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn density_within(weight: i64, load: i128, maximum: Weight, footprint_area: i128) -> bool {
+    const SQUARE_METRE_TICKS: i128 = 16_000_000_i128 * 16_000_000_i128;
+    let total = i128::from(weight).saturating_add(load);
+    total.saturating_mul(SQUARE_METRE_TICKS) <= i128::from(maximum.0).saturating_mul(footprint_area)
 }
 
 fn ground_contact_allowed(rule: Option<&str>, candidate: Aabb, placements: &[Placement]) -> bool {
@@ -1768,9 +2143,9 @@ fn used_volume_delta(placements: &[Placement], placement: &Placement) -> i128 {
     delta
 }
 
-fn stack_limits_valid(placements: &[Placement], graph: &ContactGraph) -> bool {
-    for (root, placement) in placements.iter().enumerate() {
-        let Some(maximum) = placement.instance.item.max_stacked_items else {
+fn stack_limits_valid<T: LoadSubject>(bodies: &[T], graph: &ContactGraph) -> bool {
+    for (root, body) in bodies.iter().enumerate() {
+        let Some(maximum) = body.max_stacked_items() else {
             continue;
         };
         let mut seen = BTreeSet::new();
@@ -1787,19 +2162,30 @@ fn stack_limits_valid(placements: &[Placement], graph: &ContactGraph) -> bool {
     true
 }
 
-fn stack_density_valid_with_loads(
-    placements: &[Placement],
+fn stack_density_valid_with_loads<T: LoadSubject>(
+    bodies: &[T],
     maximum: Option<Weight>,
     loads: &[i128],
 ) -> bool {
     let Some(maximum) = maximum else {
         return true;
     };
-    const SQUARE_METRE_TICKS: i128 = 16_000_000_i128 * 16_000_000_i128;
-    placements.iter().zip(loads).all(|(placement, load)| {
-        let total = placement.instance.item.weight.0 as i128 + *load;
-        total.saturating_mul(SQUARE_METRE_TICKS)
-            <= (maximum.0 as i128).saturating_mul(placement.envelope_dimensions.base_area())
+    bodies.iter().zip(loads).all(|(body, load)| {
+        density_within(
+            body.weight_ticks(),
+            *load,
+            maximum,
+            body.envelope().dimensions.base_area(),
+        )
+    })
+}
+
+/// `crushed` without the offender's name, over any bearing subject.
+fn crush_free<T: LoadSubject>(bodies: &[T], loads: &[i128]) -> bool {
+    bodies.iter().zip(loads).all(|(body, load)| {
+        body.max_compression_pressure_kpa().is_none_or(|limit| {
+            !crush_exceeded(limit, *load, body.envelope().dimensions.base_area())
+        })
     })
 }
 
@@ -1808,21 +2194,19 @@ pub fn calculate_top_loads(placements: &[Placement]) -> Option<Vec<i128>> {
     calculate_top_loads_with_graph(placements, &graph)
 }
 
-fn calculate_top_loads_with_graph(
-    placements: &[Placement],
+fn calculate_top_loads_with_graph<T: LoadSubject>(
+    bodies: &[T],
     graph: &ContactGraph,
 ) -> Option<Vec<i128>> {
-    let mut loads = vec![0_i128; placements.len()];
-    let mut order = (0..placements.len()).collect::<Vec<_>>();
+    let mut loads = vec![0_i128; bodies.len()];
+    let mut order = (0..bodies.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| {
-        std::cmp::Reverse((
-            placements[*index].envelope_box().z2(),
-            placements[*index].envelope_origin.z,
-        ))
+        let envelope = bodies[*index].envelope();
+        Reverse((envelope.z2(), envelope.origin.z))
     });
 
     for upper_index in order {
-        let upper = placements[upper_index].envelope_box();
+        let upper = bodies[upper_index].envelope();
         if upper.origin.z == 0 {
             continue;
         }
@@ -1831,7 +2215,7 @@ fn calculate_top_loads_with_graph(
             continue;
         }
         let total_area = supports.iter().map(|edge| edge.area).sum::<i128>();
-        let downward = placements[upper_index].instance.item.weight.0 as i128 + loads[upper_index];
+        let downward = i128::from(bodies[upper_index].weight_ticks()) + loads[upper_index];
         let mut distributed = 0_i128;
         for (position, edge) in supports.iter().enumerate() {
             let share = if position + 1 == supports.len() {
@@ -1840,18 +2224,18 @@ fn calculate_top_loads_with_graph(
                 downward.saturating_mul(edge.area) / total_area
             };
             distributed = distributed.saturating_add(share);
-            let support = &placements[edge.index].instance.item;
+            let support = &bodies[edge.index];
             // `stackable: false` is geometry, not load: nothing may rest on the item at
             // all. Gating it on `share > 0` meant a weightless box resting on a
             // non-stackable one transferred nothing and so was waved through, and since
             // nothing here self-validates the answer came back `feasible` while the
             // shared validator called it `non_stackable`.
-            if !support.stackable {
+            if !support.stackable() {
                 return None;
             }
             loads[edge.index] = loads[edge.index].saturating_add(share);
-            if let Some(maximum) = support.max_top_load
-                && loads[edge.index] > maximum.0 as i128
+            if let Some(maximum) = support.max_top_load_ticks()
+                && loads[edge.index] > i128::from(maximum)
             {
                 return None;
             }
@@ -2743,6 +3127,7 @@ mod tests {
             tag_limits: BTreeMap::new(),
             max_stack_density: None,
             rate_table: None,
+            access_directions: Vec::new(),
         }
     }
 
@@ -3297,5 +3682,136 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A small deterministic generator: the property below wants many scenes, not a
+    /// chosen few, and a fixed seed keeps every run identical.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % bound
+        }
+    }
+
+    fn load_body(lcg: &mut Lcg, origin: Point) -> LoadBody {
+        let side = 10 + lcg.next(3) as i64 * 10;
+        LoadBody {
+            envelope: Aabb {
+                origin,
+                dimensions: dimensions(side, side, 10 + lcg.next(2) as i64 * 10),
+            },
+            weight: lcg.next(5) as i64 * 1_000,
+            stackable: lcg.next(6) != 0,
+            max_top_load: (lcg.next(3) == 0).then(|| lcg.next(4) as i64 * 1_500),
+            max_stacked_items: (lcg.next(4) == 0).then(|| lcg.next(3) as usize),
+            max_compression_pressure_kpa: (lcg.next(4) == 0).then(|| 1 + lcg.next(3) as i64),
+        }
+    }
+
+    fn body_item(body: &LoadBody, sequence: usize) -> ItemInstance {
+        let mut item = item("body");
+        item.dimensions = body.envelope.dimensions;
+        item.weight = Weight(body.weight);
+        item.stackable = body.stackable;
+        item.max_top_load = body.max_top_load.map(Weight);
+        item.max_stacked_items = body.max_stacked_items;
+        item.max_compression_pressure_kpa = body.max_compression_pressure_kpa;
+        ItemInstance { item, sequence }
+    }
+
+    /// The from-scratch verdict `candidate_respects_loads` gave before the sweep existed:
+    /// every placement plus the candidate, one graph, every rule over all of it.
+    fn rebuilt_verdict(
+        bodies: &[LoadBody],
+        candidate: LoadBody,
+        max_density: Option<Weight>,
+    ) -> bool {
+        let mut all = bodies.to_vec();
+        all.push(candidate);
+        let boxes = all.iter().map(|body| body.envelope).collect::<Vec<_>>();
+        let widest = boxes
+            .iter()
+            .map(|box_| box_.dimensions.length.0.max(box_.dimensions.width.0))
+            .max()
+            .unwrap_or(1);
+        load_rules_hold(
+            &all,
+            &ContactGraph::with_cell_hint(&boxes, widest),
+            max_density,
+        )
+    }
+
+    #[test]
+    fn the_incremental_load_sweep_matches_the_from_scratch_verdict() {
+        // Stacks are built on a coarse lattice so faces meet, overhang and float; candidates
+        // land under existing boxes as often as on top of them, which is the case where a
+        // supporter list changes and the settled shares move.
+        let mut lcg = Lcg(20_260_902);
+        let mut agreements = (0_usize, 0_usize);
+        for scene in 0..400 {
+            let mut container = container();
+            container.max_stack_density =
+                (scene % 3 == 0).then(|| Weight(lcg.next(4) as i64 * 5_000_000_000));
+            let mut state = ContainerState::new(container.clone(), 1);
+            let mut bodies = Vec::new();
+            for sequence in 0..(1 + lcg.next(7) as usize) {
+                let origin = Point {
+                    x: lcg.next(4) as i64 * 10,
+                    y: lcg.next(4) as i64 * 10,
+                    z: lcg.next(4) as i64 * 10,
+                };
+                let body = load_body(&mut lcg, origin);
+                if bodies
+                    .iter()
+                    .any(|placed: &LoadBody| placed.envelope.intersects(body.envelope))
+                {
+                    continue;
+                }
+                let candidate = Candidate {
+                    envelope_origin: origin,
+                    position: origin,
+                    rotation: Rotation::Lwh,
+                    dimensions: body.envelope.dimensions,
+                    envelope_dimensions: body.envelope.dimensions,
+                    support_ratio: 1.0,
+                    score: 0,
+                };
+                apply_candidate(&mut state, body_item(&body, sequence), &candidate);
+                bodies.push(body);
+            }
+            let sweep = LoadSweep::new(&state, 30);
+            for _ in 0..12 {
+                let origin = Point {
+                    x: lcg.next(5) as i64 * 10,
+                    y: lcg.next(5) as i64 * 10,
+                    z: lcg.next(5) as i64 * 10,
+                };
+                let candidate = load_body(&mut lcg, origin);
+                if bodies
+                    .iter()
+                    .any(|placed| placed.envelope.intersects(candidate.envelope))
+                {
+                    continue;
+                }
+                let expected = rebuilt_verdict(&bodies, candidate, container.max_stack_density);
+                assert_eq!(
+                    sweep.allows(candidate),
+                    expected,
+                    "scene {scene}: candidate {candidate:?} over {bodies:?}"
+                );
+                if expected {
+                    agreements.0 += 1;
+                } else {
+                    agreements.1 += 1;
+                }
+            }
+        }
+        // The property is only worth something if both verdicts actually occur.
+        assert!(agreements.0 > 100 && agreements.1 > 100, "{agreements:?}");
     }
 }

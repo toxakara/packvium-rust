@@ -3,9 +3,10 @@ use super::extreme::{
     find_candidates, score_solution,
 };
 use crate::deadline::Deadline;
+use crate::geometry::ShapeType;
 use crate::model::*;
 use crate::solver::{CandidateScorer, PlacementConstraint};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Exhaustively explores item orders, allowed rotations, and the engine's
@@ -34,29 +35,61 @@ pub fn pack_exact_one(
     let mut searched_all_containers = true;
     let mut metrics = SolverMetrics::default();
 
+    let profiled = items
+        .iter()
+        .map(|item| (item.clone(), exact_item_profile(item, &request.config)))
+        .collect::<Vec<_>>();
     let mut containers = request.containers.clone();
     containers.sort_by_key(|container| container_order_key(container, &request.config));
+    // Each container's root floor is an admissible bound on anything its search can
+    // return, so containers are searched best-floor first and a container whose floor
+    // cannot beat the incumbent is skipped as proven, never searched. `position` keeps
+    // the ranked order as the tie-break -- among equal scores the earlier container
+    // still wins, exactly as the plain in-order scan chose -- while the search no longer
+    // spends its whole effort budget proving that a box which cannot take every item
+    // is worse than one that already did.
+    let mut planned = containers
+        .into_iter()
+        .enumerate()
+        .filter(|(_, container)| container.quantity != Some(0))
+        .map(|(position, container)| {
+            let initial = ContainerState::new(container, 1);
+            let floor = optimistic_completion_score(&initial, &profiled, &request.config);
+            (floor, position, initial)
+        })
+        .collect::<Vec<_>>();
+    planned.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+    let mut best_position = usize::MAX;
 
-    for container in containers {
+    for (root_floor, position, initial) in planned {
         if deadline.expired() || effort_exhausted(request, &metrics) {
             searched_all_containers = false;
             break;
         }
-        if container.quantity == Some(0) {
+        if let Some(best) = best_result.as_ref()
+            && (root_floor > best.score || (root_floor == best.score && position > best_position))
+        {
             continue;
         }
 
-        let profiled = items
-            .iter()
-            .map(|item| (item.clone(), exact_item_profile(item, &request.config)))
-            .collect::<Vec<_>>();
-        let mut best_state = ContainerState::new(container.clone(), 1);
+        let mut best_state = initial.clone();
         let mut best_state_score = score_state(&best_state, &profiled, &request.config);
-        let initial = ContainerState::new(container, 1);
-        let complete_lower_bound =
-            optimistic_completion_score(&initial, &profiled, &request.config);
+        let complete_lower_bound = root_floor;
+        let mut visited = VisitedStates {
+            keys: StateKeys::new(
+                &profiled,
+                constraints.is_empty()
+                    && scorers.is_empty()
+                    && initial.packed.container.max_stack_density.is_none()
+                    && profiled.iter().all(|(instance, _)| {
+                        !instance.item.is_stack_sensitive()
+                            && instance.item.shape_type != ShapeType::Compressible
+                    }),
+            ),
+            seen: BTreeSet::new(),
+        };
         search(
-            profiled,
+            profiled.clone(),
             request,
             constraints,
             scorers,
@@ -66,6 +99,7 @@ pub fn pack_exact_one(
             &mut best_state_score,
             &complete_lower_bound,
             &mut metrics,
+            &mut visited,
         );
 
         let placed = best_state
@@ -146,12 +180,12 @@ pub fn pack_exact_one(
             catalog_versions_used: Vec::new(),
         };
 
-        let replace = best_result
-            .as_ref()
-            .map(|best| result.score < best.score)
-            .unwrap_or(true);
+        let replace = best_result.as_ref().is_none_or(|best| {
+            result.score < best.score || (result.score == best.score && position < best_position)
+        });
         if replace {
             best_result = Some(result);
+            best_position = position;
         }
         if timed_out || effort_limited {
             searched_all_containers = false;
@@ -295,18 +329,45 @@ fn optimistic_completion_score(
         .collect::<Vec<_>>();
     volumes.sort_unstable();
     let mut placeable = remaining.len();
-    let mut smallest_volume_sum = volumes.iter().sum::<i128>();
     if !nesting_involved && volume > 0 {
         placeable = 0;
-        smallest_volume_sum = 0;
+        let mut admitted_volume = 0_i128;
         for item_volume in &volumes {
-            if used_now + smallest_volume_sum + item_volume > volume {
+            if used_now + admitted_volume + item_volume > volume {
                 break;
             }
-            smallest_volume_sum += item_volume;
+            admitted_volume += item_volume;
             placeable += 1;
         }
     }
+    // Weight is additive under every rule, nesting included, so the same greedy
+    // argument bounds the count from the payload side: no descendant can seat more
+    // remaining instances than the lightest prefix the free payload still admits. The
+    // item cap bounds it outright. Without these a weight-capped container searched
+    // every ordering of items it could never take -- a million placement attempts to
+    // prove three light boxes fit where the volume bound said all six might.
+    if let Some(maximum) = container.max_payload {
+        let free_payload = i128::from(maximum.0) - i128::from(state.payload);
+        let mut weights = remaining
+            .iter()
+            .map(|(_, profile)| i128::from(profile.weight))
+            .collect::<Vec<_>>();
+        weights.sort_unstable();
+        let mut admitted = 0;
+        let mut lightest_sum = 0_i128;
+        for weight in &weights {
+            if lightest_sum + weight > free_payload {
+                break;
+            }
+            lightest_sum += weight;
+            admitted += 1;
+        }
+        placeable = placeable.min(admitted);
+    }
+    if let Some(maximum) = container.max_items {
+        placeable = placeable.min(maximum.saturating_sub(state.packed.placements.len()));
+    }
+    let smallest_volume_sum = volumes.iter().take(placeable).sum::<i128>();
     let unpacked_floor = (remaining.len() - placeable) as i128;
 
     if placeable == 0 && state.packed.placements.is_empty() {
@@ -383,6 +444,62 @@ fn optimistic_completion_score(
     }
 }
 
+/// A search state up to the labelling of interchangeable instances. Item types are
+/// numbered once per search so a key is five machine words per placement, not a string,
+/// and the set stays small: at most one entry per node the effort budget admits.
+///
+/// Sorting is sound only when future decisions are independent of insertion order. Load
+/// settling hands an indivisible integer remainder to the last supporter, while extension
+/// constraints/scorers may deliberately inspect placement order. Those scenes retain the
+/// insertion sequence in the key. Ordinary box scenes canonicalise it and fold the full
+/// item-order permutation tree; identical instances remain interchangeable in both modes.
+type StateKey = Vec<(u32, i64, i64, i64, u8)>;
+
+struct VisitedStates {
+    keys: StateKeys,
+    seen: BTreeSet<StateKey>,
+}
+
+struct StateKeys {
+    types: BTreeMap<String, u32>,
+    canonicalize_order: bool,
+}
+
+impl StateKeys {
+    fn new(items: &[(ItemInstance, ExactItemProfile)], canonicalize_order: bool) -> Self {
+        let mut types = BTreeMap::new();
+        for (instance, _) in items {
+            let next = types.len() as u32;
+            types.entry(instance.item.id.clone()).or_insert(next);
+        }
+        Self {
+            types,
+            canonicalize_order,
+        }
+    }
+
+    fn of(&self, state: &ContainerState) -> StateKey {
+        let mut key = state
+            .packed
+            .placements
+            .iter()
+            .map(|placement| {
+                (
+                    self.types[&placement.instance.item.id],
+                    placement.envelope_origin.x,
+                    placement.envelope_origin.y,
+                    placement.envelope_origin.z,
+                    placement.rotation as u8,
+                )
+            })
+            .collect::<Vec<_>>();
+        if self.canonicalize_order {
+            key.sort_unstable();
+        }
+        key
+    }
+}
+
 // Each parameter is independently-varying recursive DFS state (the remaining work,
 // the read-only request/constraints/scorers/deadline threaded unchanged through every
 // call, and the mutable state/best/metrics accumulators) -- bundling them into a
@@ -400,8 +517,16 @@ fn search(
     best_score: &mut Vec<i128>,
     complete_lower_bound: &[i128],
     metrics: &mut SolverMetrics,
+    visited: &mut VisitedStates,
 ) {
     if deadline.expired() || effort_exhausted(request, metrics) {
+        return;
+    }
+    // In an order-insensitive scene, two item orders that seat the same boxes at the same
+    // places reach the same state and the first visit already explored its subtree. In a
+    // load-sensitive or extension-bearing scene StateKeys preserves insertion order, so
+    // the same check only folds states whose order-dependent future is also the same.
+    if !visited.seen.insert(visited.keys.of(state)) {
         return;
     }
     metrics.search_nodes_expanded = metrics.search_nodes_expanded.saturating_add(1);
@@ -474,6 +599,7 @@ fn search(
                 best_score,
                 complete_lower_bound,
                 metrics,
+                visited,
             );
             if best_score.as_slice() == complete_lower_bound {
                 return;
@@ -538,14 +664,15 @@ mod tests {
 
     #[test]
     fn exact_small_keeps_a_complete_incumbent_when_effort_expires() {
-        // Root plus four placements exactly consumes this counted prefix. The first
-        // container has already produced a complete incumbent when the global exact
-        // search budget binds, so the later container must not erase that result.
+        // Root plus four placements exactly consumes this counted prefix. Containers are
+        // searched best root floor first, so `b-flat` -- the one the objective prefers --
+        // has already produced a complete incumbent when the global exact search budget
+        // binds, and the remaining container must not erase that result.
         let output = pack_json(&open_height_request(5)).expect("budgeted exact-small request");
         let result: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(result["complete"], true);
-        assert_eq!(result["containers"][0]["container_type"], "a-tall");
+        assert_eq!(result["containers"][0]["container_type"], "b-flat");
         assert_eq!(result["algorithm"]["metrics"]["search_nodes_expanded"], 5);
         assert_eq!(result["algorithm"]["effort_limit_reached"], true);
     }

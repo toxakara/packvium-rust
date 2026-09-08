@@ -104,13 +104,17 @@ impl IndependentValidator {
                 if placement.instance.item.must_be_on_floor && placement.envelope_origin.z != 0 {
                     issue(&mut issues, "floor_required", &id);
                 }
-                let support = support_graph.support_ratio(&packed.placements, index);
                 let required = placement
                     .instance
                     .item
                     .minimum_support_ratio
                     .max(request.config.minimum_support_ratio);
-                if support + 1e-12 < required {
+                if !support_area_sufficient(
+                    placement.envelope_origin.z,
+                    support_graph.support_area(index),
+                    placement.envelope_dimensions.base_area(),
+                    required,
+                ) {
                     issue(&mut issues, "support", &id);
                 }
                 if !ground_contact_valid_with_graph(packed, index, &support_graph) {
@@ -424,6 +428,7 @@ mod tests {
                 tag_limits: BTreeMap::new(),
                 max_stack_density: None,
                 rate_table: None,
+                access_directions: Vec::new(),
             },
             sequence: 1,
             placements,

@@ -79,6 +79,7 @@ fn container(id: &str, side_mm: i64) -> Container {
         tag_limits: BTreeMap::new(),
         max_stack_density: None,
         rate_table: None,
+        access_directions: Vec::new(),
     }
 }
 
@@ -521,7 +522,7 @@ fn an_empty_registry_still_packs_through_the_portfolio() {
     assert!(result.complete());
     assert_eq!(
         result.algorithm.solver, "grid",
-        "the  guard must not disable the fast path when no constraint is registered"
+        "the guard must not disable the fast path when no constraint is registered"
     );
 }
 

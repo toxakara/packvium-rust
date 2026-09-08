@@ -9,6 +9,9 @@
 use crate::geometry::{Aabb, Dimensions};
 use std::collections::BTreeMap;
 
+type CellRange = (i64, i64);
+type CellRanges = (CellRange, CellRange, CellRange);
+
 #[derive(Clone, Debug)]
 pub(crate) struct SpatialIndex {
     cell_x: i64,
@@ -28,8 +31,13 @@ impl SpatialIndex {
     }
 
     pub(crate) fn add(&mut self, index: usize, box_: Aabb) {
-        for cell in self.cells_for(box_) {
-            self.cells.entry(cell).or_default().push(index);
+        let ((x1, x2), (y1, y2), (z1, z2)) = self.cell_ranges(box_);
+        for x in x1..x2 {
+            for y in y1..y2 {
+                for z in z1..z2 {
+                    self.cells.entry((x, y, z)).or_default().push(index);
+                }
+            }
         }
     }
 
@@ -37,11 +45,18 @@ impl SpatialIndex {
         // A contiguous buffer is materially cheaper in this hot path than allocating
         // one tree node per unique placement. Sorting restores the exact ascending
         // index order the former BTreeSet returned, so collision short-circuit order
-        // and deterministic metrics remain unchanged. O(q log q) time, O(q) space.
+        // and deterministic metrics remain unchanged. O(q log q) time, O(q) space --
+        // the one allocation the query makes; the cell walk itself allocates nothing,
+        // and this is the innermost call of every candidate sweep.
+        let ((x1, x2), (y1, y2), (z1, z2)) = self.cell_ranges(box_);
         let mut result = Vec::new();
-        for cell in self.cells_for(box_) {
-            if let Some(indices) = self.cells.get(&cell) {
-                result.extend_from_slice(indices);
+        for x in x1..x2 {
+            for y in y1..y2 {
+                for z in z1..z2 {
+                    if let Some(indices) = self.cells.get(&(x, y, z)) {
+                        result.extend_from_slice(indices);
+                    }
+                }
             }
         }
         result.sort_unstable();
@@ -49,19 +64,12 @@ impl SpatialIndex {
         result
     }
 
-    fn cells_for(&self, box_: Aabb) -> Vec<(i64, i64, i64)> {
-        let (x1, x2) = cell_range(box_.origin.x, box_.x2(), self.cell_x);
-        let (y1, y2) = cell_range(box_.origin.y, box_.y2(), self.cell_y);
-        let (z1, z2) = cell_range(box_.origin.z, box_.z2(), self.cell_z);
-        let mut result = Vec::new();
-        for x in x1..x2 {
-            for y in y1..y2 {
-                for z in z1..z2 {
-                    result.push((x, y, z));
-                }
-            }
-        }
-        result
+    fn cell_ranges(&self, box_: Aabb) -> CellRanges {
+        (
+            cell_range(box_.origin.x, box_.x2(), self.cell_x),
+            cell_range(box_.origin.y, box_.y2(), self.cell_y),
+            cell_range(box_.origin.z, box_.z2(), self.cell_z),
+        )
     }
 }
 

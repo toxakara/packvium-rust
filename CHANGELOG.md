@@ -5,6 +5,89 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). As of `1.
 public API, the request and result schemas, the numeric and units policy, the validation
 rules and the compatibility policy are frozen: breaking any of them costs a major version.
 
+## [1.1.0]
+
+An additive release on the 1.0.0 freeze. Route-aware unloading becomes a property of the
+container rather than of the whole solve, and the result contract grows the reserved,
+typed shape a future optimality gap needs. Every schema change is additive: a request that
+omits the new field gets the answer it got before, and both frozen public API surfaces are
+unchanged.
+
+The four engines' candidate hot paths were also profiled and rewritten. That work changes
+no result — all 399 corpus fixtures are byte-identical — and it is in this release because
+two of its findings were correctness fixes rather than speed.
+
+### Added
+
+- **Doors on a container: `container.access_directions`.** Naming which walls an item can
+  be pulled through, so that nothing due at a later stop stands between an earlier item and
+  a door. Previously this could only be stated once for a whole solve; a container now
+  states its own doors and falls back to that setting when it states none. An empty list
+  leaves the rule inert — it is not read as a sealed container, and it is deliberately not
+  read as all six walls, which would switch a real constraint on for callers who never set
+  the field. Implemented in all four engines, and refused by none.
+- **A reserved shape for reporting an optimality gap.** The result schema now declares the
+  names, types and ceilings a gap will use, together with the rule that an attained bound
+  carries no gap at all rather than a zero. No engine emits any of them yet. The existing
+  extension point on that object stays open, so a producer accepted by the 1.0 schema is
+  still accepted by 1.1.
+
+### Changed
+
+- **The solvers do less repeated work.** Byte-identical results everywhere, with the
+  largest gains where a scene has many contacts: on a 120-item contact-heavy request the
+  Rust engine goes from 10.1 s to 1.4 s and the JavaScript fallback from 1.70 s to 0.76 s;
+  on a 200-item adversarial free-space scene JavaScript goes from 3.25 s to 0.58 s. Some
+  scenes are unchanged and one is marginally slower. **This is not a speed-leadership
+  claim** — measured against other libraries on identical hardware, that claim is false on
+  latency, and no Packvium surface makes it.
+- **Every published package manifest now names its author, licence, repository, issue
+  tracker and homepage.** Absent fields are read as an anonymous package.
+- **`@packvium/engine` no longer declares `@packvium/native` as an optional dependency.**
+  That package is not published, so the entry named something npm could not fetch. Nothing
+  a caller can observe changes: the install already succeeded and answered from the
+  JavaScript engine, and `index.js` still loads `@packvium/native` by literal specifier, so
+  installing it yourself alongside the engine still selects the compiled backend.
+
+### Fixed
+
+- **The Rust engine accepted placements the validator refused.** Support-ratio comparison
+  used a floating-point epsilon wide enough to admit an area a whole square tick short of
+  the requirement. It is now the same exact integer rule the other three engines use.
+- **The JavaScript fallback accepted door names no other engine would.** An unknown
+  direction was refused only on requests that took the general solving path; a request
+  simple enough to be answered by the compact-grid shortcut was answered instead of
+  refused.
+- **The JavaScript fallback broke identifier ties by host locale.** That is neither stable
+  across machines nor equal to the code-point order the other engines use, so two hosts
+  could order the same items differently. Every tie-break now uses the shared code-point
+  order.
+- **A container's doors could be answered from another container's cached corridor.** Two
+  containers of the same size with different doors are two different questions; the cache
+  key did not separate them, which could have silently accepted a placement that walls an
+  item in.
+- **The PHP package could not be loaded on PHP 7.3 or 7.4.** The package advertises
+  `php: >=7.3` and carries a second, downgraded source tree for runtimes below 8.2. In
+  `1.0.0` that tree contained one line of PHP 8.1 syntax, so the whole of it failed to
+  parse on both older runtimes. `1.1.0` is the first version whose legacy tree loads. If
+  you are on PHP 8.2 or newer you were never affected — the canonical tree is what your
+  runtime selects.
+
+- **The engine package no longer loads its native backend through a computed specifier.**
+  Every module the package can load can now be resolved by reading the source. Behaviour
+  is identical: an absent, unbuilt or incompatible native addon still means the pure
+  JavaScript engine answers instead.
+
+### Not claimed
+
+- **A reported optimality gap.** The names are reserved and typed; nothing emits them.
+- **`container.pallet_overhang_limit`.** Reserved in the request schema and refused by all
+  four engines.
+- **Identical placements across engines.** Unchanged from 1.0.0: different engines may
+  return different, equally valid arrangements, and that is measured and budgeted.
+- **Optimal packings for arbitrary requests.** 3D packing remains NP-hard.
+- **Fastest engine.** Still false on latency and still claimed nowhere.
+
 ## [1.0.0]
 
 The stable core release. It freezes the contract that already exists rather than adding a

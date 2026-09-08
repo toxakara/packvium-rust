@@ -5,7 +5,7 @@
 //! ports, and `conformance/scene/objective-bounds.json` holds all three to the same vectors
 //! on 380 cases drawn from the golden corpus.
 //!
-//!  asks only for soundness here -- the bound must never exceed the achieved
+//! asks only for soundness here -- the bound must never exceed the achieved
 //! objective -- because Rust and JavaScript are not held to placement equality. That
 //! distinction does not apply to a bound: it is a function of the *request*, so there is no
 //! room for a legitimately different answer, and this port is held to equality because
@@ -154,7 +154,7 @@ pub struct ContainerType {
 /// its hull and leaves the rest of its bounding box free; a `compressible` item gives up
 /// height under load.
 ///
-/// The design document named only the first until  found the omission with a
+/// The design document named only the first until found the omission with a
 /// soundness test over the corpus. Asking the question once, here, is what stops a future
 /// fourth shape from reintroducing the same unsoundness silently.
 pub fn occupies_less_than_its_box(item: &Item) -> bool {
@@ -482,15 +482,22 @@ mod tests {
 
     /// Every default-objective fixture in the golden corpus, as Python computed it.
     ///
-    ///  asks only that this engine's bound never exceed the achieved objective. It is
+    /// asks only that this engine's bound never exceed the achieved objective. It is
     /// held to the stronger claim because the stronger claim is true: a bound is a function
     /// of the request, so Rust and Python disagreeing about one would be a defect in one of
     /// them rather than the permitted freedom in how these two engines place items.
     #[test]
     fn every_corpus_case_matches_python_exactly() {
+        // A cross-language fixture kept one level above this crate; a published copy
+        // does not carry it.
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../../../conformance/scene/objective-bounds.json");
-        let text = std::fs::read_to_string(path).expect("the shared bounds scene");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!(
+                "skipping: the shared cross-language scene fixture is not part of this package"
+            );
+            return;
+        };
         let document: serde_json::Value = serde_json::from_str(&text).expect("valid scene");
         assert_eq!(document["format"], "packvium-objective-bounds/v1");
         let cases = document["cases"].as_array().expect("scene cases");
@@ -797,7 +804,7 @@ mod tests {
     /// The shape rule, asserted against engine objects rather than the scene's flag.
     ///
     /// The scene supplies `shrinks` ready-made so the corpus check is about arithmetic
-    /// alone. That leaves one thing it cannot catch, and it is the exact omission 
+    /// alone. That leaves one thing it cannot catch, and it is the exact omission
     /// found in Python: a port that checks only `nesting_height` is unsound for
     /// `convex_hull` and `compressible`, both of which occupy less than their bounding box.
     #[test]
