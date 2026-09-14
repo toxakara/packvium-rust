@@ -2353,6 +2353,7 @@ fn try_pack_into_greedy(
     let current = remaining;
     let mut next = Vec::new();
     let mut processed = vec![false; current.len()];
+    let mut groups = group_member_indices(current);
 
     for cursor in 0..current.len() {
         if effort_exhausted(request, metrics) {
@@ -2370,11 +2371,9 @@ fn try_pack_into_greedy(
         }
         metrics.search_nodes_expanded = metrics.search_nodes_expanded.saturating_add(1);
         let batch_indices = if let Some(group) = current[cursor].item.group.as_deref() {
-            (cursor..current.len())
-                .filter(|index| {
-                    !processed[*index] && current[*index].item.group.as_deref() == Some(group)
-                })
-                .collect::<Vec<_>>()
+            groups
+                .remove(group)
+                .expect("first unprocessed group member")
         } else {
             vec![cursor]
         };
@@ -2505,24 +2504,29 @@ fn container_beam_key(
     )
 }
 
-fn item_batches(items: &[ItemInstance]) -> Vec<Vec<ItemInstance>> {
-    let mut batches = Vec::new();
-    let mut consumed = BTreeSet::new();
-    for item in items {
-        if consumed.contains(&item.id()) {
-            continue;
+fn group_member_indices(items: &[ItemInstance]) -> BTreeMap<&str, Vec<usize>> {
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, item) in items.iter().enumerate() {
+        if let Some(group) = item.item.group.as_deref() {
+            groups.entry(group).or_default().push(index);
         }
-        let batch = if let Some(group) = item.item.group.as_deref() {
-            items
-                .iter()
-                .filter(|candidate| candidate.item.group.as_deref() == Some(group))
-                .cloned()
-                .collect::<Vec<_>>()
+    }
+    groups
+}
+
+fn item_batches(items: &[ItemInstance]) -> Vec<Vec<ItemInstance>> {
+    let mut batches: Vec<Vec<ItemInstance>> = Vec::new();
+    let mut positions = BTreeMap::new();
+    for item in items {
+        if let Some(group) = item.item.group.as_deref() {
+            let position = *positions.entry(group).or_insert_with(|| {
+                batches.push(Vec::new());
+                batches.len() - 1
+            });
+            batches[position].push(item.clone());
         } else {
-            vec![item.clone()]
-        };
-        consumed.extend(batch.iter().map(ItemInstance::id));
-        batches.push(batch);
+            batches.push(vec![item.clone()]);
+        }
     }
     batches
 }
@@ -3107,6 +3111,58 @@ mod tests {
             compression_ratio_ppm: None,
             max_compression_pressure_kpa: None,
         }
+    }
+
+    #[test]
+    fn group_batches_preserve_first_appearance_and_member_order() {
+        let groups = [
+            Some("00"),
+            None,
+            Some("0"),
+            Some("00"),
+            Some("1"),
+            Some("0"),
+            None,
+            Some("1"),
+        ];
+        let items = groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                let mut value = item(&index.to_string());
+                value.group = group.map(str::to_owned);
+                ItemInstance {
+                    item: value,
+                    sequence: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let batches = item_batches(&items)
+            .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|instance| instance.item.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            batches,
+            vec![
+                vec!["0", "3"],
+                vec!["1"],
+                vec!["2", "5"],
+                vec!["4", "7"],
+                vec!["6"]
+            ]
+        );
+        let indices = group_member_indices(&items);
+        assert_eq!(indices["00"], vec![0, 3]);
+        assert_eq!(indices["0"], vec![2, 5]);
+        assert_eq!(indices["1"], vec![4, 7]);
+        assert_eq!(indices.len(), 3);
+        assert!(item_batches(&[]).is_empty());
+        assert!(group_member_indices(&[]).is_empty());
     }
 
     fn container() -> Container {

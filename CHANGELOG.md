@@ -5,6 +5,113 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). As of `1.
 public API, the request and result schemas, the numeric and units policy, the validation
 rules and the compatibility policy are frozen: breaking any of them costs a major version.
 
+## [1.2.0]
+
+An additive release. A packing result can now be turned into a document an operator can
+work from, in all four languages; and, in Python, a proposed catalog change can be
+compared, replayed against history and published through an approval step rather than
+argued about.
+
+Nothing here breaks 1.1.0. Every schema change is additive, the frozen Python surface is
+unchanged, and the PHP surface grows one new namespace and nothing else.
+
+### Added
+
+- **Execution plans, in all four languages.** `packvium.execution`,
+  `Packvium\Execution\Plan`, `packvium_core::execution` and `@packvium/engine`'s
+  `execution.js` derive a work order from an already validated result: what to lift, why a
+  carton was chosen, and what was not packed with its proof level unsoftened. The adapter
+  calls no solver and no validator — a test in each language asserts that — and given the
+  same result all four emit a byte-identical canonical form.
+
+  Two properties are part of the format rather than notes about it. Everything the solver
+  or validator decided sits under `facts`; every human-readable sentence sits under
+  `presentation` and names the fields it came from in `cites`, so a consumer that reads
+  only `facts` loses nothing it may rely on. And the step order is **injected**: supply
+  `loading_orders` and each step is numbered, omit it and the container reports
+  `order: "unavailable"` with every placement still listed. There is no third behaviour,
+  because presenting the order the solver happened to walk its candidates in as an order
+  that is safe to lift boxes in would be a claim nothing supports.
+
+- **Operator locks, in Python.** `packvium.locks` lets an operator pin a placement and get
+  a *second* result beside the approved one — never an edit of it, so "what was approved"
+  and "what was proposed" stay two artifacts. A lock becomes an ordinary placement
+  constraint, so the re-solve is the same portfolio under the same independent validator:
+  **a lock cannot produce a placement the engine would otherwise refuse**, and the
+  strongest thing it can do is reserve its own slot. A lock the solve cannot honour is
+  reported as unpreserved and names the lock rather than raising; a lock set that
+  contradicts itself is refused before any solve runs.
+
+  Python-only, deliberately: a lock has no representation in the request schema, so there
+  is nothing to hand another engine.
+
+- **Scenario comparison, recommendations and historical replay, in Python.**
+  `packvium.simulation` compares two pinned scenarios order by order and returns a Pareto
+  report per order — never a blended delta, because a single number can name a winner that
+  is worse on the axis a caller actually cares about. `packvium.recommendations` turns that
+  comparison into a proposal, or returns nothing at all when the paired cohort is too
+  small, and publishes only through an explicit approval step. `packvium.holdout` replays a
+  proposal against decisions held out of the evidence that produced it, over the append-only
+  ledger in `packvium.outcomes`; a packing the injected validator rejects is that arm's
+  failure at any cost, and realised damage, returns and repacks are reported against the
+  carton that actually shipped rather than credited to the one that was never tried.
+
+  This surface is supported and **not yet signature-frozen** — a parameter may be renamed
+  or a returned value gain a field in a minor release, announced here rather than blocked
+  by a gate. Pin the version if you depend on its exact shape; `docs/PUBLIC-API.md` says
+  which surfaces carry the stronger promise.
+
+- **`pack_from_dict` accepts a keyword-only `extensions` registry (Python).** Additive: it
+  defaults to `None` and every existing call keeps its meaning and its answer. It exists so
+  a lock can enter the engine as an ordinary request-derived constraint rather than through
+  a second, lock-aware search path. The registry **adds to** the compiled policy rules and
+  does not replace them.
+
+- **Two new worked examples.** `execution` (Python, PHP and Node) turns a result into
+  numbered steps and shows what "byte-identical" does and does not promise; `intelligence`
+  (Python) proves a carton change is worth publishing before publishing it.
+
+### Changed
+
+- **The solvers do less repeated work, again.** Byte-identical results everywhere. Group
+  batching in the Rust extreme-point solver drops two quadratic scans over group members
+  for a single pass, and the PHP and Python grid-admission and load-ordering paths reuse a
+  prototype profile and a canonical order instead of rebuilding them per candidate.
+
+- **Every example names its own time budget.** An example that solved on the library default
+  could print a different answer on a busy machine. Each now sets `time_limit_ms`, far above
+  what its solve needs; every printed answer is unchanged.
+
+### Fixed
+
+- **The JavaScript engine could return fewer placements than it reported packed.** When the
+  per-container beam search stopped early — on its node limit, the deadline or the effort
+  budget — it chose the surviving leader without the batches it had not reached yet, so those
+  items were neither placed nor listed as unpacked while the result still said `feasible`. It
+  needs `solver_profile: "quality"` or an explicit `container_plan_beam_width` above 1, and it
+  shipped in `@packvium/engine` `1.0.0` and `1.1.0`. The default profiles never reach that
+  path, and Python, PHP and Rust were never affected. If you run the JavaScript engine on the
+  `quality` profile, check `packed_item_count` against the placements you actually received
+  from those versions.
+
+- **The intelligence modules would not have imported on Python 3.9**, which is the minimum
+  the package declares. Six modules used `dataclass(slots=True)` from the standard library;
+  that argument does not exist before 3.10, so importing any of them raised `TypeError` on a
+  supported runtime. They now route through the package's own compatibility shim, as the
+  rest of the package already did.
+
+- **`@packvium/engine` did not expose its execution plan.** The module was named in the
+  package manifest but not in `exports`, so `import '@packvium/engine/execution.js'` failed
+  with `ERR_PACKAGE_PATH_NOT_EXPORTED` and the main entry re-exported neither function. The
+  subpath is now declared, with TypeScript declarations beside it.
+
+- **A non-finite metric is refused rather than ranked as optimal.** `NaN` makes both `>` and
+  `<` false, so an axis carrying one was silently counted equal and a candidate whose metrics
+  were all `NaN` arrived on the Pareto frontier beside a clean one. It is now refused by a
+  named error that says which candidate and which axis. Infinities are still accepted: they
+  are ends of the number line, and a caller encoding "unpriceable" as an infinite cost gets
+  the answer they mean.
+
 ## [1.1.0]
 
 An additive release on the 1.0.0 freeze. Route-aware unloading becomes a property of the
