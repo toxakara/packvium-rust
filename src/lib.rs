@@ -8,6 +8,7 @@ mod compression;
 mod contact_graph;
 mod deadline;
 mod error;
+pub mod execution;
 mod explain;
 mod geometry;
 mod hull;

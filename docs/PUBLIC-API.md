@@ -113,6 +113,43 @@ move backwards. This is a testing seam, not a serialized request field.
   catalog was involved), preserved by Python, PHP, Rust and JavaScript;
 - warnings and top-K alternatives.
 
+### `alternatives`, and what it is not
+
+Each entry in `alternatives[]` is a **complete result in its own right**, with its own score
+vector, containers and unpacked items — the schema says `$ref: "#"` and means it.
+
+**`configuration.alternatives` counts the winner.** It is the size of the ranked set the
+portfolio keeps, so the list of runners-up holds at most `alternatives - 1` entries. The
+schema's own minimum, `alternatives: 1`, therefore returns an **empty** list. Ask for `2` to
+receive one.
+
+**The list is per-engine and is not part of the cross-language contract.** Implementations
+are not required to explore the same number of portfolio starts — under this engine's own
+profiles a request may run one start, nine, or twenty-two — so PHP, Python, Rust and
+JavaScript will not generally return the same runners-up, the same number of them, or the
+same scores. Do not diff `alternatives` across implementations. Three properties *are*
+required of every implementation:
+
+1. each entry is a complete result that satisfies the result schema on its own;
+2. no alternative's score is lexicographically better than the winner's — if one were, it
+   would be the winner;
+3. the list holds at most `configuration.alternatives - 1` entries.
+
+**An empty list is normal, and it does not mean "nothing else was possible".** Read
+`termination.starts`, which names every portfolio start, whether it completed, and which was
+selected. Four situations produce an empty list, and only the last is about the difficulty of
+the request:
+
+| Situation | What `termination.starts` shows |
+| --- | --- |
+| `solver_profile: fast` runs a single solver | one start — this profile can never rank a runner-up |
+| `alternatives: 1` | any number of starts, and a cap of zero runners-up |
+| only one start finished within the budget | several starts, `completed: true` on one |
+| the grid lattice packed everything, so the portfolio stopped | one start, `grid:volume`, selected |
+
+If you want alternatives, ask for a profile that explores (`balanced` or `quality`) and a
+count of at least `2`.
+
 ### Solver metrics
 
 Every result, including each alternative, contains an `algorithm.metrics` object:
@@ -420,6 +457,103 @@ is a caller bug and is raised the way each language raises one (`CommerceInputEr
 tariff effective at that instant, no rate for that zone -- is a successful call returning
 `"status": "rejected"` with a code from a closed set, exactly as an infeasible packing
 request returns a result with a status rather than raising.
+
+## Execution plan
+
+A document derived from an already validated packing result: what to do first, why this
+carton, and what was not packed. It is a view, not a decision — it calls no solver and no
+validator, and a test in each language asserts that. The contract is
+EXECUTION-PLAN.md.
+
+| Language | Entry point |
+| --- | --- |
+| Python | `packvium.execution.build_execution_plan(request, result, loading_orders=...)`, `.canonical_plan_json(plan)` |
+| PHP | `Packvium\Execution\Plan::build(array $request, array $result, array $loadingOrders = [])`, `::canonicalJson(array $plan)` |
+| Rust | `packvium_core::execution::build_plan_json(result_json, loading_orders_json)` |
+| JavaScript | `buildExecutionPlan(request, result, {loadingOrders})`, `canonicalPlanJson(plan)` from `@packvium/engine`'s `execution.js` |
+
+All four are held to **byte-identical** output on the canonical form, over the whole golden
+corpus. That is stricter than the packing contract, which allows two engines to place items
+differently and compares an objective floor: a plan is derived from a result, so there is
+nothing left to differ about. The plan's own JSON Schema is closed — an extra key in one
+implementation is a divergence, not a nicety.
+
+**The step order is injected.** The engines compute a safe loading order from geometry the
+adapter never sees, so `loading_orders` is optional: supply it and each step is numbered,
+omit it and the container reports `order: "unavailable"` with every placement still listed.
+There is no third behaviour, because falling back to the order placements appear in would
+present an artifact of how the solver walked its candidates as an order safe to lift boxes
+in.
+
+**Facts and presentation are separate in the output.** Anything the solver or validator
+decided is under `facts`; every human-readable sentence is under `presentation` and names
+the authoritative fields it was built from in `cites`. A downstream system that reads only
+`facts` loses nothing it is entitled to rely on, and an `unpacked_items[].proof.level` of
+`observed` stays `observed` in both.
+
+**Operator locks re-solve; they never edit the plan.** An operator who pins a placement
+gets a *new* result beside the approved one rather than an edit of it, so "what was
+approved" and "what was proposed" stay two artifacts instead of two states of one.
+
+| Language | Entry point |
+| --- | --- |
+| Python | `packvium.locks.resolve_with_locks(request, locks)`, `.locks_from_plan(plan, ...)`, `.lock_registry(locks)` |
+| PHP, Rust, JavaScript | **not exported** |
+
+Each lock becomes an ordinary placement constraint, so the re-solve is the same portfolio
+under the same independent validator that any other request gets. There is no lock-aware
+solver and no relaxed validation: **a lock cannot produce a placement the engine would
+otherwise refuse**, and the strongest thing it can do is reserve its own slot. A lock the
+solve cannot honour comes back on `LockedResolve` as unpreserved and names the lock — it is
+an outcome, not an exception — while a lock set that contradicts itself, by overlapping or
+by naming an item the request does not contain, is refused with `LockSetError` before any
+solve runs.
+
+Python only, and deliberately so: a lock has no representation in the request schema, since
+that field is held for the next contract freeze, so there is nothing to hand another engine.
+
+## Scenario and recommendation API
+
+Scenario what-if comparison and catalog/rule recommendation publication, exported as
+`packvium.simulation` and `packvium.recommendations`. The full contract is
+INTELLIGENCE-API.md; what belongs here is the surface and its two
+limits, both of which are part of the API rather than notes about it.
+
+| Language | Entry point |
+| --- | --- |
+| Python | `packvium.simulation.run_scenario(...)`, `.compare_scenarios(...)`; `packvium.recommendations.propose_recommendation(...)`, `.approve_catalog(...)`, `.approve_policy(...)`; `packvium.holdout.evaluate_on_history(...)` over a `packvium.outcomes.OutcomeLedger` |
+| PHP, Rust, JavaScript | **not exported** |
+
+**Python only, and held to no cross-language conformance.** Every other contract in this
+document is proved by driving four engines as subprocesses over JSON. `run_scenario` takes
+an `OrderEvaluator` *callback* as its central argument, and a callback does not cross a
+pipe -- so the harness that proves the packing and commerce contracts cannot express a
+scenario at all. Whether the data-in/data-out half ever crosses runtimes is an open
+question, not an omission; INTELLIGENCE-API.md scopes it.
+
+**Historical replay ships with the ledger it reads.** `evaluate_on_history` scores a
+recommendation against decisions held out by an explicit `split_at`, and could not be
+exported until `packvium.outcomes` was, because a function whose central argument a caller
+cannot construct is worse than an unexported one. Two rules are enforced as control flow
+rather than documented: a packing the injected validator rejects is that arm's failure at
+any cost and its metrics never reach the comparison, and the validator is handed the
+request/result pair with no score in it. Only the deterministically recomputable part of an
+outcome is scored -- realised damage, returns, repacks and operator overrides happened
+under the carton that actually shipped, so they are reported against the baseline and never
+credited to the treatment.
+
+`compare_scenarios` returns a Pareto report per order and never a blended delta, and
+`propose_recommendation` returns `None` rather than a low-confidence proposal when the
+paired cohort is too small. Neither writes to a registry: publishing goes only through
+`approve_catalog` / `approve_policy`, and a proposal is handed no registry to write to.
+
+**Supported, and not yet frozen.** This surface and `packvium.locks` are reached by
+importing the submodule, which puts them outside the frozen API snapshot the packing and
+commerce surfaces are held to. They work, they are tested, and they will not be withdrawn
+inside 1.x — but a parameter may be renamed or a returned value gain a field in a minor
+release, announced in the changelog rather than blocked by a gate. Pin the version if you
+depend on the exact shape. COMPATIBILITY.md states why this one surface
+is held that way and what would change it.
 
 ## JSON API
 
