@@ -6,7 +6,7 @@ dependencies beyond `serde`, exact integer geometry.
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.2.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.3.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](docs/GUARANTEES.md) before relying on a result.
@@ -54,6 +54,7 @@ and execute without a project around it.
 | [`pack-stdin.rs`](examples/pack-stdin.rs) | Read a shared-contract request on stdin and write the result to stdout. |
 | [`commerce.rs`](examples/commerce.rs) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
 | [`commerce-stdin.rs`](examples/commerce-stdin.rs) | The same three functions over stdin/stdout. |
+| [`artifacts.rs`](examples/artifacts.rs) | Hand a result to a system with no engine: one document with the plan, geometry and the request that produced it, exported as CSV and a printable HTML work order — byte-identical to the other three engines. |
 
 ```bash
 cargo run --example basic
@@ -75,6 +76,11 @@ cargo run --example basic
   containers.
 - **Extensible.** Register your own constraints, item orderings, candidate scorers,
   container selectors or complete solvers.
+- **Work orders and portable artifacts.** `execution::build_plan_json` turns a result into
+  an operator's step list. `artifacts::build_artifact_json` wraps that plan with geometry,
+  display values and the request that produced it, and `artifact_exports` writes it as
+  canonical JSON, CSV or a self-contained HTML work order, byte for byte what the Python,
+  PHP and JavaScript packages write.
 - **`#![forbid(unsafe_code)]`.** The engine itself contains no `unsafe`.
 
 ## Documentation

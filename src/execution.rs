@@ -12,9 +12,10 @@
 //! assert!(plan.contains("\"format\":\"packvium-execution-plan/v1\""));
 //! ```
 //!
-//! Held to byte-identical output with `packvium.execution` and `Packvium\Execution\Plan`.
-//! That is cheaper here than elsewhere: `serde_json`'s object map is a `BTreeMap`, so a
-//! document is already in the sorted-key compact form the other two produce deliberately.
+//! Held to byte-identical output with `packvium.execution` and `Packvium\Execution\Plan`, and
+//! written in the RFC 8785 canonical form the operational artifact shares. Until 1.3.0 this
+//! was `serde_json`'s compact writer: the same bytes for every golden plan, but not for a key
+//! outside the Basic Multilingual Plane or an integral float, where the adapters disagreed.
 //!
 //! Two rules do the work, and both are about not quietly becoming a decision-maker.
 //! Authoritative solver facts and human text are separated in the *output* under `facts`
@@ -23,7 +24,9 @@
 //! `item_type`, `orientation` and `position.*.ticks` -- and never by `item_id`, which
 //! `conformance/canonical.py` drops as "an instance count rather than a semantic property".
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Number, Value, json};
+
+use crate::{canonical_json, value_text};
 
 /// The plan's own format tag. Not the packing schema's version, and it does not move with
 /// it: a result can gain fields without changing what a plan says.
@@ -51,15 +54,39 @@ fn fail<T>(message: impl Into<String>) -> PlanResult<T> {
     Err(ExecutionPlanError(message.into()))
 }
 
-fn integers(value: Option<&Value>) -> Vec<i64> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_i64).collect())
-        .unwrap_or_default()
+/// A score vector as the result carries it. Terms are copied, never filtered: dropping one the
+/// adapter cannot read would shift every later index and misname the deciding axis.
+fn score_terms(value: Option<&Value>) -> Vec<Value> {
+    value.and_then(Value::as_array).cloned().unwrap_or_default()
+}
+
+/// Terms compare by value, as the reference compares them: `1` and `1.0` are the same term.
+fn same_term(left: &Value, right: &Value) -> bool {
+    match (left.as_i64(), right.as_i64()) {
+        (Some(left), Some(right)) => left == right,
+        _ if left.is_number() && right.is_number() => left.as_f64() == right.as_f64(),
+        _ => left == right,
+    }
+}
+
+/// `alternative - winner`: exact for integers, IEEE for anything with a fraction.
+fn term_difference(winner: &Value, alternative: &Value) -> PlanResult<Value> {
+    if let (Some(chosen), Some(other)) = (winner.as_i64(), alternative.as_i64()) {
+        let difference = i128::from(other) - i128::from(chosen);
+        // Beyond i64 a difference is beyond 2^53 - 1 as well, and the writer refuses it.
+        let held =
+            i64::try_from(difference).unwrap_or(if difference < 0 { i64::MIN } else { i64::MAX });
+        return Ok(Value::from(held));
+    }
+    if !(winner.is_number() && alternative.is_number()) {
+        return fail("score terms that are not numbers cannot be subtracted");
+    }
+    let difference = alternative.as_f64().unwrap_or(0.0) - winner.as_f64().unwrap_or(0.0);
+    Ok(Number::from_f64(difference.clamp(-f64::MAX, f64::MAX)).map_or(Value::Null, Value::Number))
 }
 
 /// A reference two languages agree on, for one placement in one container.
-fn placement_reference(container_index: usize, placement: &Value) -> PlanResult<Value> {
+pub(crate) fn placement_reference(container_index: usize, placement: &Value) -> PlanResult<Value> {
     let object = match placement.as_object() {
         Some(object) => object,
         None => return fail("a placement must be an object"),
@@ -104,7 +131,7 @@ fn placement_reference(container_index: usize, placement: &Value) -> PlanResult<
 fn steps(
     container_index: usize,
     placements: &[Value],
-    loading_order: Option<&Vec<i64>>,
+    loading_order: Option<&[i64]>,
 ) -> PlanResult<(String, Vec<Value>)> {
     let Some(order) = loading_order else {
         let mut listed = Vec::with_capacity(placements.len());
@@ -113,14 +140,11 @@ fn steps(
         }
         return Ok(("unavailable".to_string(), listed));
     };
-    let mut sorted: Vec<i64> = order.clone();
+    let mut sorted: Vec<i64> = order.to_vec();
     sorted.sort_unstable();
     let expected: Vec<i64> = (0..placements.len() as i64).collect();
     if sorted != expected {
-        return fail(format!(
-            "loading order for container {container_index} is not a permutation of its {} placements",
-            placements.len()
-        ));
+        return Err(not_a_permutation(container_index, placements.len()));
     }
     let mut ordered = Vec::with_capacity(order.len());
     for (step, index) in order.iter().enumerate() {
@@ -132,20 +156,43 @@ fn steps(
     Ok(("loading".to_string(), ordered))
 }
 
+/// An injected order as indices. An entry that is not an integer is refused rather than
+/// dropped: dropping it could turn `[0, "1"]` into a permutation of one placement.
+fn loading_order(
+    container_index: usize,
+    value: &Value,
+    placement_count: usize,
+) -> PlanResult<Vec<i64>> {
+    value
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .map(Value::as_i64)
+                .collect::<Option<Vec<i64>>>()
+        })
+        .ok_or_else(|| not_a_permutation(container_index, placement_count))
+}
+
+fn not_a_permutation(container_index: usize, placement_count: usize) -> ExecutionPlanError {
+    ExecutionPlanError(format!(
+        "loading order for container {container_index} is not a permutation of its {placement_count} placements"
+    ))
+}
+
 /// The first index at which two score vectors differ, and by how much.
 ///
 /// Never a blended number. The portfolio compared these lexicographically, so the first
 /// differing index *is* the decision; weighting the vector would replace a decision that
 /// was made with one that was not.
-fn first_difference(winner: &[i64], loser: &[i64]) -> PlanResult<Value> {
-    let shared = winner.len().min(loser.len());
-    for index in 0..shared {
-        if winner[index] != loser[index] {
+fn first_difference(winner: &[Value], loser: &[Value]) -> PlanResult<Value> {
+    for (index, (chosen, other)) in winner.iter().zip(loser).enumerate() {
+        if !same_term(chosen, other) {
             return Ok(json!({
                 "index": index,
-                "winner": winner[index],
-                "alternative": loser[index],
-                "difference": loser[index] - winner[index],
+                "winner": chosen,
+                "alternative": other,
+                "difference": term_difference(chosen, other)?,
             }));
         }
     }
@@ -155,8 +202,8 @@ fn first_difference(winner: &[i64], loser: &[i64]) -> PlanResult<Value> {
     Ok(Value::Null)
 }
 
-fn alternative(index: usize, winner_score: &[i64], value: &Value) -> PlanResult<Value> {
-    let score = integers(value.get("score"));
+fn alternative(index: usize, winner_score: &[Value], value: &Value) -> PlanResult<Value> {
+    let score = score_terms(value.get("score"));
     let difference = first_difference(winner_score, &score)?;
     let summary = if difference.is_null() {
         "This option scored identically to the chosen one on every objective axis; \
@@ -165,7 +212,9 @@ fn alternative(index: usize, winner_score: &[i64], value: &Value) -> PlanResult<
     } else {
         format!(
             "This option differs first at objective axis {} ({UNNAMED_AXIS}): chosen {}, this {}.",
-            difference["index"], difference["winner"], difference["alternative"]
+            difference["index"],
+            value_text::text(&difference["winner"]),
+            value_text::text(&difference["alternative"])
         )
     };
     Ok(json!({
@@ -191,15 +240,36 @@ fn alternative(index: usize, winner_score: &[i64], value: &Value) -> PlanResult<
 /// strings for the same reason the commerce entry points take one: this is the shape the
 /// conformance harness can drive over a pipe.
 pub fn build_plan_json(result_json: &str, loading_orders_json: &str) -> PlanResult<String> {
-    let result: Value = match serde_json::from_str(result_json) {
+    // Read exactly, not with `serde_json`'s best-effort float parser: a float read one ULP
+    // off is written back as different digits.
+    let result = match canonical_json::parse(result_json) {
         Ok(value) => value,
-        Err(error) => return fail(format!("result is not valid JSON: {error}")),
+        Err(error) => return fail(format!("result is not valid JSON: {}", error.message)),
     };
-    let orders: Value = match serde_json::from_str(loading_orders_json) {
+    let orders = match canonical_json::parse(loading_orders_json) {
         Ok(value) => value,
-        Err(error) => return fail(format!("loading orders are not valid JSON: {error}")),
+        Err(error) => {
+            return fail(format!(
+                "loading orders are not valid JSON: {}",
+                error.message
+            ));
+        }
     };
-    if result.get("status").is_none() {
+    let plan = build_plan(&result, &orders)?;
+    canonical_json::to_canonical_string(&plan).or_else(|error| {
+        fail(format!(
+            "the plan has no canonical spelling: {}",
+            error.message
+        ))
+    })
+}
+
+/// The plan for one parsed result; the operational artifact wraps exactly this.
+///
+/// O(P + U + A·S) for P placements, U unplaced items and A alternatives of S score terms, plus
+/// O(L log L) to check a loading order of length L is a permutation.
+pub(crate) fn build_plan(result: &Value, orders: &Value) -> PlanResult<Value> {
+    if result.get("status").is_none_or(Value::is_null) {
         return fail("a result without a status is not a validated result");
     }
 
@@ -208,19 +278,20 @@ pub fn build_plan_json(result_json: &str, loading_orders_json: &str) -> PlanResu
         .get("containers")
         .and_then(Value::as_array)
         .unwrap_or(&empty);
-    let winner_score = integers(result.get("score"));
+    let winner_score = score_terms(result.get("score"));
 
     let mut plan_containers = Vec::with_capacity(containers.len());
     for (index, container) in containers.iter().enumerate() {
         let placements = container
             .get("placements")
             .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let order = orders
-            .get(index.to_string())
-            .map(|value| integers(Some(value)));
-        let (kind, listed) = steps(index, &placements, order.as_ref())?;
+            .map_or(&[][..], Vec::as_slice);
+        let order = match orders.get(index.to_string()) {
+            // An explicit null is no order, as a missing entry is.
+            None | Some(Value::Null) => None,
+            Some(value) => Some(loading_order(index, value, placements.len())?),
+        };
+        let (kind, listed) = steps(index, placements, order.as_deref())?;
         plan_containers.push(json!({
             "container_index": index,
             "facts": {
@@ -241,6 +312,17 @@ pub fn build_plan_json(result_json: &str, loading_orders_json: &str) -> PlanResu
     {
         let level = item.pointer("/proof/level").cloned().unwrap_or(Value::Null);
         let reason = item.get("reason").cloned().unwrap_or(Value::Null);
+        let details = match item.get("details") {
+            None | Some(Value::Null) => json!([]),
+            Some(details) => details.clone(),
+        };
+        // Spelled as the reference interpolates them, so a missing reason reads `None` in
+        // every engine instead of vanishing in one.
+        let summary = format!(
+            "Not packed: {} ({}).",
+            value_text::text(&reason),
+            value_text::text(&level)
+        );
         unplaced.push(json!({
             "facts": {
                 "item_type": item.get("item_type").cloned().unwrap_or(Value::Null),
@@ -248,14 +330,10 @@ pub fn build_plan_json(result_json: &str, loading_orders_json: &str) -> PlanResu
                 // Carried through unchanged. Softening `observed` into "could not fit"
                 // would turn an honest limit into a false certainty.
                 "proof_level": level,
-                "details": item.get("details").cloned().unwrap_or(json!([])),
+                "details": details,
             },
             "presentation": {
-                "summary": format!(
-                    "Not packed: {} ({}).",
-                    item.get("reason").and_then(Value::as_str).unwrap_or(""),
-                    item.pointer("/proof/level").and_then(Value::as_str).unwrap_or(""),
-                ),
+                "summary": summary,
                 "cites": ["unpacked_items[].reason", "unpacked_items[].proof.level"],
             },
         }));
@@ -292,7 +370,7 @@ pub fn build_plan_json(result_json: &str, loading_orders_json: &str) -> PlanResu
         "alternatives": alternatives,
         "unplaced": unplaced,
     });
-    Ok(plan.to_string())
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -472,10 +550,140 @@ mod tests {
             build_plan_json(&result(), "{}"),
             build_plan_json(&result(), "{}")
         );
-        // `serde_json`'s map is a BTreeMap, so the document is already sorted and compact --
-        // the same form Python's `sort_keys=True` and PHP's recursive ksort produce.
+        // RFC 8785: keys sorted by UTF-16 code unit, no whitespace.
         let plan = build_plan_json(&result(), "{}").unwrap();
         assert!(plan.starts_with(r#"{"alternatives":"#), "{plan}");
         assert!(!plan.contains(", "), "{plan}");
+    }
+
+    #[test]
+    fn the_plan_is_written_in_rfc_8785_canonical_form() {
+        let spelled = result()
+            .replace(r#""volume_utilization":0.5"#, r#""volume_utilization":1.0"#)
+            .replace(r#""objective":"default""#, "\"objective\":\"a\u{2028}b\"");
+        let plan = build_plan_json(&spelled, "{}").unwrap();
+        assert!(plan.contains(r#""volume_utilization":1}"#), "{plan}");
+        assert!(plan.contains("\"objective\":\"a\u{2028}b\""), "{plan}");
+    }
+
+    #[test]
+    fn score_terms_are_copied_and_compared_by_value_never_filtered() {
+        let with_alternative = result()
+            .replace(
+                r#""score":[0,1,0,0,1000000]"#,
+                r#""score":[0,1.5,0,0,1000000]"#,
+            )
+            .replace(
+                r#""alternatives":[]"#,
+                r#""alternatives":[{"status":"feasible","score":[0.0,2,0,0,900000]}]"#,
+            );
+        let plan: Value =
+            serde_json::from_str(&build_plan_json(&with_alternative, "{}").unwrap()).unwrap();
+        assert_eq!(plan["facts"]["score"], json!([0, 1.5, 0, 0, 1000000]));
+        let difference = &plan["alternatives"][0]["facts"]["first_difference"];
+        assert_eq!(difference["index"], 1);
+        assert_eq!(difference["difference"], json!(0.5));
+        let summary = plan["alternatives"][0]["presentation"]["summary"]
+            .as_str()
+            .unwrap();
+        assert!(summary.contains("chosen 1.5, this 2."), "{summary}");
+
+        let unsubtractable = result().replace(
+            r#""alternatives":[]"#,
+            r#""alternatives":[{"score":[0,"x",0,0,1000000]}]"#,
+        );
+        let error = build_plan_json(&unsubtractable, "{}").unwrap_err();
+        assert!(error.0.contains("not numbers"), "{}", error.0);
+    }
+
+    #[test]
+    fn a_result_whose_status_is_null_is_not_a_validated_result() {
+        let error = build_plan_json(r#"{"status":null,"containers":[]}"#, "{}").unwrap_err();
+        assert!(error.0.contains("validated result"), "{}", error.0);
+    }
+
+    #[test]
+    fn a_null_order_is_no_order_and_a_non_integer_entry_is_refused() {
+        assert_eq!(
+            plan(r#"{"0":null}"#)["containers"][0]["order"],
+            "unavailable"
+        );
+        let error = build_plan_json(&result(), r#"{"0":[1,"0"]}"#).unwrap_err();
+        assert!(error.0.contains("permutation"), "{}", error.0);
+    }
+
+    #[test]
+    fn an_unpacked_item_without_a_reason_is_summarised_as_the_reference_writes_it() {
+        let with_unpacked = result().replace(
+            r#""unpacked_items":[]"#,
+            r#""unpacked_items":[{"item_type":"ladder","details":null}]"#,
+        );
+        let plan: Value =
+            serde_json::from_str(&build_plan_json(&with_unpacked, "{}").unwrap()).unwrap();
+        let unplaced = &plan["unplaced"][0];
+        assert_eq!(
+            unplaced["presentation"]["summary"],
+            "Not packed: None (None)."
+        );
+        assert_eq!(unplaced["facts"]["details"], json!([]));
+    }
+
+    #[test]
+    fn the_error_prints_its_own_message() {
+        let error = ExecutionPlanError("a placement must be an object".to_string());
+        assert_eq!(error.to_string(), "a placement must be an object");
+    }
+
+    #[test]
+    fn a_placement_that_is_not_an_object_is_refused() {
+        let error = placement_reference(0, &json!("cube")).unwrap_err();
+        assert!(error.0.contains("must be an object"), "{}", error.0);
+    }
+
+    #[test]
+    fn a_placement_without_exact_ticks_is_refused_and_the_path_is_named() {
+        let mut placement: Value = serde_json::from_str(&placement("cube", 0)).unwrap();
+        placement["position"]["x"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ticks");
+        let error = placement_reference(0, &placement).unwrap_err();
+        assert!(error.0.contains("position.x.ticks"), "{}", error.0);
+    }
+
+    #[test]
+    fn an_alternative_with_the_same_score_says_so_and_has_no_first_difference() {
+        let with_alternative = result().replace(
+            r#""alternatives":[]"#,
+            r#""alternatives":[{"status":"feasible","score":[0,1,0,0,1000000]}]"#,
+        );
+        let plan: Value =
+            serde_json::from_str(&build_plan_json(&with_alternative, "{}").unwrap()).unwrap();
+        let alternative = &plan["alternatives"][0];
+        assert_eq!(alternative["facts"]["first_difference"], Value::Null);
+        let summary = alternative["presentation"]["summary"].as_str().unwrap();
+        assert!(summary.contains("scored identically"), "{summary}");
+    }
+
+    #[test]
+    fn text_that_is_not_json_is_refused_for_either_input() {
+        let error = build_plan_json("{", "{}").unwrap_err();
+        assert!(error.0.contains("result is not valid JSON"), "{}", error.0);
+        let error = build_plan_json(&result(), "{").unwrap_err();
+        assert!(
+            error.0.contains("loading orders are not valid JSON"),
+            "{}",
+            error.0
+        );
+    }
+
+    #[test]
+    fn a_plan_with_a_number_no_engine_holds_exactly_is_refused() {
+        let beyond = result().replace(
+            r#""score":[0,1,0,0,1000000]"#,
+            r#""score":[0,1,0,0,9007199254740993]"#,
+        );
+        let error = build_plan_json(&beyond, "{}").unwrap_err();
+        assert!(error.0.contains("no canonical spelling"), "{}", error.0);
     }
 }

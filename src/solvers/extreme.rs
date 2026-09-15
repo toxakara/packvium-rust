@@ -2567,6 +2567,7 @@ fn try_pack_into_beam(
     //: nodes have consumed batches `0..pending_from` and nothing after, so completing one
     //: of them means adding `batches[pending_from..]` to its unplaced list -- see the
     //: final selection below for why leaving that out lost items outright.
+    let mut incumbent_key = container_beam_key(&incumbent, &[]);
     let mut pending_from: Option<usize> = None;
 
     for (position, batch) in batches.iter().enumerate() {
@@ -2644,15 +2645,17 @@ fn try_pack_into_beam(
         for node in &expansions {
             let mut complete = node.clone();
             complete.unplaced.extend(future.iter().cloned());
-            if container_beam_key(&complete, &[]) < container_beam_key(&incumbent, &[]) {
+            let complete_key = container_beam_key(&complete, &[]);
+            if complete_key < incumbent_key {
                 incumbent = complete;
+                incumbent_key = complete_key;
             }
         }
         if expansions.is_empty() || exhausted {
             pending_from = Some(position);
             break;
         }
-        expansions.sort_by_key(|node| container_beam_key(node, &future));
+        expansions.sort_by_cached_key(|node| container_beam_key(node, &future));
         expansions.truncate(request.config.container_plan_beam_width);
         beam = expansions;
     }
@@ -2680,7 +2683,7 @@ fn try_pack_into_beam(
             node
         })
         .min_by_key(|node| container_beam_key(node, &[]))
-        && container_beam_key(&completed, &[]) < container_beam_key(&incumbent, &[])
+        && container_beam_key(&completed, &[]) < incumbent_key
     {
         incumbent = completed;
     }
