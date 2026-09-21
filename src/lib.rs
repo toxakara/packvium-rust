@@ -2,7 +2,10 @@
 #![deny(missing_debug_implementations)]
 
 mod api;
+pub mod artifact_exports;
+pub mod artifacts;
 pub mod bounds;
+mod canonical_json;
 pub mod commerce;
 mod compression;
 mod contact_graph;
@@ -22,6 +25,7 @@ mod solvers;
 mod spatial_index;
 mod units;
 mod validation;
+mod value_text;
 
 pub use api::{pack_json, pack_request, rebalance_json};
 pub use deadline::{Clock, Deadline};

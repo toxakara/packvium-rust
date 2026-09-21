@@ -198,9 +198,10 @@ impl CatalogRegistry {
     }
 
     pub fn version(&self, number: i64) -> Result<&Version, CatalogRejection> {
-        self.versions
-            .iter()
-            .find(|version| version.number == number)
+        usize::try_from(number)
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .and_then(|index| self.versions.get(index))
             .ok_or(CatalogRejection::VersionNotFound)
     }
 
@@ -250,5 +251,31 @@ impl Catalogs {
 
     pub fn get(&self, catalog_id: &str) -> Option<&CatalogRegistry> {
         self.inner.get(catalog_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinned_history_preserves_boundaries_and_rollback() {
+        let mut registry = CatalogRegistry::new("lookup".into());
+        for number in 1..=64 {
+            registry.publish(Snapshot::default(), number % 7, number, String::new());
+        }
+        for number in [1, 2, 32, 64] {
+            assert_eq!(registry.version(number).unwrap().number, number);
+        }
+        for number in [i64::MIN, -10, 0, 65, i64::MAX] {
+            assert!(matches!(
+                registry.version(number),
+                Err(CatalogRejection::VersionNotFound)
+            ));
+        }
+        registry.rollback(1, 100, Some(6), String::new()).unwrap();
+        assert_eq!(registry.version(65).unwrap().rolled_back_from, Some(1));
+        assert_eq!(registry.resolve(None, Some(6)).unwrap().number, 65);
+        assert_eq!(registry.resolve(None, Some(0)).unwrap().number, 63);
     }
 }

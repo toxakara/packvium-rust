@@ -512,6 +512,47 @@ solve runs.
 Python only, and deliberately so: a lock has no representation in the request schema, since
 that field is held for the next contract freeze, so there is nothing to hand another engine.
 
+Since 1.3.0 the canonical form is RFC 8785, the spelling the operational artifact uses. For
+every plan an engine emits the bytes are the ones 1.2.0 wrote.
+
+## Operational artifact
+
+One portable document built from a validated result. It carries:
+- the execution plan, unchanged;
+- the geometry needed to draw it;
+- the rendered values a work order prints;
+- the provenance needed to replay it: the request itself, the catalogs, the deterministic part
+  of the solver record, and an honest replay level.
+
+It is exported as JSON, RFC 4180 CSV, or a self-contained printable HTML work order. Like the
+plan it is a view, not a decision: no solver, validator, renderer or clock is called. The
+contract is OPERATIONAL-ARTIFACTS.md.
+
+| Language | Builder | Exports |
+| --- | --- | --- |
+| Python | `packvium.artifacts.build_operational_artifact(request, result, loading_orders=...)`, `.canonical_artifact_json(artifact)` | `packvium.artifact_exports.export_json(artifact)`, `.export_csv(artifact)`, `.export_work_order_html(artifact)` |
+| PHP | `Packvium\Artifacts\OperationalArtifact` | `Packvium\Artifacts\ArtifactExports` |
+| Rust | `packvium_core::artifacts::build_artifact_json(request_json, result_json, loading_orders_json)` | `packvium_core::artifact_exports::export_json`, `export_csv`, `export_work_order_html` |
+| JavaScript | `buildOperationalArtifact(request, result, {loadingOrders})`, `canonicalArtifactJson(artifact)` from `@packvium/engine`'s `artifacts.js` | `exportJson`, `exportCsv`, `exportWorkOrderHtml` from `artifact-exports.js` |
+
+All four are held to **byte-identical** output on all three exports. The comparison covers
+every golden result with its own request and a real loading order, plus edge cases no fixture
+contains. The schema is closed.
+
+**Placements are addressed by the plan's `placement_ref`, never by `item_id`**, in geometry, in
+work-order lines, in CSV rows and in the visualizer. Work-order lines are the plan's steps,
+looked up in the plan's order and never re-ordered.
+
+**Replay is stated, not assumed.** `provenance.replay.level` is `exact` only when solving the
+embedded request again must reproduce the result. When the search stopped on wall-clock time,
+or the result does not record how it was solved, the level is `not_guaranteed`, and `because`
+names the field that decided it.
+
+**Refusals use one closed set of codes** in every language (`invalid_request`, `invalid_result`,
+`invalid_plan_input`, `mixed_units`, `number_out_of_range`, `invalid_string`, `invalid_value`,
+`unknown_format`, `invalid_json`). An export or reader handed a format it does not know refuses
+it rather than guessing.
+
 ## Scenario and recommendation API
 
 Scenario what-if comparison and catalog/rule recommendation publication, exported as
