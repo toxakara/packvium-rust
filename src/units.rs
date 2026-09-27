@@ -14,25 +14,7 @@ impl Length {
     pub const TICKS_PER_INCH: i64 = 406_400;
 
     pub fn parse(value: &Value, default_unit: &str) -> PackResult<Self> {
-        let (raw, unit) = scalar_and_unit(value, default_unit)?;
-        let multiplier = match unit.to_ascii_lowercase().as_str() {
-            "tick" | "ticks" => 1,
-            "mm" | "millimeter" | "millimeters" => Self::TICKS_PER_MM,
-            "cm" => Self::TICKS_PER_MM * 10,
-            "m" => Self::TICKS_PER_MM * 1_000,
-            "in" | "inch" | "inches" => Self::TICKS_PER_INCH,
-            "ft" => Self::TICKS_PER_INCH * 12,
-            other => return Err(PackError::UnsupportedUnit(other.to_owned())),
-        };
-        let (numerator, denominator) = parse_rational(&raw)?;
-        let scaled = numerator
-            .checked_mul(multiplier as i128)
-            .ok_or_else(|| PackError::InvalidNumber(raw.clone()))?;
-        let ticks = round_half_even(scaled, denominator)?;
-        if !(0..=i64::MAX as i128).contains(&ticks) {
-            return Err(PackError::InvalidNumber(raw));
-        }
-        Ok(Self(ticks as i64))
+        bounded_ticks(value, default_unit, MeasureKind::Length).map(Self)
     }
 
     pub fn to_json(self, unit: &str) -> Value {
@@ -66,25 +48,7 @@ impl Weight {
     pub const TICKS_PER_LB: i64 = 3_628_738_960;
 
     pub fn parse(value: &Value, default_unit: &str) -> PackResult<Self> {
-        let (raw, unit) = scalar_and_unit(value, default_unit)?;
-        let multiplier = match unit.to_ascii_lowercase().as_str() {
-            "tick" | "ticks" => 1,
-            "mg" => Self::TICKS_PER_MG,
-            "g" => Self::TICKS_PER_G,
-            "kg" => Self::TICKS_PER_KG,
-            "oz" => Self::TICKS_PER_OZ,
-            "lb" | "lbs" => Self::TICKS_PER_LB,
-            other => return Err(PackError::UnsupportedUnit(other.to_owned())),
-        };
-        let (numerator, denominator) = parse_rational(&raw)?;
-        let scaled = numerator
-            .checked_mul(multiplier as i128)
-            .ok_or_else(|| PackError::InvalidNumber(raw.clone()))?;
-        let ticks = round_half_even(scaled, denominator)?;
-        if !(0..=i64::MAX as i128).contains(&ticks) {
-            return Err(PackError::InvalidNumber(raw));
-        }
-        Ok(Self(ticks as i64))
+        bounded_ticks(value, default_unit, MeasureKind::Weight).map(Self)
     }
 
     pub fn to_json(self, unit: &str) -> Value {
@@ -102,6 +66,74 @@ impl Weight {
             "unit": unit,
         })
     }
+}
+
+/// Which quantity a measure is, so the one parser can tell a length unit from a weight unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MeasureKind {
+    Length,
+    Weight,
+}
+
+impl MeasureKind {
+    /// Ticks per `unit`, matched ignoring case and surrounding space as the reference does.
+    fn multiplier(self, unit: &str) -> Option<i64> {
+        let unit = unit.trim().to_ascii_lowercase();
+        Some(match (self, unit.as_str()) {
+            (_, "tick" | "ticks") => 1,
+            (Self::Length, "mm" | "millimeter" | "millimeters") => Length::TICKS_PER_MM,
+            (Self::Length, "cm") => Length::TICKS_PER_MM * 10,
+            (Self::Length, "m") => Length::TICKS_PER_MM * 1_000,
+            (Self::Length, "in" | "inch" | "inches") => Length::TICKS_PER_INCH,
+            (Self::Length, "ft") => Length::TICKS_PER_INCH * 12,
+            (Self::Weight, "mg") => Weight::TICKS_PER_MG,
+            (Self::Weight, "g") => Weight::TICKS_PER_G,
+            (Self::Weight, "kg") => Weight::TICKS_PER_KG,
+            (Self::Weight, "oz") => Weight::TICKS_PER_OZ,
+            (Self::Weight, "lb" | "lbs") => Weight::TICKS_PER_LB,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn knows_unit(self, unit: &str) -> bool {
+        self.multiplier(unit).is_some()
+    }
+}
+
+/// A measure's ticks before any range check, so a caller can tell a negative measure from
+/// one that does not parse at all. The text of the scalar comes back for error messages.
+fn unbounded_ticks(
+    value: &Value,
+    default_unit: &str,
+    kind: MeasureKind,
+) -> PackResult<(String, i128)> {
+    let (raw, unit) = scalar_and_unit(value, default_unit)?;
+    let multiplier = kind
+        .multiplier(&unit)
+        .ok_or_else(|| PackError::UnsupportedUnit(unit.trim().to_ascii_lowercase()))?;
+    let (numerator, denominator) = parse_rational(&raw)?;
+    let scaled = numerator
+        .checked_mul(multiplier as i128)
+        .ok_or_else(|| PackError::InvalidNumber(raw.clone()))?;
+    let ticks = round_half_even(scaled, denominator)?;
+    Ok((raw, ticks))
+}
+
+fn bounded_ticks(value: &Value, default_unit: &str, kind: MeasureKind) -> PackResult<i64> {
+    let (raw, ticks) = unbounded_ticks(value, default_unit, kind)?;
+    i64::try_from(ticks)
+        .ok()
+        .filter(|ticks| *ticks >= 0)
+        .ok_or(PackError::InvalidNumber(raw))
+}
+
+/// The measure's ticks, negative ones included; an error only when it does not parse.
+pub(crate) fn measure_ticks(
+    value: &Value,
+    default_unit: &str,
+    kind: MeasureKind,
+) -> PackResult<i128> {
+    unbounded_ticks(value, default_unit, kind).map(|(_, ticks)| ticks)
 }
 
 fn scalar_and_unit(value: &Value, default_unit: &str) -> PackResult<(String, String)> {

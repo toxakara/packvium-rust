@@ -1,5 +1,6 @@
 use super::extreme::{
-    ContainerState, apply_candidate, container_order_key, find_candidates_at_points, score_solution,
+    ContainerState, OpenedContainers, apply_candidate, container_order_key,
+    find_candidates_at_points, open_fixed_containers, score_solution,
 };
 use crate::deadline::Deadline;
 use crate::geometry::{Aabb, Dimensions, Point};
@@ -26,15 +27,28 @@ pub fn pack_maximal_order(
     deadline: &Deadline,
 ) -> PackingResult {
     let started = deadline.now_ns();
-    let mut remaining = items.to_vec();
-    let mut packed = Vec::new();
     let mut metrics = SolverMetrics::default();
-    let mut container_sequence = 0;
-    let mut inventory = request
-        .containers
-        .iter()
-        .map(|container| (container.id.clone(), container.quantity))
-        .collect::<BTreeMap<_, _>>();
+    let fill = |container: Container,
+                sequence: usize,
+                items: &[ItemInstance],
+                metrics: &mut SolverMetrics| {
+        fill_container(
+            request,
+            container,
+            sequence,
+            items,
+            constraints,
+            scorers,
+            deadline,
+            metrics,
+        )
+    };
+    let OpenedContainers {
+        mut packed,
+        mut remaining,
+        mut inventory,
+        mut sequences,
+    } = open_fixed_containers(request, items, deadline, &mut metrics, &fill);
 
     while !remaining.is_empty()
         && request
@@ -47,81 +61,14 @@ pub fn pack_maximal_order(
         let Some(container) = choose_container(request, &remaining, &inventory) else {
             break;
         };
-        container_sequence += 1;
-        let mut state = ContainerState::new(container.clone(), container_sequence);
-        let mut spaces = vec![Space(Aabb {
-            origin: Point::ZERO,
-            dimensions: container.inner_dimensions,
-        })];
-        for obstacle in &container.obstacles {
-            for box_ in obstacle.boxes() {
-                spaces = subtract_all(spaces, box_, &mut metrics);
-            }
-        }
-        let mut next = Vec::new();
-        // Sorted origins for the current `spaces` snapshot. `spaces` is mutated only by
-        // `subtract_all` after a committed placement (see the `if let Some(candidate)` arm
-        // below); every other statement between here and the next commit only reads it.
-        // Caching the sort and the derived points across those reads is therefore a no-op
-        // transform: re-sorting an already-sorted `Vec` with a stable comparator reproduces
-        // the same order, so the cached order is bit-for-bit what a fresh sort would give.
-        let mut sorted_points: Option<Vec<Point>> = None;
-
-        for item in remaining {
-            if deadline.expired() || effort_exhausted(request, &metrics) {
-                next.push(item);
-                continue;
-            }
-            metrics.search_nodes_expanded = metrics.search_nodes_expanded.saturating_add(1);
-            let points = sorted_points
-                .get_or_insert_with(|| {
-                    spaces.sort_by_key(|space| {
-                        (
-                            space.0.origin.z,
-                            space.0.dimensions.volume(),
-                            space.0.origin.y,
-                            space.0.origin.x,
-                        )
-                    });
-                    spaces.iter().map(|space| space.0.origin).collect()
-                })
-                .clone();
-            let candidates = find_candidates_at_points(
-                &state,
-                &item,
-                request,
-                constraints,
-                scorers,
-                points,
-                usize::MAX,
-                deadline,
-                &mut metrics,
-            );
-            let selected = candidates.into_iter().find(|candidate| {
-                let box_ = Aabb {
-                    origin: candidate.envelope_origin,
-                    dimensions: candidate.envelope_dimensions,
-                };
-                spaces.iter().any(|space| space.0.contains(box_))
-            });
-            if let Some(candidate) = selected {
-                let occupied = Aabb {
-                    origin: candidate.envelope_origin,
-                    dimensions: candidate.envelope_dimensions,
-                };
-                apply_candidate(&mut state, item, &candidate);
-                spaces = subtract_all(spaces, occupied, &mut metrics);
-                sorted_points = None;
-            } else {
-                next.push(item);
-            }
-        }
-
+        let sequence = sequences.get(&container.id).copied().unwrap_or(0) + 1;
+        let (state, next) = fill(container.clone(), sequence, &remaining, &mut metrics);
         if state.packed.placements.is_empty() {
             inventory.insert(container.id.clone(), Some(0));
             remaining = next;
             continue;
         }
+        sequences.insert(container.id.clone(), sequence);
         if let Some(Some(value)) = inventory.get_mut(&container.id) {
             *value = value.saturating_sub(1);
         }
@@ -182,6 +129,99 @@ pub fn pack_maximal_order(
         objective: request.config.objective.clone(),
         catalog_versions_used: Vec::new(),
     }
+}
+
+/// One container's maximal-space search, starting from any fixed items it already holds.
+#[allow(clippy::too_many_arguments)]
+fn fill_container(
+    request: &PackingRequest,
+    container: Container,
+    sequence: usize,
+    remaining: &[ItemInstance],
+    constraints: &[Arc<dyn PlacementConstraint>],
+    scorers: &[Arc<dyn CandidateScorer>],
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+) -> (ContainerState, Vec<ItemInstance>) {
+    let mut state = ContainerState::new(container.clone(), sequence);
+    let mut spaces = vec![Space(Aabb {
+        origin: Point::ZERO,
+        dimensions: container.inner_dimensions,
+    })];
+    for obstacle in &container.obstacles {
+        for box_ in obstacle.boxes() {
+            spaces = subtract_all(spaces, box_, metrics);
+        }
+    }
+    let fixed_boxes = state
+        .packed
+        .placements
+        .iter()
+        .map(Placement::envelope_box)
+        .collect::<Vec<_>>();
+    for box_ in fixed_boxes {
+        spaces = subtract_all(spaces, box_, metrics);
+    }
+    let mut next = Vec::new();
+    // Sorted origins for the current `spaces` snapshot. `spaces` is mutated only by
+    // `subtract_all` after a committed placement (see the `if let Some(candidate)` arm
+    // below); every other statement between here and the next commit only reads it.
+    // Caching the sort and the derived points across those reads is therefore a no-op
+    // transform: re-sorting an already-sorted `Vec` with a stable comparator reproduces
+    // the same order, so the cached order is bit-for-bit what a fresh sort would give.
+    let mut sorted_points: Option<Vec<Point>> = None;
+
+    for item in remaining.iter().cloned() {
+        if deadline.expired() || effort_exhausted(request, metrics) {
+            next.push(item);
+            continue;
+        }
+        metrics.search_nodes_expanded = metrics.search_nodes_expanded.saturating_add(1);
+        let points = sorted_points
+            .get_or_insert_with(|| {
+                spaces.sort_by_key(|space| {
+                    (
+                        space.0.origin.z,
+                        space.0.dimensions.volume(),
+                        space.0.origin.y,
+                        space.0.origin.x,
+                    )
+                });
+                spaces.iter().map(|space| space.0.origin).collect()
+            })
+            .clone();
+        let candidates = find_candidates_at_points(
+            &state,
+            &item,
+            request,
+            constraints,
+            scorers,
+            points,
+            usize::MAX,
+            deadline,
+            metrics,
+        );
+        let selected = candidates.into_iter().find(|candidate| {
+            let box_ = Aabb {
+                origin: candidate.envelope_origin,
+                dimensions: candidate.envelope_dimensions,
+            };
+            spaces.iter().any(|space| space.0.contains(box_))
+        });
+        if let Some(candidate) = selected {
+            let occupied = Aabb {
+                origin: candidate.envelope_origin,
+                dimensions: candidate.envelope_dimensions,
+            };
+            apply_candidate(&mut state, item, &candidate);
+            spaces = subtract_all(spaces, occupied, metrics);
+            sorted_points = None;
+        } else {
+            next.push(item);
+        }
+    }
+
+    (state, next)
 }
 
 // Precondition: `spaces` is containment-free -- every call site passes either a

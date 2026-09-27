@@ -974,6 +974,7 @@ mod tests {
             max_stack_density: max_stack_density_kg.map(|kg| Weight(kg * TICKS_PER_KG)),
             rate_table: None,
             access_directions: Vec::new(),
+            preloaded: Vec::new(),
         }
     }
 
@@ -994,6 +995,7 @@ mod tests {
             envelope_dimensions: dims,
             support_ratio: 1.0,
             top_load: Weight(0),
+            fixed: false,
         }
     }
 

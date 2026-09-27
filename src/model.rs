@@ -491,6 +491,32 @@ pub struct Container {
     /// order search identically. Overrides `PackingConfig::access_directions`, which
     /// remains for the library callers who set the doors in code.
     pub access_directions: Vec<String>,
+    /// Items already in this one container instance before search starts. Set only by the
+    /// solvers, on the instance a request's `fixed_placements` name; `ContainerState::new`
+    /// moves them into its placements, so a packed container never carries them twice
+    /// (docs/PLAN-REVISIONS.md).
+    pub preloaded: Vec<Placement>,
+}
+
+/// An item already in a known place before the solve: loaded, or locked there.
+///
+/// Addressed by container type and instance rather than by a result's container index,
+/// which does not exist until the solve finishes. `position` is the physical origin, as a
+/// result reports it, so a result placement can be fixed by quoting it
+/// (docs/PLAN-REVISIONS.md).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixedPlacement {
+    pub item_id: String,
+    pub container_id: String,
+    pub container_instance: usize,
+    pub position: Point,
+    pub rotation: Rotation,
+}
+
+impl FixedPlacement {
+    pub fn packed_container_id(&self) -> String {
+        format!("{}#{}", self.container_id, self.container_instance)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -501,9 +527,29 @@ pub struct PackingRequest {
     pub output_length_unit: String,
     pub output_weight_unit: String,
     pub catalog_versions_used: Vec<Value>,
+    /// Items already in a known place before the solve, as the request states them.
+    pub fixed_placements: Vec<FixedPlacement>,
+    /// `fixed_placements` resolved by admission: the containers they name, in opening
+    /// order, each holding only its fixed items. The portfolio fills this from
+    /// `fixed_placements` when it is empty, so a caller leaves it empty.
+    pub fixed_containers: Vec<PackedContainer>,
 }
 
 impl PackingRequest {
+    /// Every instance a fixed placement did not take, in request order.
+    pub fn free_instances(&self) -> Vec<ItemInstance> {
+        let fixed = self
+            .fixed_containers
+            .iter()
+            .flat_map(|container| &container.placements)
+            .map(|placement| placement.instance.id())
+            .collect::<BTreeSet<_>>();
+        self.instances()
+            .into_iter()
+            .filter(|instance| !fixed.contains(&instance.id()))
+            .collect()
+    }
+
     pub fn instances(&self) -> Vec<ItemInstance> {
         self.items
             .iter()
@@ -527,6 +573,8 @@ pub struct Placement {
     pub envelope_dimensions: Dimensions,
     pub support_ratio: f64,
     pub top_load: Weight,
+    /// Placed by the request's `fixed_placements`, not by search; nothing may move it.
+    pub fixed: bool,
 }
 
 impl Placement {
@@ -702,6 +750,7 @@ impl LatticeSummary {
                 envelope_dimensions: self.envelope,
                 support_ratio: 1.0,
                 top_load: Weight(0),
+                fixed: false,
             });
         }
         out
@@ -1398,7 +1447,7 @@ impl PackingResult {
                     .placements
                     .iter()
                     .map(|placement| {
-                        serde_json::json!({
+                        let mut serialized = serde_json::json!({
                             "item_id": placement.instance.id(),
                             "item_type": placement.instance.item.id.clone(),
                             "position": placement.position.to_json(length_unit),
@@ -1406,7 +1455,13 @@ impl PackingResult {
                             "orientation": placement.rotation.as_str(),
                             "support_ratio": format!("{:.6}", placement.support_ratio),
                             "top_load": placement.top_load.to_json(weight_unit),
-                        })
+                        });
+                        // Absent unless true, so a request without fixed placements keeps
+                        // its bytes.
+                        if placement.fixed {
+                            serialized["fixed"] = Value::Bool(true);
+                        }
+                        serialized
                     })
                     .collect::<Vec<_>>();
 
@@ -1609,6 +1664,7 @@ mod tests {
             envelope_dimensions: item.dimensions,
             support_ratio: 1.0,
             top_load: Weight(0),
+            fixed: false,
         }
     }
 

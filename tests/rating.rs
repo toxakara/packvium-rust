@@ -100,7 +100,7 @@ fn a_malformed_tariff_is_refused_rather_than_mispriced() {
         ),
         (
             json!({"weight_brackets_g": ["2000"], "prices_minor": [900]}),
-            "weight_brackets_g must hold integers",
+            "/rate_table/weight_brackets_g/0: must be an integer",
         ),
         (
             json!({"weight_brackets_g": [], "prices_minor": []}),
@@ -124,10 +124,13 @@ fn a_malformed_tariff_is_refused_rather_than_mispriced() {
 #[test]
 fn a_non_positive_first_bracket_is_refused_by_the_same_guard() {
     // A zero or negative bound would make the first band unreachable while still looking
-    // priced. It shares the ascending check's message deliberately: both describe the
-    // same malformed ladder.
+    // priced. The request's rule table names the bracket before the parser's ascending
+    // guard sees it, with the schema's floor.
     let error = refusal(json!({"weight_brackets_g": [0], "prices_minor": [900]}));
-    assert!(error.contains("strictly ascending and positive"), "{error}");
+    assert!(
+        error.ends_with("/rate_table/weight_brackets_g/0: must be at least 1"),
+        "{error}"
+    );
 }
 
 #[test]

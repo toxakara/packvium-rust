@@ -74,6 +74,19 @@
   (`c` emitted containers, `r <= 6` rotations), so large identical quantities do not
   create per-item JavaScript objects either. Requests outside the regular-lattice
   preconditions keep using the general solver and may still return coordinates.
+- `fixed_placements`: optional items already in a known place before the solve -- loaded,
+  or locked there by an operator. Each names an item type, a container type and instance
+  (from 1; the result emits that container as `<type>#<instance>`), the physical position a
+  result reports and an orientation, so a result placement can be fixed by quoting it. Fixed
+  items are real placements: they carry weight, support what is stacked on them, take top
+  load and count against payload. They take the first instances of their type, their
+  containers open first and are always kept, and each is reported unmoved with
+  `"fixed": true`. A fixed set that is not a valid packing on its own is refused before
+  search with `invalid_fixed_placement`. Python `Packer.pack(items, containers,
+  fixed_placements)` and PHP `Packer::pack($items, $containers, $fixedPlacements)` take
+  `FixedPlacement` values; Rust takes them in `PackingRequest.fixed_placements`, and every
+  JSON entry point reads the field. PLAN-REVISIONS.md is the contract;
+  all four engines implement it.
 - `catalog_versions_used`: optional immutable catalog references resolved before
   packing. Each reference has exactly `catalog_id`, positive `version`,
   non-negative `published_at_epoch_ms`, and `content_digest`; catalog IDs are unique.
@@ -552,6 +565,27 @@ names the field that decided it.
 `invalid_plan_input`, `mixed_units`, `number_out_of_range`, `invalid_string`, `invalid_value`,
 `unknown_format`, `invalid_json`). An export or reader handed a format it does not know refuses
 it rather than guessing.
+
+## Plan revisions
+
+An append-only, hash-chained record of what differed from an approved plan: a missing item,
+a substituted carton, an operator lock or a verified placement. Each revision derives the
+request the next plan solves; a replan is an ordinary solve of it, with locks and verified
+placements carried as `fixed_placements`. A revision is a pure function of its parent, the
+approved operational artifact and its events, and calls no solver or clock. The contract is
+PLAN-REVISIONS.md.
+
+| Language | Surface |
+| --- | --- |
+| Python | `packvium.revisions.root_revision(request)`, `.derive_revision(parent, approved_artifact, events)`, `.verify_revision_chain(revisions, artifacts=None)`, `.document_digest(document)`, `.canonical_revision_json(document)`; `packvium.revision_outcomes.record_revision(ledger, revision, decision_id, recorded_at)` |
+| Rust | `packvium_core::revisions::root_revision_json(request)`, `derive_revision_json(parent, artifact, events)`, `apply_events_json(request, events)`, `verify_revision_chain_json(revisions, artifacts)`, `document_digest_json(document)`, `canonical_revision_json(document)`; SHA-256 from the `sha2` crate, so the WASM package hashes too |
+| JavaScript | `rootRevision`, `deriveRevision`, `applyEvents`, `verifyRevisionChain`, `documentDigest`, `canonicalRevisionJson` from `@packvium/engine`'s `revisions.js`; SHA-256 from `node:crypto` |
+| PHP | `Packvium\Revisions\PlanRevision::root($request)`, `::derive($parent, $approvedArtifact, $events)`, `::verifyChain($revisions, $artifacts)`, `::digest($document)`, `::canonicalJson($document)`, `::parse($json)`. Documents are `stdClass` trees, so `{}` and `[]` keep their digests |
+
+Digests are SHA-256 over the RFC 8785 canonical bytes. The audit reports `revision_number`,
+`parent_mismatch`, `sequence_gap`, `request_mismatch` and `artifact_mismatch` without
+stopping at the first. Refusals use `invalid_revision`, `invalid_event`, `event_conflict`,
+`invalid_artifact` and the canonical-form codes.
 
 ## Scenario and recommendation API
 

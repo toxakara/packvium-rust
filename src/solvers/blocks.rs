@@ -187,6 +187,7 @@ pub(crate) fn pack_homogeneous_blocks(
 
 fn supports(request: &PackingRequest, constraints: &[Arc<dyn PlacementConstraint>]) -> bool {
     constraints.is_empty()
+        && request.fixed_containers.is_empty()
         && request.containers.iter().all(|container| {
             container.obstacles.is_empty()
                 && container.axles.is_none()
@@ -429,6 +430,7 @@ fn pack_mode(
                         envelope_dimensions: block.envelope,
                         support_ratio: 1.0,
                         top_load: Weight(0),
+                        fixed: false,
                     });
                     index += 1;
                     metrics.feasible_candidates = metrics.feasible_candidates.saturating_add(1);

@@ -20,17 +20,55 @@ pub struct IndependentValidator;
 
 impl IndependentValidator {
     pub fn validate(&self, request: &PackingRequest, result: &PackingResult) -> ValidationReport {
-        let mut issues = Vec::new();
         let expected = request
             .instances()
             .iter()
             .map(ItemInstance::id)
             .collect::<BTreeSet<_>>();
+        let (mut issues, mut seen) = self.check_containers(request, &result.containers);
+        for unpacked in &result.unpacked {
+            if !seen.insert(unpacked.instance.id()) {
+                issue(&mut issues, "duplicate_accounting", &unpacked.instance.id());
+            }
+        }
+        if seen != expected {
+            issue(
+                &mut issues,
+                "item_accounting",
+                "packed and unpacked items do not match request",
+            );
+        }
+        ValidationReport {
+            valid: issues.is_empty(),
+            issues,
+        }
+    }
+
+    /// Every rule that holds container by container, without item accounting: what a
+    /// fixed set must satisfy on its own, before the free items are placed.
+    pub fn validate_containers(
+        &self,
+        request: &PackingRequest,
+        containers: &[PackedContainer],
+    ) -> ValidationReport {
+        let (issues, _) = self.check_containers(request, containers);
+        ValidationReport {
+            valid: issues.is_empty(),
+            issues,
+        }
+    }
+
+    fn check_containers(
+        &self,
+        request: &PackingRequest,
+        containers: &[PackedContainer],
+    ) -> (Vec<ValidationIssue>, BTreeSet<String>) {
+        let mut issues = Vec::new();
         let mut seen = BTreeSet::new();
         let mut inventory = BTreeMap::<String, usize>::new();
         let mut groups = BTreeMap::<String, String>::new();
 
-        for packed in &result.containers {
+        for packed in containers {
             *inventory.entry(packed.container.id.clone()).or_default() += 1;
             if let Some(maximum) = packed.container.quantity
                 && inventory[&packed.container.id] > maximum
@@ -48,6 +86,12 @@ impl IndependentValidator {
             let support_graph = ContactGraph::from_placements(&packed.placements);
             let mut payload = 0_i64;
             let mut tag_counts = BTreeMap::<String, usize>::new();
+            // Without a tag in the container no pair can be incompatible, so the common case
+            // skips the pairwise scan and stays one pass.
+            let compatibility_sensitive = packed.placements.iter().any(|placement| {
+                !placement.instance.item.tags.is_empty()
+                    || !placement.instance.item.incompatible_tags.is_empty()
+            });
             for (index, placement) in packed.placements.iter().enumerate() {
                 let id = placement.instance.id();
                 if !seen.insert(id.clone()) {
@@ -100,6 +144,18 @@ impl IndependentValidator {
                             &format!("{} and {}", id, other.instance.id()),
                         );
                     }
+                }
+                if compatibility_sensitive
+                    && let Some(other) = first_incompatible(&packed.placements, index)
+                {
+                    issue(
+                        &mut issues,
+                        "incompatible_items",
+                        &format!(
+                            "{id}: {} is incompatible with {}",
+                            placement.instance.item.id, other.id
+                        ),
+                    );
                 }
                 if placement.instance.item.must_be_on_floor && placement.envelope_origin.z != 0 {
                     issue(&mut issues, "floor_required", &id);
@@ -155,23 +211,92 @@ impl IndependentValidator {
             validate_stack_counts_with_graph(packed, &support_graph, &mut issues);
             validate_route_order_with_graph(packed, &support_graph, &mut issues);
         }
+        validate_fixed_placements(request, containers, &mut issues);
+        (issues, seen)
+    }
+}
 
-        for unpacked in &result.unpacked {
-            if !seen.insert(unpacked.instance.id()) {
-                issue(&mut issues, "duplicate_accounting", &unpacked.instance.id());
-            }
-        }
-        if seen != expected {
-            issue(
-                &mut issues,
-                "item_accounting",
-                "packed and unpacked items do not match request",
-            );
-        }
-        ValidationReport {
-            valid: issues.is_empty(),
-            issues,
-        }
+/// The first other item in the container, in placement order, that the item at `index`
+/// may not share it with: either one's `incompatible_tags` names a tag the other carries.
+fn first_incompatible(placements: &[Placement], index: usize) -> Option<&Item> {
+    let item = &placements[index].instance.item;
+    if item.tags.is_empty() && item.incompatible_tags.is_empty() {
+        return None;
+    }
+    placements
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| *position != index)
+        .map(|(_, other)| &other.instance.item)
+        .find(|other| {
+            !item.incompatible_tags.is_disjoint(&other.tags)
+                || !other.incompatible_tags.is_disjoint(&item.tags)
+        })
+}
+
+/// Every fixed placement is where the request put it, and nothing else claims to be.
+///
+/// Physics needs no rule: a fixed item is an ordinary placement, so every check above
+/// already applied to it. Only whether it moved is new (docs/PLAN-REVISIONS.md).
+fn validate_fixed_placements(
+    request: &PackingRequest,
+    containers: &[PackedContainer],
+    issues: &mut Vec<ValidationIssue>,
+) {
+    type FixedKey = (String, String, i64, i64, i64, &'static str);
+    let requested = request
+        .fixed_placements
+        .iter()
+        .map(|entry| {
+            (
+                entry.packed_container_id(),
+                entry.item_id.clone(),
+                entry.position.x,
+                entry.position.y,
+                entry.position.z,
+                entry.rotation.as_str(),
+            )
+        })
+        .collect::<BTreeSet<FixedKey>>();
+    let reported = containers
+        .iter()
+        .flat_map(|packed| {
+            packed
+                .placements
+                .iter()
+                .filter(|placement| placement.fixed)
+                .map(move |placement| {
+                    (
+                        packed.id(),
+                        placement.instance.item.id.clone(),
+                        placement.position.x,
+                        placement.position.y,
+                        placement.position.z,
+                        placement.rotation.as_str(),
+                    )
+                })
+        })
+        .collect::<BTreeSet<FixedKey>>();
+    let present = containers
+        .iter()
+        .map(PackedContainer::id)
+        .collect::<BTreeSet<_>>();
+    let detail = |key: &FixedKey| {
+        format!(
+            "{} in {} at ({}, {}, {}) {}",
+            key.1, key.0, key.2, key.3, key.4, key.5
+        )
+    };
+    for key in requested.difference(&reported) {
+        let code = if present.contains(&key.0) {
+            "fixed_placement_moved"
+        } else {
+            "fixed_container_missing"
+        };
+        issue(issues, code, &detail(key));
+    }
+    for key in reported.difference(&requested) {
+        issue(issues, "unexpected_fixed_placement", &detail(key));
     }
 }
 
@@ -404,6 +529,7 @@ mod tests {
                 envelope_dimensions: dimensions,
                 support_ratio: 1.0,
                 top_load: Weight(0),
+                fixed: false,
             })
             .collect();
         PackedContainer {
@@ -429,6 +555,7 @@ mod tests {
                 max_stack_density: None,
                 rate_table: None,
                 access_directions: Vec::new(),
+                preloaded: Vec::new(),
             },
             sequence: 1,
             placements,
@@ -445,6 +572,8 @@ mod tests {
             output_length_unit: "ticks".into(),
             output_weight_unit: "ticks".into(),
             catalog_versions_used: Vec::new(),
+            fixed_placements: Vec::new(),
+            fixed_containers: Vec::new(),
         };
         let result = PackingResult {
             status: PackingStatus::Feasible,
@@ -461,6 +590,42 @@ mod tests {
             catalog_versions_used: Vec::new(),
         };
         IndependentValidator.validate(&request, &result)
+    }
+
+    fn incompatibilities(packed: PackedContainer) -> Vec<String> {
+        validate_nested(packed)
+            .issues
+            .into_iter()
+            .filter(|issue| issue.code == "incompatible_items")
+            .map(|issue| issue.message)
+            .collect()
+    }
+
+    #[test]
+    fn validator_refuses_incompatible_items_sharing_a_container() {
+        let mut packed = nested_container(3, None, None);
+        packed.placements[0].instance.item.id = "acid".into();
+        packed.placements[0]
+            .instance
+            .item
+            .tags
+            .insert("acid".into());
+        packed.placements[2].instance.item.id = "base".into();
+        packed.placements[2]
+            .instance
+            .item
+            .incompatible_tags
+            .insert("acid".into());
+        assert_eq!(
+            incompatibilities(packed.clone()),
+            [
+                "acid#1: acid is incompatible with base",
+                "base#3: base is incompatible with acid"
+            ]
+        );
+        packed.placements[2].instance.item.incompatible_tags = ["alkali".into()].into();
+        assert!(incompatibilities(packed).is_empty());
+        assert!(incompatibilities(nested_container(3, None, None)).is_empty());
     }
 
     #[test]

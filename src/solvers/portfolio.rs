@@ -27,12 +27,24 @@ pub(crate) fn solve_portfolio_with_deadline(
     custom_orders: &[Arc<dyn ItemOrderStrategy>],
     deadline: &Deadline,
 ) -> PackResult<PackingResult> {
+    // Fixed placements are admitted once, here, so every start and every caller of the
+    // registry -- not only the JSON API -- is refused the same way before any search.
+    let admitted;
+    let request = if request.fixed_placements.is_empty() || !request.fixed_containers.is_empty() {
+        request
+    } else {
+        admitted = PackingRequest {
+            fixed_containers: crate::fixed::admit(request)?,
+            ..request.clone()
+        };
+        &admitted
+    };
     let enabled = |name: &str| {
         request.config.solvers.is_empty()
             || request.config.solvers.iter().any(|solver| solver == name)
     };
     let explicit_selection = !request.config.solvers.is_empty();
-    let instances = request.instances();
+    let instances = request.free_instances();
     if request
         .config
         .solvers
@@ -251,9 +263,24 @@ pub(crate) fn solve_portfolio_with_deadline(
         && instances.len() <= request.config.exact_item_limit
         && !deadline.expired()
         && results.len() < restart_limit
-        && let Some(result) = pack_exact_one(request, &instances, constraints, scorers, deadline)
     {
-        results.push(result);
+        if let Some(result) = pack_exact_one(request, &instances, constraints, scorers, deadline) {
+            results.push(result);
+        } else if explicit_selection
+            && request.config.solvers.len() == 1
+            && !request.fixed_containers.is_empty()
+        {
+            // The exhaustive search fills one container from empty; with fixed containers
+            // it stands down, and an explicit selection still gets an answer.
+            results.push(pack_order(
+                request,
+                &instances,
+                constraints,
+                scorers,
+                "exact_small:fallback",
+                deadline,
+            ));
+        }
     }
 
     if explicit_selection {
@@ -302,10 +329,12 @@ pub(crate) fn solve_portfolio_with_deadline(
         } else {
             PackingStatus::BestFound
         };
-        let score = score_solution(&[], &unpacked, &request.config);
+        // Containers holding fixed items are part of every answer, this one included.
+        let containers = request.fixed_containers.clone();
+        let score = score_solution(&containers, &unpacked, &request.config);
         results.push(PackingResult {
             status,
-            containers: Vec::new(),
+            containers,
             unpacked,
             algorithm: AlgorithmReport {
                 profile: request.config.profile.as_str().into(),

@@ -64,6 +64,50 @@ pub(crate) fn to_canonical_string(value: &Value) -> CanonicalResult<String> {
     Ok(out)
 }
 
+/// The integer a JSON value is, judged by value as every engine can judge it.
+///
+/// `1.0` is `1`, because JavaScript cannot tell them apart once the text is parsed; `true`,
+/// `"1"` and `1.5` are not integers, and neither is anything past 2^53 - 1, which JavaScript
+/// no longer holds exactly. The bound is also why `+ 1` on the answer can never overflow.
+pub(crate) fn json_integer(value: &Value) -> Option<i64> {
+    let Value::Number(number) = value else {
+        return None;
+    };
+    let integer = match number.as_i64() {
+        Some(integer) => integer,
+        None if number.is_u64() => return None,
+        None => {
+            let float = number.as_f64()?;
+            if !float.is_finite()
+                || float.fract() != 0.0
+                || float.abs() > MAX_EXACT_MAGNITUDE as f64
+            {
+                return None;
+            }
+            float as i64
+        }
+    };
+    (integer.unsigned_abs() <= MAX_EXACT_MAGNITUDE).then_some(integer)
+}
+
+/// How a refusal quotes a value: its canonical JSON, the one spelling four engines share.
+pub(crate) fn json_spelling(value: &Value) -> String {
+    to_canonical_string(value).unwrap_or_else(|error| match error.code {
+        CanonicalJsonErrorCode::NumberOutOfRange => "an out-of-range number".into(),
+        _ => "an unspellable value".into(),
+    })
+}
+
+/// A list of field names as a refusal quotes it, e.g. `["note"]`.
+pub(crate) fn spell_names(names: &[&str]) -> String {
+    json_spelling(&Value::Array(
+        names
+            .iter()
+            .map(|name| Value::String((*name).to_owned()))
+            .collect(),
+    ))
+}
+
 fn write_value(value: &Value, out: &mut String) -> CanonicalResult<()> {
     match value {
         Value::Null => out.push_str("null"),
@@ -602,6 +646,43 @@ mod tests {
         for (text, spelled) in cases {
             assert_eq!(canonical(text), spelled, "{text}");
         }
+    }
+
+    #[test]
+    fn an_integer_is_judged_by_value() {
+        let integer = |text: &str| json_integer(&parse(text).unwrap());
+        assert_eq!(integer("1"), Some(1));
+        assert_eq!(integer("1.0"), Some(1));
+        assert_eq!(integer("-3e0"), Some(-3));
+        assert_eq!(integer("9007199254740991"), Some(9_007_199_254_740_991));
+        assert_eq!(integer("-9007199254740991.0"), Some(-9_007_199_254_740_991));
+        for refused in [
+            "true",
+            "\"1\"",
+            "1.5",
+            "null",
+            "[1]",
+            "9007199254740992",
+            "9007199254740992.0",
+            "1e300",
+            "99999999999999999999",
+        ] {
+            assert_eq!(integer(refused), None, "{refused}");
+        }
+        assert_eq!(json_integer(&Value::from(u64::MAX)), None);
+    }
+
+    #[test]
+    fn a_refusal_quotes_a_value_by_its_canonical_spelling() {
+        assert_eq!(json_spelling(&json!("a\"b")), r#""a\"b""#);
+        assert_eq!(json_spelling(&json!(["a", "b"])), r#"["a","b"]"#);
+        assert_eq!(json_spelling(&json!(true)), "true");
+        assert_eq!(json_spelling(&Value::Null), "null");
+        assert_eq!(json_spelling(&json!(2.0)), "2");
+        assert_eq!(
+            json_spelling(&json!(9_007_199_254_740_992_u64)),
+            "an out-of-range number"
+        );
     }
 
     #[test]

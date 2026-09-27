@@ -13,12 +13,15 @@ mod deadline;
 mod error;
 pub mod execution;
 mod explain;
+mod fixed;
 mod geometry;
 mod hull;
 mod model;
 mod nested;
 mod policy;
 mod rebalance;
+mod request_errors;
+pub mod revisions;
 mod sequence;
 mod solver;
 mod solvers;
@@ -29,16 +32,17 @@ mod value_text;
 
 pub use api::{pack_json, pack_request, rebalance_json};
 pub use deadline::{Clock, Deadline};
-pub use error::{PackError, PackResult};
+pub use error::{PackError, PackResult, RequestError};
 pub use explain::{
     Explanation, RejectionCode, UnknownReasonError, explain_reason, explain_unpacked_item,
     explanation_for_unpacked_item,
 };
 pub use geometry::{Aabb, Dimensions, Point, Rotation, ShapeType};
 pub use model::{
-    AlgorithmReport, Container, Item, ItemInstance, Obstacle, PackedContainer, PackingConfig,
-    PackingRequest, PackingResult, PackingStatus, Placement, ReasonProof, RejectionObservation,
-    ResultFact, SolverMetrics, SolverProfile, StartRecord, UnpackedItem, aggregate_termination,
+    AlgorithmReport, Container, FixedPlacement, Item, ItemInstance, Obstacle, PackedContainer,
+    PackingConfig, PackingRequest, PackingResult, PackingStatus, Placement, ReasonProof,
+    RejectionObservation, ResultFact, SolverMetrics, SolverProfile, StartRecord, UnpackedItem,
+    aggregate_termination,
 };
 pub use nested::{NestedLevel, NestedPackingRequest, NestedPackingResult, pack_nested};
 pub use policy::{PolicyConstraint, PolicyRule, PolicyRuleSet, RuleForm, ShipmentContext};

@@ -23,9 +23,12 @@ pub fn pack_exact_one(
     // The depth-first search branches on individual items, so it cannot keep a group
     // together and would happily pack half of one. Stand aside and let the group-aware
     // extreme-point path answer instead, the same way `pack_maximal_order` does.
+    // It also fills one container from empty, so it stands aside when fixed items have
+    // already opened containers of their own (docs/PLAN-REVISIONS.md).
     if items.len() > request.config.exact_item_limit
         || request.containers.is_empty()
         || items.iter().any(|item| item.item.group.is_some())
+        || !request.fixed_containers.is_empty()
     {
         return None;
     }

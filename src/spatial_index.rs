@@ -6,7 +6,7 @@
 //! the tests below guard the correctness-critical property: an actually intersecting
 //! box is never omitted.
 
-use crate::geometry::{Aabb, Dimensions};
+use crate::geometry::{Aabb, Dimensions, Point};
 use std::collections::BTreeMap;
 
 type CellRange = (i64, i64);
@@ -49,6 +49,9 @@ impl SpatialIndex {
         // the one allocation the query makes; the cell walk itself allocates nothing,
         // and this is the innermost call of every candidate sweep.
         let ((x1, x2), (y1, y2), (z1, z2)) = self.cell_ranges(box_);
+        if x2 == x1 + 1 && y2 == y1 + 1 && z2 == z1 + 1 {
+            return self.cells.get(&(x1, y1, z1)).cloned().unwrap_or_default();
+        }
         let mut result = Vec::new();
         for x in x1..x2 {
             for y in y1..y2 {
@@ -59,9 +62,21 @@ impl SpatialIndex {
                 }
             }
         }
-        result.sort_unstable();
-        result.dedup();
+        if result.len() > 1 {
+            result.sort_unstable();
+            result.dedup();
+        }
         result
+    }
+
+    pub(crate) fn bucket_at(&self, point: Point) -> &[usize] {
+        let ix = point.x.div_euclid(self.cell_x);
+        let iy = point.y.div_euclid(self.cell_y);
+        let iz = point.z.div_euclid(self.cell_z);
+        self.cells
+            .get(&(ix, iy, iz))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     fn cell_ranges(&self, box_: Aabb) -> CellRanges {
