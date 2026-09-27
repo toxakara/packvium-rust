@@ -1,9 +1,12 @@
-use crate::error::{PackError, PackResult};
+use crate::canonical_json::json_integer;
+use crate::error::{PackError, PackResult, RequestError};
+use crate::fixed;
 use crate::geometry::{ALL_DIRECTIONS, Aabb, Dimensions, Point, Rotation, ShapeType};
 use crate::hull::{self, Vertex};
 use crate::model::*;
 use crate::policy::{PolicyConstraint, PolicyRuleSet};
 use crate::rebalance::rebalance_weight;
+use crate::request_errors;
 use crate::solver::SolverRegistry;
 use crate::units::{Length, Weight};
 use crate::validation::IndependentValidator;
@@ -13,7 +16,7 @@ use std::sync::Arc;
 
 pub fn pack_json(input: &str) -> PackResult<String> {
     let value: Value = serde_json::from_str(input)?;
-    let request = parse_request(&value)?;
+    let request = request_from_json(&value)?;
     let result = pack_request_with_policy(&request, &PolicyRuleSet::parse(value.get("policy"))?)?;
     Ok(serde_json::to_string(&result.to_json(
         &request.output_length_unit,
@@ -30,7 +33,7 @@ pub fn rebalance_json(
     max_moves: usize,
 ) -> PackResult<String> {
     let request_value: Value = serde_json::from_str(request_input)?;
-    let request = parse_request(&request_value)?;
+    let request = request_from_json(&request_value)?;
     validate_request(&request)?;
     let result_value: Value = serde_json::from_str(result_input)?;
     let original = parse_rebalance_result(&request, &result_value)?;
@@ -263,6 +266,7 @@ fn parse_rebalance_result(request: &PackingRequest, value: &Value) -> PackResult
                         envelope_dimensions: dimensions.expand(clearance),
                         support_ratio,
                         top_load: Weight(top_load),
+                        fixed: placement.get("fixed") == Some(&Value::Bool(true)),
                     })
                 })
                 .collect::<PackResult<Vec<_>>>()?;
@@ -513,6 +517,8 @@ fn expand_for_validation(result: &PackingResult) -> PackingResult {
 /// A name added here must also be recorded in `conformance/public-field-matrix.json` with
 /// a `rejected:unsupported_feature` support level for this engine, which is what makes the
 /// conformance corpus assert the rejection instead of merely tolerating it.
+// `fixed_placements` left this list in 1.4.0, when this engine gained seeding, admission and
+// the fixed-placement validator rule (docs/PLAN-REVISIONS.md).
 const UNSUPPORTED_REQUEST_FIELDS: &[&str] = &[];
 const UNSUPPORTED_CONFIGURATION_FIELDS: &[&str] = &[];
 // `hull_vertices`, `compression_ratio` and `max_compression_pressure_kpa` left this list in
@@ -620,11 +626,105 @@ fn reject_listed_fields(
     )))
 }
 
-fn parse_request(root: &Value) -> PackResult<PackingRequest> {
-    let object = root
+/// The request a JSON document describes, or the first rule it breaks.
+///
+/// Unsupported fields are refused first, as `unsupported_feature`; then the schema's rule
+/// table names the first bad value (`request_errors`); then the model is built, and anything
+/// that still fails there is a request error too, without a field. The tariff rule runs last,
+/// outside that wrapping, because it is the solver's precondition rather than a malformed
+/// value -- the reference raises it from its packer.
+fn request_from_json(value: &Value) -> PackResult<PackingRequest> {
+    let object = value
         .as_object()
-        .ok_or_else(|| PackError::InvalidInput("request must be an object".into()))?;
+        .ok_or_else(|| RequestError::new("wrong_type", "", "must be an object"))?;
     reject_unsupported(object)?;
+    request_errors::check_request(value)?;
+    let normalised = without_null_optionals(value);
+    let object = normalised.as_object().unwrap_or(object);
+    let request = parse_request(object).map_err(as_request_error)?;
+    require_rated_containers(&request)?;
+    Ok(request)
+}
+
+/// The request with every null optional removed, where the rule table already treats null as
+/// absent: the model builders take their defaults from a missing key, and a null that reached
+/// them would be read as a value. Only the request's own records are cleaned -- `metadata` and
+/// the like are echoed back and keep their nulls.
+fn without_null_optionals(value: &Value) -> Value {
+    let mut request = value.clone();
+    strip_nulls(&mut request);
+    if let Some(object) = request.as_object_mut() {
+        if let Some(configuration) = object.get_mut("configuration") {
+            strip_nulls(configuration);
+            if let Some(budget) = configuration.get_mut("effort_budget") {
+                strip_nulls(budget);
+            }
+        }
+        for key in ["items", "containers"] {
+            for entry in object
+                .get_mut(key)
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                strip_nulls(entry);
+                if let Some(table) = entry.get_mut("rate_table") {
+                    strip_nulls(table);
+                }
+            }
+        }
+    }
+    request
+}
+
+fn strip_nulls(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|_, entry| !entry.is_null());
+    }
+}
+
+/// Whatever the rule table did not name still reaches the caller as a request error.
+///
+/// Only turning JSON into the model runs inside this, never the solve, so a solver defect is
+/// never dressed up as the caller's mistake. An error that already carries its own code (a
+/// fixed-placement refusal, `unsupported_feature`) passes through unchanged.
+fn as_request_error(error: PackError) -> PackError {
+    match error {
+        PackError::InvalidInput(_)
+        | PackError::InvalidNumber(_)
+        | PackError::UnsupportedUnit(_)
+        | PackError::Serialization(_) => {
+            RequestError::new("invalid_value", "", error.to_string()).into()
+        }
+        other => other,
+    }
+}
+
+// Rating some containers and not others would rank a priced packing against an unpriced one
+// as though the unpriced were free, so a missing tariff is refused before either solver path
+// runs -- a static property of the request, unlike a billed weight past the last bracket,
+// which depends on how the search filled the box and therefore loses a candidate instead.
+// Python, PHP and the JavaScript fallback all refuse here; Rust did not, and priced the
+// container at the unpriceable sentinel instead.
+fn require_rated_containers(request: &PackingRequest) -> PackResult<()> {
+    if request.config.objective != "lowest_landed_cost" {
+        return Ok(());
+    }
+    match request
+        .containers
+        .iter()
+        .find(|container| container.rate_table.is_none())
+    {
+        Some(unrated) => Err(PackError::InvalidInput(format!(
+            "the lowest_landed_cost objective requires a rate_table on every container; \
+             {:?} has none",
+            unrated.id
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn parse_request(object: &Map<String, Value>) -> PackResult<PackingRequest> {
     let length_unit = object
         .get("units")
         .and_then(Value::as_object)
@@ -660,25 +760,12 @@ fn parse_request(root: &Value) -> PackResult<PackingRequest> {
         .iter()
         .map(|value| parse_container(value, length_unit))
         .collect::<PackResult<Vec<_>>>()?;
-    // Rating some containers and not others would rank a priced packing against an
-    // unpriced one as though the unpriced were free, so a missing tariff is refused
-    // before either solver path runs -- a static property of the request, unlike a
-    // billed weight past the last bracket, which depends on how the search filled the
-    // box and therefore loses a candidate instead. Python, PHP and the JavaScript
-    // fallback all refuse here; Rust did not, and priced the container at the
-    // unpriceable sentinel instead.
-    if config.objective == "lowest_landed_cost"
-        && let Some(unrated) = containers
-            .iter()
-            .find(|container| container.rate_table.is_none())
-    {
-        return Err(PackError::InvalidInput(format!(
-            "the lowest_landed_cost objective requires a rate_table on every container; \
-             {:?} has none",
-            unrated.id
-        )));
-    }
     let catalog_versions_used = parse_catalog_versions(object.get("catalog_versions_used"))?;
+    let fixed_placements =
+        fixed::require_fixed_placement_shapes(object.get("fixed_placements"), length_unit)?
+            .iter()
+            .map(|value| parse_fixed_placement(value, length_unit))
+            .collect::<PackResult<Vec<_>>>()?;
     Ok(PackingRequest {
         items,
         containers,
@@ -686,6 +773,8 @@ fn parse_request(root: &Value) -> PackResult<PackingRequest> {
         output_length_unit,
         output_weight_unit,
         catalog_versions_used,
+        fixed_placements,
+        fixed_containers: Vec::new(),
     })
 }
 
@@ -838,31 +927,36 @@ fn parse_config(value: Option<&Value>, length_unit: &str) -> PackResult<PackingC
     };
     Ok(PackingConfig {
         profile,
-        time_limit_ms: u64_field(map, "time_limit_ms", 1_000),
-        top_k: usize_field(map, "alternatives", 3).max(1),
+        time_limit_ms: floored_integer(map, "time_limit_ms", "configuration", 1)?
+            .map_or(1_000, |value| value.unsigned_abs()),
+        top_k: floored_usize(map, "alternatives", "configuration", 1, 3)?,
         seed: u64_field(map, "seed", 42),
-        max_containers: map
-            .get("max_containers")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
+        max_containers: floored_integer(map, "max_containers", "configuration", 1)?.map(to_usize),
         clearance: parse_optional_length(map.get("clearance"), length_unit)?,
         minimum_support_ratio: map
             .get("minimum_support_ratio")
             .and_then(Value::as_f64)
             .unwrap_or(0.0),
-        exact_item_limit: usize_field(map, "exact_item_limit", 7),
-        multi_start_orders: usize_field(map, "multi_start_orders", 8).max(1),
-        max_candidates_per_item: usize_field(
+        exact_item_limit: floored_usize(map, "exact_item_limit", "configuration", 1, 7)?,
+        multi_start_orders: floored_usize(map, "multi_start_orders", "configuration", 1, 8)?,
+        max_candidates_per_item: floored_usize(
             map,
             "max_candidates_per_item",
+            "configuration",
+            1,
             if profile == SolverProfile::Quality {
                 16
             } else {
                 1
             },
-        )
-        .max(1),
-        max_candidate_points: usize_field(map, "max_candidate_points", 4_096).max(16),
+        )?,
+        max_candidate_points: floored_usize(
+            map,
+            "max_candidate_points",
+            "configuration",
+            16,
+            4_096,
+        )?,
         parallel: map.get("parallel").and_then(Value::as_bool).unwrap_or(true),
         effort_budget: parse_effort_budget(map.get("effort_budget"))?,
         solvers,
@@ -874,26 +968,28 @@ fn parse_config(value: Option<&Value>, length_unit: &str) -> PackResult<PackingC
             .get("require_placement_coordinates")
             .and_then(Value::as_bool)
             .unwrap_or(true),
-        container_plan_beam_width: usize_field(
+        container_plan_beam_width: floored_usize(
             map,
             "container_plan_beam_width",
+            "configuration",
+            1,
             if profile == SolverProfile::Quality {
                 16
             } else {
                 1
             },
-        )
-        .max(1),
-        container_plan_node_limit: usize_field(
+        )?,
+        container_plan_node_limit: floored_usize(
             map,
             "container_plan_node_limit",
+            "configuration",
+            1,
             if profile == SolverProfile::Quality {
                 100_000
             } else {
                 1
             },
-        )
-        .max(1),
+        )?,
         // Not read from the request: the schema has no access-directions field, so a
         // request cannot switch the stop-accessibility rule on. A library caller sets it
         // on the config directly, as in the Python and PHP engines.
@@ -1014,7 +1110,7 @@ fn parse_item(value: &Value, unit: &str) -> PackResult<Item> {
         id,
         dimensions,
         weight: parse_optional_weight(map.get("weight"), "g")?,
-        quantity: usize_field(map, "quantity", 1),
+        quantity: floored_usize(map, "quantity", "item", 1, 1)?,
         allowed_rotations: rotations,
         stackable: map
             .get("stackable")
@@ -1204,17 +1300,11 @@ fn parse_container(value: &Value, unit: &str) -> PackResult<Container> {
             .get("max_payload")
             .map(|value| Weight::parse(value, "g"))
             .transpose()?,
-        cost_minor: map.get("cost_minor").and_then(Value::as_i64).unwrap_or(0),
-        quantity: map
-            .get("quantity")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
+        cost_minor: floored_integer(map, "cost_minor", "container", 0)?.unwrap_or(0),
+        quantity: floored_integer(map, "quantity", "container", 1)?.map(to_usize),
         obstacles,
         tags: string_set(map.get("tags")),
-        max_items: map
-            .get("max_items")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
+        max_items: floored_integer(map, "max_items", "container", 1)?.map(to_usize),
         metadata: object_map(map.get("metadata")),
         axles: parse_axles(map.get("axles"), unit)?,
         void_fill_reserve_ppm: parse_ratio_ppm(map.get("void_fill_reserve_ratio"))?,
@@ -1246,6 +1336,7 @@ fn parse_container(value: &Value, unit: &str) -> PackResult<Container> {
             .transpose()?,
         rate_table: parse_rate_table(map.get("rate_table"))?,
         access_directions: parse_access_directions(map.get("access_directions"))?,
+        preloaded: Vec::new(),
     })
 }
 
@@ -1292,7 +1383,7 @@ fn parse_rate_table(value: Option<&Value>) -> PackResult<Option<RateTable>> {
     let map = value
         .as_object()
         .ok_or_else(|| PackError::InvalidInput("container.rate_table must be an object".into()))?;
-    let integers = |key: &str| -> PackResult<Vec<i64>> {
+    let integers = |key: &str, minimum: i64| -> PackResult<Vec<i64>> {
         map.get(key)
             .and_then(Value::as_array)
             .ok_or_else(|| {
@@ -1300,20 +1391,25 @@ fn parse_rate_table(value: Option<&Value>) -> PackResult<Option<RateTable>> {
             })?
             .iter()
             .map(|entry| {
-                entry.as_i64().ok_or_else(|| {
-                    PackError::InvalidInput(format!(
-                        "container.rate_table.{key} must hold integers"
-                    ))
-                })
+                json_integer(entry)
+                    .filter(|number| *number >= minimum)
+                    .ok_or_else(|| {
+                        PackError::InvalidInput(format!(
+                            "container.rate_table.{key} must hold integers >= {minimum}"
+                        ))
+                    })
             })
             .collect()
     };
-    let optional = |key: &str| -> i64 { map.get(key).and_then(Value::as_i64).unwrap_or(0) };
+    let optional = |key: &str| -> PackResult<i64> {
+        Ok(floored_integer(map, key, "container.rate_table", 0)?.unwrap_or(0))
+    };
     let table = RateTable {
-        weight_brackets_g: integers("weight_brackets_g")?,
-        prices_minor: integers("prices_minor")?,
-        minimum_charge_minor: optional("minimum_charge_minor"),
-        fuel_surcharge_permille: optional("fuel_surcharge_permille"),
+        // The bracket floor is enforced below with ascending order, under one message.
+        weight_brackets_g: integers("weight_brackets_g", i64::MIN)?,
+        prices_minor: integers("prices_minor", 0)?,
+        minimum_charge_minor: optional("minimum_charge_minor")?,
+        fuel_surcharge_permille: optional("fuel_surcharge_permille")?,
     };
     if table.weight_brackets_g.is_empty() {
         return Err(PackError::InvalidInput(
@@ -1403,14 +1499,46 @@ fn parse_obstacle(value: &Value, unit: &str) -> PackResult<Obstacle> {
 }
 
 fn parse_aabb(map: &Map<String, Value>, unit: &str) -> PackResult<Aabb> {
-    let origin = map.get("origin").and_then(Value::as_object);
     Ok(Aabb {
-        origin: Point {
-            x: parse_optional_length(origin.and_then(|value| value.get("x")), unit)?.0,
-            y: parse_optional_length(origin.and_then(|value| value.get("y")), unit)?.0,
-            z: parse_optional_length(origin.and_then(|value| value.get("z")), unit)?.0,
-        },
+        origin: parse_point(map.get("origin"), unit)?,
         dimensions: parse_dimensions(map.get("dimensions"), unit)?,
+    })
+}
+
+/// A point whose missing axes are 0, as an obstacle origin and a fixed position are written.
+fn parse_point(value: Option<&Value>, unit: &str) -> PackResult<Point> {
+    let point = value.and_then(Value::as_object);
+    Ok(Point {
+        x: parse_optional_length(point.and_then(|value| value.get("x")), unit)?.0,
+        y: parse_optional_length(point.and_then(|value| value.get("y")), unit)?.0,
+        z: parse_optional_length(point.and_then(|value| value.get("z")), unit)?.0,
+    })
+}
+
+/// One entry `fixed::require_fixed_placement_shapes` has already admitted: every field is
+/// present and of its type, so only the measures are left to the length parser.
+fn parse_fixed_placement(value: &Value, unit: &str) -> PackResult<FixedPlacement> {
+    let map = value
+        .as_object()
+        .ok_or_else(|| PackError::InvalidInput("fixed placement must be object".into()))?;
+    let instance = map
+        .get("container_instance")
+        .map_or(Some(1), json_integer)
+        .ok_or_else(|| PackError::InvalidInput("container_instance counts from 1".into()))?;
+    Ok(FixedPlacement {
+        item_id: str_field(map, "item_type")?,
+        container_id: str_field(map, "container_type")?,
+        // An instance past a 32-bit target's address space names no container it can open;
+        // the contiguity check refuses it there as it refuses any other gap.
+        container_instance: usize::try_from(instance).unwrap_or(usize::MAX),
+        position: parse_point(map.get("position"), unit)?,
+        rotation: map
+            .get("orientation")
+            .and_then(Value::as_str)
+            .and_then(parse_rotation)
+            .ok_or_else(|| {
+                PackError::InvalidInput("fixed placement orientation is invalid".into())
+            })?,
     })
 }
 
@@ -1629,11 +1757,47 @@ fn optional_string_set(value: Option<&Value>, path: &str) -> PackResult<BTreeSet
     }
 }
 
-fn usize_field(map: &Map<String, Value>, key: &str, default: usize) -> usize {
-    map.get(key)
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .unwrap_or(default)
+/// A request integer that must not fall below the schema's `minimum` for it.
+///
+/// Absent (or `null`) keeps the caller's default; a value present but below the floor, or
+/// not an integer at all, is refused rather than quietly replaced by that default, since a
+/// mistyped sign would otherwise pack a request nobody asked for.
+fn floored_integer(
+    map: &Map<String, Value>,
+    key: &str,
+    scope: &str,
+    minimum: i64,
+) -> PackResult<Option<i64>> {
+    match map.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => json_integer(value)
+            .filter(|number| *number >= minimum)
+            .map(Some)
+            .ok_or_else(|| PackError::InvalidInput(below_floor(scope, key, minimum))),
+    }
+}
+
+fn floored_usize(
+    map: &Map<String, Value>,
+    key: &str,
+    scope: &str,
+    minimum: i64,
+    default: usize,
+) -> PackResult<usize> {
+    Ok(floored_integer(map, key, scope, minimum)?.map_or(default, to_usize))
+}
+
+fn below_floor(scope: &str, key: &str, minimum: i64) -> String {
+    match minimum {
+        0 => format!("{scope}.{key} must be a non-negative integer"),
+        1 => format!("{scope}.{key} must be a positive integer"),
+        _ => format!("{scope}.{key} must be an integer >= {minimum}"),
+    }
+}
+
+/// Saturates on a 32-bit target, where a count past its address space is already unreachable.
+fn to_usize(value: i64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 fn u64_field(map: &Map<String, Value>, key: &str, default: u64) -> u64 {
@@ -2071,18 +2235,14 @@ mod public_feature_tests {
                 .contains("configuration.objective")
         );
         let item = r#"{"items":[{"id":"a","dimensions":{"length":"10","width":"10","height":"10"},"max_stacked_items":"1"}],"containers":[{"id":"c","inner_dimensions":{"length":"20","width":"20","height":"20"}}]}"#;
-        assert!(
-            pack_json(item)
-                .unwrap_err()
-                .to_string()
-                .contains("item.max_stacked_items")
+        assert_eq!(
+            pack_json(item).unwrap_err().to_string(),
+            "invalid_request: /items/0/max_stacked_items: must be an integer"
         );
         let container = r#"{"items":[{"id":"a","dimensions":{"length":"10","width":"10","height":"10"}}],"containers":[{"id":"c","inner_dimensions":{"length":"20","width":"20","height":"20"},"tag_limits":[]}]}"#;
-        assert!(
-            pack_json(container)
-                .unwrap_err()
-                .to_string()
-                .contains("container.tag_limits")
+        assert_eq!(
+            pack_json(container).unwrap_err().to_string(),
+            "invalid_request: /containers/0/tag_limits: must be an object"
         );
     }
 

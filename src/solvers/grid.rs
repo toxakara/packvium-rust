@@ -94,7 +94,10 @@ fn grid_selection_key(
 }
 
 pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<PackingResult> {
-    if request.items.len() != 1
+    // A lattice is laid into empty containers; fixed items open containers of their own,
+    // so the general search answers instead (docs/PLAN-REVISIONS.md).
+    if !request.fixed_containers.is_empty()
+        || request.items.len() != 1
         // A rate table prices by weight bracket, and a bracket step or minimum charge
         // means cost is not monotone in the billed-weight proxy this closed-form solver
         // would otherwise rank by. Unlike the general portfolio, this solver
@@ -338,6 +341,7 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
                             envelope_dimensions: envelope,
                             support_ratio: 1.0,
                             top_load: Weight(0),
+                            fixed: false,
                         });
                     }
                 }
@@ -498,6 +502,7 @@ mod tests {
                 max_stack_density: None,
                 rate_table: None,
                 access_directions: Vec::new(),
+                preloaded: Vec::new(),
             }],
             config: PackingConfig {
                 profile: SolverProfile::Fast,
@@ -506,6 +511,8 @@ mod tests {
             output_length_unit: "mm".into(),
             output_weight_unit: "g".into(),
             catalog_versions_used: Vec::new(),
+            fixed_placements: Vec::new(),
+            fixed_containers: Vec::new(),
         }
     }
 
@@ -568,6 +575,7 @@ mod tests {
                 max_stack_density: None,
                 rate_table: None,
                 access_directions: Vec::new(),
+                preloaded: Vec::new(),
             },
         );
         let result = try_grid(&req, &no_deadline()).expect("grid should apply");
@@ -620,6 +628,7 @@ mod tests {
                 max_stack_density: None,
                 rate_table: None,
                 access_directions: Vec::new(),
+                preloaded: Vec::new(),
             },
         );
         let result = try_grid(&req, &no_deadline()).expect("grid should apply");

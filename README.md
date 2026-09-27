@@ -6,7 +6,7 @@ dependencies beyond `serde`, exact integer geometry.
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.3.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.4.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](docs/GUARANTEES.md) before relying on a result.
@@ -42,6 +42,31 @@ let result = packvium_core::pack_json(request)?;
 cargo run --example basic
 ```
 
+## Errors
+
+A request that no engine may answer returns `PackError::InvalidRequest(RequestError)` before
+anything is solved. It names the problem instead of describing it:
+
+```rust
+use packvium_core::PackError;
+
+match packvium_core::pack_json(&request) {
+    Ok(result) => println!("{result}"),
+    Err(PackError::InvalidRequest(error)) => {
+        error.code();   // "invalid_request"
+        error.reason(); // "below_minimum"
+        error.field();  // "/items/0/quantity" -- a JSON Pointer into your request
+        // Display: "invalid_request: /items/0/quantity: must be at least 1"
+    }
+    Err(other) => eprintln!("{other}"),
+}
+```
+
+`reason()` is one of `missing_field`, `wrong_type`, `below_minimum`, `above_maximum`, `negative_measure`, `invalid_unit`, `duplicate_id`, `not_allowed` or `invalid_value`. `PackError` is `#[non_exhaustive]`, so keep a wildcard arm.
+The message is the same in every Packvium engine. Branch on `reason` and `field`; show the
+message to a person. A request that is valid but does not fit completely is not an error: the
+result lists what was left out, and why, in `unpacked_items`.
+
 ## Examples
 
 Runnable, in [`examples/`](examples). Each one is a single file you can read top to bottom
@@ -55,6 +80,7 @@ and execute without a project around it.
 | [`commerce.rs`](examples/commerce.rs) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
 | [`commerce-stdin.rs`](examples/commerce-stdin.rs) | The same three functions over stdin/stdout. |
 | [`artifacts.rs`](examples/artifacts.rs) | Hand a result to a system with no engine: one document with the plan, geometry and the request that produced it, exported as CSV and a printable HTML work order — byte-identical to the other three engines. |
+| [`revisions.rs`](examples/revisions.rs) | Replan a half-loaded job: a missing item and a locked placement recorded against the approved plan, a replan that keeps the locked item in place, and a hash-chained record that notices an edit — the same revision bytes as the other three engines. |
 
 ```bash
 cargo run --example basic
@@ -81,6 +107,11 @@ cargo run --example basic
   display values and the request that produced it, and `artifact_exports` writes it as
   canonical JSON, CSV or a self-contained HTML work order, byte for byte what the Python,
   PHP and JavaScript packages write.
+- **Items already in place, and replanning around them.** A request's `fixed_placements` pins
+  items to known positions before the solve: they keep their place, carry weight and support,
+  and come back marked `fixed: true`. `revisions` records what changed on the dock — a missing
+  item, a substituted container, a lock, a verification — as an append-only chain linked by
+  SHA-256, and derives the request the next plan solves.
 - **`#![forbid(unsafe_code)]`.** The engine itself contains no `unsafe`.
 
 ## Documentation

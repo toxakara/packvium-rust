@@ -186,6 +186,9 @@ pub fn rebalance_weight(
 
         let mut committed = None;
         'search: for placement_index in placements {
+            if working[source_index].placements[placement_index].fixed {
+                continue;
+            }
             let weight = working[source_index].placements[placement_index]
                 .instance
                 .item
@@ -309,6 +312,7 @@ mod tests {
             max_stack_density: None,
             rate_table: None,
             access_directions: Vec::new(),
+            preloaded: Vec::new(),
         }
     }
 
@@ -325,6 +329,7 @@ mod tests {
             envelope_dimensions: item.dimensions,
             support_ratio: 1.0,
             top_load: Weight(0),
+            fixed: false,
         }
     }
 
@@ -357,6 +362,8 @@ mod tests {
             output_length_unit: "ticks".into(),
             output_weight_unit: "ticks".into(),
             catalog_versions_used: Vec::new(),
+            fixed_placements: Vec::new(),
+            fixed_containers: Vec::new(),
         };
         let original = result(vec![
             PackedContainer {
@@ -448,6 +455,8 @@ mod tests {
             output_length_unit: "ticks".into(),
             output_weight_unit: "ticks".into(),
             catalog_versions_used: Vec::new(),
+            fixed_placements: Vec::new(),
+            fixed_containers: Vec::new(),
         };
         let original = result(vec![
             PackedContainer {
@@ -515,6 +524,8 @@ mod tests {
                 output_length_unit: "ticks".into(),
                 output_weight_unit: "ticks".into(),
                 catalog_versions_used: Vec::new(),
+                fixed_placements: Vec::new(),
+                fixed_containers: Vec::new(),
             };
             let original = result(vec![
                 PackedContainer {

@@ -176,16 +176,18 @@ pub struct Aabb {
 }
 
 impl Aabb {
+    // The far corner saturates rather than wraps: a request can place a box near `i64::MAX`
+    // ticks, and a wrapped corner would read as inside every container.
     pub fn x2(self) -> i64 {
-        self.origin.x + self.dimensions.length.0
+        self.origin.x.saturating_add(self.dimensions.length.0)
     }
 
     pub fn y2(self) -> i64 {
-        self.origin.y + self.dimensions.width.0
+        self.origin.y.saturating_add(self.dimensions.width.0)
     }
 
     pub fn z2(self) -> i64 {
-        self.origin.z + self.dimensions.height.0
+        self.origin.z.saturating_add(self.dimensions.height.0)
     }
 
     pub fn contains(self, other: Self) -> bool {
@@ -298,6 +300,28 @@ mod tests {
             width: Length(width),
             height: Length(height),
         }
+    }
+
+    #[test]
+    fn a_far_corner_past_the_integer_range_is_outside_not_wrapped() {
+        let container = Aabb {
+            origin: Point::ZERO,
+            dimensions: dims(100, 100, 100),
+        };
+        let far = |x: i64, y: i64, z: i64| Aabb {
+            origin: Point { x, y, z },
+            dimensions: dims(10, 10, 10),
+        };
+        for (x, y, z) in [
+            (i64::MAX - 5, 0, 0),
+            (0, i64::MAX - 5, 0),
+            (0, 0, i64::MAX - 5),
+        ] {
+            let box_ = far(x, y, z);
+            assert!(!container.contains(box_), "{x} {y} {z}");
+            assert!(!container.intersects(box_), "{x} {y} {z}");
+        }
+        assert_eq!(far(i64::MAX - 5, 0, 0).x2(), i64::MAX);
     }
 
     /// The refusal every engine owes, and the one this module had never been asked for.

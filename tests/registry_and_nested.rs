@@ -80,6 +80,7 @@ fn container(id: &str, side_mm: i64) -> Container {
         max_stack_density: None,
         rate_table: None,
         access_directions: Vec::new(),
+        preloaded: Vec::new(),
     }
 }
 
@@ -91,6 +92,8 @@ fn request(items: Vec<Item>, containers: Vec<Container>) -> PackingRequest {
         output_length_unit: "mm".into(),
         output_weight_unit: "kg".into(),
         catalog_versions_used: Vec::new(),
+        fixed_placements: Vec::new(),
+        fixed_containers: Vec::new(),
     }
 }
 

@@ -474,6 +474,7 @@ mod tests {
             envelope_dimensions: dimensions,
             support_ratio: 1.0,
             top_load: Weight(0),
+            fixed: false,
         }
     }
 
