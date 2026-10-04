@@ -102,6 +102,21 @@ fn representative_reasons_name_the_value_at_fault() {
             "must be a measure",
         ),
         (
+            |r| {
+                r["configuration"]["top_k"] = json!(2);
+                r["configuration"]["profile"] = json!("balanced");
+            },
+            "not_allowed",
+            "/configuration/profile",
+            "is not a known field",
+        ),
+        (
+            |r| r["configuration"]["effort_budget"] = json!({"max_nodes": 1}),
+            "not_allowed",
+            "/configuration/effort_budget/max_nodes",
+            "is not a known field",
+        ),
+        (
             |r| r["configuration"]["solver_profile"] = json!("fastest"),
             "not_allowed",
             "/configuration/solver_profile",
@@ -213,15 +228,47 @@ fn a_fixed_placement_refusal_keeps_its_message_and_gains_reason_and_field() {
 #[test]
 fn a_parse_failure_the_rules_do_not_name_is_an_invalid_value_without_a_field() {
     let mut request = base();
-    request["configuration"]["objective"] = json!(17);
+    request["items"][0]["shape_type"] = json!("sphere");
     let error = refused(&request);
     assert_eq!(
         (error.code(), error.reason(), error.field()),
         ("invalid_request", "invalid_value", "")
     );
-    assert!(
-        error.detail().contains("configuration.objective"),
-        "{error}"
+    assert!(error.detail().contains("item.shape_type"), "{error}");
+}
+
+#[test]
+fn an_unknown_objective_or_access_direction_is_refused_with_not_allowed_and_pointer() {
+    let mut request = base();
+    request["configuration"]["objective"] = json!("cheapest");
+    let error = refused(&request);
+    assert_eq!(
+        (error.code(), error.reason(), error.field()),
+        ("invalid_request", "not_allowed", "/configuration/objective")
+    );
+
+    let mut request = base();
+    request["containers"][0]["access_directions"] = json!(["+w"]);
+    let error = refused(&request);
+    assert_eq!(
+        (error.code(), error.reason(), error.field()),
+        (
+            "invalid_request",
+            "not_allowed",
+            "/containers/0/access_directions/0"
+        )
+    );
+
+    let mut request = base();
+    request["containers"][0]["access_directions"] = json!("+x");
+    let error = refused(&request);
+    assert_eq!(
+        (error.code(), error.reason(), error.field()),
+        (
+            "invalid_request",
+            "wrong_type",
+            "/containers/0/access_directions"
+        )
     );
 }
 

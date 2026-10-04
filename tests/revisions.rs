@@ -562,7 +562,7 @@ fn a_refusal_quotes_values_by_their_canonical_json() {
         ),
         (
             json!([with_placement(|p| p["position"] = json!({"w": "5"}))]),
-            r#"placement.position does not carry ["w"]"#,
+            r#"placement.position cannot carry ["w"]"#,
         ),
         (
             json!([with_placement(|p| p["position"] = json!({"x": true}))]),

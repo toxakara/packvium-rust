@@ -1,15 +1,15 @@
 [package]
 name = "packvium"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "Deterministic, extensible 3D cartonization and rectangular bin-packing engine"
+description = "Deterministic 3D bin-packing and cartonization engine for pallets, containers, trucks and shipping cartons. Exact integer geometry, reproducible results."
 readme = "README.md"
 repository = "https://github.com/toxakara/packvium-rust"
 homepage = "https://packvium.com"
-documentation = "https://docs.rs/packvium"
-keywords = ["3d-bin-packing", "cartonization", "packaging", "container-loading", "logistics"]
+documentation = "https://packvium.com/docs"
+keywords = ["3d-bin-packing", "bin-packing", "3d-packing", "cartonization", "container-loading"]
 categories = ["algorithms", "mathematics", "data-structures"]
 authors = ["Packvium contributors"]
 

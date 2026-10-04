@@ -187,6 +187,9 @@ pub(crate) fn pack_homogeneous_blocks(
 
 fn supports(request: &PackingRequest, constraints: &[Arc<dyn PlacementConstraint>]) -> bool {
     constraints.is_empty()
+        // A block set on a smaller one overhangs it, so a request that asks for support
+        // is left to the per-item search.
+        && request.config.minimum_support_ratio == 0.0
         && request.fixed_containers.is_empty()
         && request.containers.iter().all(|container| {
             container.obstacles.is_empty()
@@ -209,6 +212,24 @@ fn supports(request: &PackingRequest, constraints: &[Arc<dyn PlacementConstraint
                 && item.nesting_height.is_none()
                 && item.stop_index.is_none()
         })
+}
+
+/// The share of a member's base that rests on the floor or on a box beneath it.
+fn member_support(placements: &[Placement], origin: Point, envelope: Dimensions) -> f64 {
+    if origin.z == 0 {
+        return 1.0;
+    }
+    let base = Aabb {
+        origin,
+        dimensions: envelope,
+    };
+    let area = placements
+        .iter()
+        .map(Placement::envelope_box)
+        .filter(|below| below.z2() == origin.z)
+        .map(|below| below.overlap_area_xy(base))
+        .sum::<i128>();
+    (area as f64 / envelope.base_area() as f64).min(1.0)
 }
 
 fn pack_one(
@@ -428,7 +449,13 @@ fn pack_mode(
                         dimensions: block.physical,
                         envelope_origin: origin,
                         envelope_dimensions: block.envelope,
-                        support_ratio: 1.0,
+                        // Above its bottom layer a member rests on an identical
+                        // footprint; the bottom layer rests on whatever is there.
+                        support_ratio: if z == 0 {
+                            member_support(&packed.placements, origin, block.envelope)
+                        } else {
+                            1.0
+                        },
                         top_load: Weight(0),
                         fixed: false,
                     });
@@ -473,6 +500,104 @@ mod tests {
             ],
             "containers": [{"id":"box","quantity":1,"inner_dimensions":{"length":"300","width":"200","height":"200"},"max_payload":{"value":"1000","unit":"g"}}]
         }).to_string()
+    }
+
+    /// One 60x60x40 base and three 40x60x50 tops in a 100 mm crate: the base ends on two
+    /// tops and overhangs them.
+    fn a_base_and_three_tops(minimum_support_ratio: f64) -> serde_json::Value {
+        let request = serde_json::json!({
+            "units": {"length": "mm"},
+            "configuration": {
+                "solver_profile": "quality",
+                "solvers": ["homogeneous_blocks"],
+                "time_limit_ms": 60_000,
+                "effort_budget": {"max_search_nodes": 100_000},
+                "minimum_support_ratio": minimum_support_ratio
+            },
+            "items": [
+                {"id":"base","quantity":1,"dimensions":{"length":"60","width":"60","height":"40"}},
+                {"id":"top","quantity":3,"dimensions":{"length":"40","width":"60","height":"50"}}
+            ],
+            "containers": [{"id":"crate","quantity":1,"inner_dimensions":{"length":"100","width":"100","height":"100"}}]
+        })
+        .to_string();
+        serde_json::from_str(&pack_json(&request).expect("solve")).unwrap()
+    }
+
+    /// Each placement's reported support next to the share of its base that rests on the
+    /// floor or on a top face, from geometry alone.
+    fn reported_and_resting_support(result: &serde_json::Value) -> Vec<(f64, f64)> {
+        let ticks = |value: &serde_json::Value| value["ticks"].as_i64().unwrap();
+        let boxes = result["containers"][0]["placements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                let (x, y, z) = (
+                    ticks(&p["position"]["x"]),
+                    ticks(&p["position"]["y"]),
+                    ticks(&p["position"]["z"]),
+                );
+                let reported = p["support_ratio"].as_str().unwrap().parse::<f64>().unwrap();
+                (
+                    [x, y, z],
+                    [
+                        x + ticks(&p["dimensions"]["length"]),
+                        y + ticks(&p["dimensions"]["width"]),
+                        z + ticks(&p["dimensions"]["height"]),
+                    ],
+                    reported,
+                )
+            })
+            .collect::<Vec<_>>();
+        boxes
+            .iter()
+            .map(|(low, high, reported)| {
+                if low[2] == 0 {
+                    return (*reported, 1.0);
+                }
+                let resting = boxes
+                    .iter()
+                    .filter(|(_, below, _)| below[2] == low[2])
+                    .map(|(other_low, other_high, _)| {
+                        (high[0].min(other_high[0]) - low[0].max(other_low[0])).max(0)
+                            * (high[1].min(other_high[1]) - low[1].max(other_low[1])).max(0)
+                    })
+                    .sum::<i64>();
+                let area = (high[0] - low[0]) * (high[1] - low[1]);
+                (*reported, resting as f64 / area as f64)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_block_set_on_a_smaller_one_reports_the_support_it_really_has() {
+        let result = a_base_and_three_tops(0.0);
+        let support = reported_and_resting_support(&result);
+        assert_eq!(
+            support.iter().filter(|(_, resting)| *resting < 1.0).count(),
+            1
+        );
+        assert!(
+            support
+                .iter()
+                .any(|(reported, resting)| (*reported - 5.0 / 6.0).abs() < 1e-6
+                    && (*resting - 5.0 / 6.0).abs() < 1e-6)
+        );
+        for (reported, resting) in support {
+            assert!(
+                (reported - resting).abs() < 1e-6,
+                "{reported} reported, {resting} resting"
+            );
+        }
+    }
+
+    #[test]
+    fn the_block_solver_leaves_a_request_that_asks_for_support_to_the_per_item_search() {
+        let result = a_base_and_three_tops(1.0);
+        let support = reported_and_resting_support(&result);
+        assert!(!support.is_empty());
+        assert!(support.iter().all(|(_, resting)| *resting == 1.0));
     }
 
     #[test]

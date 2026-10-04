@@ -140,8 +140,8 @@ impl IndependentValidator {
                     if placements_collide(placement, other) && !valid_nesting(placement, other) {
                         issue(
                             &mut issues,
-                            "overlap",
-                            &format!("{} and {}", id, other.instance.id()),
+                            "collision",
+                            &format!("{} with {}", id, other.instance.id()),
                         );
                     }
                 }

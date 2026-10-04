@@ -204,6 +204,88 @@ fn a_run_with_no_levels_succeeds_and_packs_nothing() {
     assert!(result.levels.is_empty());
 }
 
+#[test]
+fn nested_levels_automatically_chain_containers_into_items_and_honour_beam_width() {
+    let nested = NestedPackingRequest {
+        levels: vec![
+            NestedLevel {
+                name: "cartons".into(),
+                request: request(vec![item("cup", 50)], vec![container("box", 100)]),
+            },
+            NestedLevel {
+                name: "pallet".into(),
+                // Empty items: chains from "cartons" level
+                request: request(vec![], vec![container("pallet", 500)]),
+            },
+        ],
+        beam_width: 3,
+    };
+
+    let result = pack_nested(&nested).expect("chained levels pack");
+    assert_eq!(result.levels.len(), 2);
+    assert_eq!(result.levels[0].0, "cartons");
+    assert_eq!(result.levels[1].0, "pallet");
+    assert_eq!(result.levels[0].1.containers.len(), 1);
+    assert_eq!(result.levels[1].1.containers.len(), 1);
+    assert_eq!(result.levels[1].1.packed_item_count(), 1);
+}
+
+#[test]
+fn an_incomplete_level_ends_the_chain_as_pythons_nested_packer_does() {
+    let nested = NestedPackingRequest {
+        levels: vec![
+            NestedLevel {
+                name: "cartons".into(),
+                // The second cup does not fit: this level cannot complete.
+                request: request(
+                    vec![item("cup", 50), item("urn", 200)],
+                    vec![container("box", 100)],
+                ),
+            },
+            NestedLevel {
+                name: "pallet".into(),
+                request: request(vec![], vec![container("pallet", 500)]),
+            },
+            NestedLevel {
+                name: "truck".into(),
+                request: request(vec![], vec![container("truck", 900)]),
+            },
+        ],
+        beam_width: 0,
+    };
+
+    let result = pack_nested(&nested).expect("an unfittable item is a result, not an error");
+    let names: Vec<&str> = result
+        .levels
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(names, ["cartons"]);
+    assert!(!result.levels[0].1.complete());
+}
+
+#[test]
+fn a_level_with_its_own_items_still_runs_after_an_incomplete_one() {
+    let nested = NestedPackingRequest {
+        levels: vec![
+            NestedLevel {
+                name: "cartons".into(),
+                request: request(vec![item("urn", 200)], vec![container("box", 100)]),
+            },
+            NestedLevel {
+                name: "pallet".into(),
+                request: request(vec![item("crate", 50)], vec![container("pallet", 500)]),
+            },
+        ],
+        beam_width: 0,
+    };
+
+    let result = pack_nested(&nested).expect("each level is a valid request");
+    assert_eq!(result.levels.len(), 2);
+    assert!(!result.levels[0].1.complete());
+    assert!(result.levels[1].1.complete());
+}
+
 // ------------------------------------------------------------------ SolverRegistry
 
 #[derive(Debug)]

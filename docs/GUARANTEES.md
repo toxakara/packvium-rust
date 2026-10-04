@@ -15,7 +15,9 @@ After a result reports `feasible` or `optimal` and passes independent validation
   1/8 µg for weight. No coordinate is ever a binary floating-point number, so no
   placement decision depends on rounding;
 - **determinism** — identical input and identical seed produce an identical result, on
-  any platform and in any of the implementations;
+  any platform, when the search completes or stops on `configuration.effort_budget`. A
+  search stopped by `time_limit_ms` stops where the host's speed let it, so it may differ
+  between runs; the result says which limit stopped it;
 - **complete accounting** — every requested item instance appears exactly once, either
   placed or listed as unpacked with a reason code.
 
@@ -31,9 +33,10 @@ After a result reports `feasible` or `optimal` and passes independent validation
 - **That your inputs are right.** Dimensions, weights and clearances are taken as given.
   Round item exteriors outward, container interiors inward, and clearance outward before
   you build the request.
-- **Support for non-rectangular shapes.** Items and containers are rigid axis-aligned
-  cuboids; obstacles are rectangular. No cylinders, deformable bags, meshes or
-  irregular geometry.
+- **Arbitrary shapes.** Containers are axis-aligned cuboids. An item is a cuboid, a convex
+  hull of vertices, or a cuboid that compresses by a declared ratio; obstacles are cuboids
+  or unions of them. Concave meshes, curved surfaces and free-form deformable bags are not
+  modelled — approximate them with a convex hull or a bounding cuboid.
 - **A result before the deadline.** With a time limit set, the search may return
   `time_limit` with a partial packing, or nothing placed at all.
 - **Full load propagation.** Top-load limits are enforced against what rests *directly*
@@ -41,14 +44,15 @@ After a result reports `feasible` or `optimal` and passes independent validation
 
 ## Not modelled at all
 
-Deformable goods, dynamic shipping physics, contact-load propagation through arbitrary
-support graphs, pallet-overhang standards, axle loads, unloading-route optimization, and
-carrier tariff or rating catalogs. None of these are built in, and none are approximated
+Dynamic shipping physics, contact-load propagation through arbitrary support graphs,
+pallet-overhang standards, and route optimization. Axle loads, the unloading order of a
+given stop sequence (`stop_index`, `access_directions`) and carrier rate tables are
+modelled; choosing the route itself is not. None of the unmodelled items is approximated
 silently — if you need them, they belong in your own layer above this library.
 
 ## Status of this release
 
-Version `1.4.0` freezes the public API. Field names, status codes, the objective
+Version `1.5.0` freezes the public API. Field names, status codes, the objective
 vector, the numeric policy and the validation rules do not change without a major
 version, so any `1.x` is a safe upgrade from any earlier `1.x`. A caret or tilde
 constraint on `1.0` is enough; an exact pin is no longer required.

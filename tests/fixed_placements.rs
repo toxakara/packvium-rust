@@ -232,7 +232,7 @@ type Mutation = Box<dyn Fn(&mut Value)>;
 fn a_fixed_set_that_cannot_hold_is_refused_before_search() {
     let cases: Vec<(&str, Mutation)> = vec![
         (
-            "overlap",
+            "collision",
             Box::new(|d| {
                 d["fixed_placements"]
                     .as_array_mut()
@@ -500,7 +500,7 @@ fn a_fixed_placement_that_is_not_the_schema_shape_is_refused_by_name() {
         (json!([5]), "fixed_placements[0] is an object"),
         (
             json!([with("zone", json!("a")),]),
-            r#"fixed_placements[0] does not carry ["zone"]"#,
+            r#"fixed_placements[0] cannot carry ["zone"]"#,
         ),
         (
             json!([no_orientation]),
@@ -528,7 +528,7 @@ fn a_fixed_placement_that_is_not_the_schema_shape_is_refused_by_name() {
         ),
         (
             json!([with("position", json!({"x": "100", "w": "5", "a": "1"}))]),
-            r#"fixed_placements[0].position does not carry ["a","w"]"#,
+            r#"fixed_placements[0].position cannot carry ["a","w"]"#,
         ),
         (
             json!([with("position", json!({"y": true}))]),

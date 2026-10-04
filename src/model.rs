@@ -897,6 +897,42 @@ impl PackedContainer {
     pub fn axle_reactions(&self) -> Option<(i128, i128, i128)> {
         axle_reactions(&self.container, &self.placements, None)
     }
+
+    /// Turns an already-packed container into an item for multi-level nesting.
+    pub fn as_item(&self) -> Item {
+        Item {
+            id: self.id(),
+            dimensions: self
+                .container
+                .outer_dimensions
+                .unwrap_or(self.container.inner_dimensions),
+            weight: self.gross_weight(),
+            quantity: 1,
+            allowed_rotations: Rotation::ALL.to_vec(),
+            stackable: true,
+            must_be_on_floor: false,
+            max_top_load: None,
+            minimum_support_ratio: 0.0,
+            group: None,
+            tags: BTreeSet::new(),
+            incompatible_tags: BTreeSet::new(),
+            priority: 0,
+            metadata: BTreeMap::from([(
+                "source_packed_container".into(),
+                Value::String(self.id()),
+            )]),
+            nesting_height: None,
+            max_stacked_items: None,
+            ground_contact_rule: None,
+            stop_index: None,
+            eligible_container_tags: BTreeSet::new(),
+            value: None,
+            shape_type: ShapeType::RigidCuboid,
+            hull_vertices: None,
+            compression_ratio_ppm: None,
+            max_compression_pressure_kpa: None,
+        }
+    }
 }
 
 pub fn axle_reactions(

@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use Packvium in your research, please cite it as below."
+title: "Packvium for Rust"
+type: software
+authors:
+  - name: "Packvium contributors"
+    website: "https://packvium.com"
+version: "1.5.0"
+license: MIT
+url: "https://packvium.com"
+repository-code: "https://github.com/toxakara/packvium-rust"
+repository-artifact: "https://crates.io/crates/packvium"
+abstract: >-
+  Deterministic 3D bin-packing and cartonization engine for pallets, containers, trucks and shipping cartons. Exact integer geometry, reproducible results.
+keywords:
+  - 3d-bin-packing
+  - bin-packing
+  - 3d-packing
+  - cartonization
+  - container-loading
+  - pallet-packing
+  - truck-loading
+  - packing-algorithm
+  - logistics
+  - deterministic

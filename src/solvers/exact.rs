@@ -57,14 +57,19 @@ pub fn pack_exact_one(
         .filter(|(_, container)| container.quantity != Some(0))
         .map(|(position, container)| {
             let initial = ContainerState::new(container, 1);
-            let floor = optimistic_completion_score(&initial, &profiled, &request.config);
-            (floor, position, initial)
+            let (can_fit, cannot_fit): (Vec<_>, Vec<_>) =
+                profiled.iter().cloned().partition(|(item, _)| {
+                    item_can_fit_container(item, &initial.packed.container, &request.config)
+                });
+            let floor =
+                optimistic_completion_score(&initial, &can_fit, &cannot_fit, &request.config);
+            (floor, position, initial, can_fit, cannot_fit)
         })
         .collect::<Vec<_>>();
     planned.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
     let mut best_position = usize::MAX;
 
-    for (root_floor, position, initial) in planned {
+    for (root_floor, position, initial, can_fit, cannot_fit) in planned {
         if deadline.expired() || effort_exhausted(request, &metrics) {
             searched_all_containers = false;
             break;
@@ -76,7 +81,7 @@ pub fn pack_exact_one(
         }
 
         let mut best_state = initial.clone();
-        let mut best_state_score = score_state(&best_state, &profiled, &request.config);
+        let mut best_state_score = score_state(&best_state, &can_fit, &cannot_fit, &request.config);
         let complete_lower_bound = root_floor;
         let mut visited = VisitedStates {
             keys: StateKeys::new(
@@ -84,7 +89,7 @@ pub fn pack_exact_one(
                 constraints.is_empty()
                     && scorers.is_empty()
                     && initial.packed.container.max_stack_density.is_none()
-                    && profiled.iter().all(|(instance, _)| {
+                    && can_fit.iter().all(|(instance, _)| {
                         !instance.item.is_stack_sensitive()
                             && instance.item.shape_type != ShapeType::Compressible
                     }),
@@ -92,7 +97,8 @@ pub fn pack_exact_one(
             seen: BTreeSet::new(),
         };
         search(
-            profiled.clone(),
+            can_fit,
+            &cannot_fit,
             request,
             constraints,
             scorers,
@@ -261,6 +267,39 @@ fn exact_item_profile(item: &ItemInstance, config: &PackingConfig) -> ExactItemP
     }
 }
 
+fn item_can_fit_container(
+    item: &ItemInstance,
+    container: &Container,
+    config: &PackingConfig,
+) -> bool {
+    if container.max_items == Some(0) {
+        return false;
+    }
+    if !item.item.eligible_container_tags.is_empty()
+        && item
+            .item
+            .eligible_container_tags
+            .is_disjoint(&container.tags)
+    {
+        return false;
+    }
+    if container
+        .max_payload
+        .is_some_and(|max| item.item.weight.0 > max.0)
+    {
+        return false;
+    }
+    item.item
+        .dimensions
+        .unique_rotations(&item.item.allowed_rotations)
+        .iter()
+        .any(|(_, dimensions)| {
+            dimensions
+                .expand(config.clearance)
+                .fits_inside(container.inner_dimensions)
+        })
+}
+
 /// Reuses the canonical finished-result objective at every visited exact-search node.
 /// This adds `O(n^2)` scoring work per node because nesting-aware used volume checks
 /// placement pairs, and no asymptotic live-space growth to the
@@ -268,10 +307,12 @@ fn exact_item_profile(item: &ItemInstance, config: &PackingConfig) -> ExactItemP
 fn score_state(
     state: &ContainerState,
     remaining: &[(ItemInstance, ExactItemProfile)],
+    unfit: &[(ItemInstance, ExactItemProfile)],
     config: &PackingConfig,
 ) -> Vec<i128> {
     let unpacked = remaining
         .iter()
+        .chain(unfit.iter())
         .map(|(instance, _)| {
             UnpackedItem::new(
                 instance.clone(),
@@ -306,9 +347,10 @@ fn score_state(
 fn optimistic_completion_score(
     state: &ContainerState,
     remaining: &[(ItemInstance, ExactItemProfile)],
+    unfit: &[(ItemInstance, ExactItemProfile)],
     config: &PackingConfig,
 ) -> Vec<i128> {
-    if state.packed.placements.is_empty() && remaining.is_empty() {
+    if state.packed.placements.is_empty() && remaining.is_empty() && unfit.is_empty() {
         return score_solution(&[], &[], config);
     }
 
@@ -371,7 +413,7 @@ fn optimistic_completion_score(
         placeable = placeable.min(maximum.saturating_sub(state.packed.placements.len()));
     }
     let smallest_volume_sum = volumes.iter().take(placeable).sum::<i128>();
-    let unpacked_floor = (remaining.len() - placeable) as i128;
+    let unpacked_floor = (remaining.len() - placeable) as i128 + unfit.len() as i128;
 
     if placeable == 0 && state.packed.placements.is_empty() {
         // No descendant can open this container at all: every one scores exactly
@@ -511,6 +553,7 @@ impl StateKeys {
 #[allow(clippy::too_many_arguments)]
 fn search(
     remaining: Vec<(ItemInstance, ExactItemProfile)>,
+    unfit: &[(ItemInstance, ExactItemProfile)],
     request: &PackingRequest,
     constraints: &[Arc<dyn PlacementConstraint>],
     scorers: &[Arc<dyn CandidateScorer>],
@@ -533,11 +576,12 @@ fn search(
         return;
     }
     metrics.search_nodes_expanded = metrics.search_nodes_expanded.saturating_add(1);
-    // This node's own score leads with `remaining.len()` unpacked, so it can only
+    // This node's own score leads with `remaining.len() + unfit.len()` unpacked, so it can only
     // beat the incumbent when that count does not already lose the first element;
     // skipping the `O(n^2)` scoring otherwise changes no incumbent decision.
-    if remaining.len() as i128 <= best_score[0] {
-        let score = score_state(state, &remaining, &request.config);
+    let total_unpacked = (remaining.len() + unfit.len()) as i128;
+    if total_unpacked <= best_score[0] {
+        let score = score_state(state, &remaining, unfit, &request.config);
         if score < *best_score {
             *best = state.clone();
             *best_score = score;
@@ -557,7 +601,7 @@ fn search(
     // cannot change the result. Without this the removal of the first-complete
     // shortcut left the DFS exploring the entire permutation tree whenever the
     // complete floor is geometrically unreachable.
-    if optimistic_completion_score(state, &remaining, &request.config) >= *best_score {
+    if optimistic_completion_score(state, &remaining, unfit, &request.config) >= *best_score {
         return;
     }
 
@@ -593,6 +637,7 @@ fn search(
             next_remaining.remove(index);
             search(
                 next_remaining,
+                unfit,
                 request,
                 constraints,
                 scorers,
@@ -734,5 +779,44 @@ mod tests {
                 .iter()
                 .all(|item| item["proof"]["level"] == "unknown_due_to_limit")
         );
+    }
+
+    #[test]
+    fn exact_small_stops_early_when_an_item_is_proven_not_to_fit() {
+        // 's scene: without the pallet jack the search finishes in about a hundred
+        // candidates. Before the jack alone spent the whole budget (106 861
+        // candidates at 1M, `effort_limit`); this budget is small enough to show that fast.
+        let request = r#"{
+            "units":{"length":"mm"},
+            "configuration":{
+                "time_limit_ms":300000,
+                "effort_budget":{
+                    "max_candidates_evaluated":20000,
+                    "max_placement_attempts":20000,
+                    "max_search_nodes":20000
+                }
+            },
+            "items":[
+                {"id":"printer","quantity":1,"weight":"9 kg","keep_upright":true,
+                 "dimensions":{"length":"420","width":"340","height":"260"}},
+                {"id":"toner","quantity":4,"weight":"900 g",
+                 "dimensions":{"length":"180","width":"120","height":"100"}},
+                {"id":"pallet-jack","quantity":1,"weight":"80 kg",
+                 "dimensions":{"length":"1200","width":"550","height":"1200"}}
+            ],
+            "containers":[
+                {"id":"crate","quantity":1,"max_payload":"30 kg",
+                 "inner_dimensions":{"length":"600","width":"400","height":"400"}}
+            ]
+        }"#;
+
+        let output = pack_json(request).expect("a request with an unfittable item");
+        let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["algorithm"]["effort_limit_reached"], false);
+        assert_eq!(result["algorithm"]["time_limit_reached"], false);
+        let unpacked = result["unpacked_items"].as_array().unwrap();
+        assert_eq!(unpacked.len(), 1);
+        assert_eq!(unpacked[0]["item_id"], "pallet-jack#1");
+        assert_eq!(unpacked[0]["proof"]["level"], "proven");
     }
 }

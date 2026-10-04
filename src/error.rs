@@ -27,6 +27,32 @@ pub enum PackError {
     TimeLimit,
 }
 
+impl PackError {
+    /// The closed, machine-readable code a caller branches on instead of parsing the message.
+    ///
+    /// The match is exhaustive on purpose: a new variant does not compile until it names its
+    /// code, so a transport that maps codes (the hosted API's HTTP statuses) cannot drift.
+    pub fn code(&self) -> &str {
+        match self {
+            Self::InvalidInput(_) | Self::Serialization(_) => "invalid_input",
+            Self::InvalidRequest(error) => error.code(),
+            Self::UnsupportedFeature(_) => "unsupported_feature",
+            Self::UnsupportedUnit(_) => "unsupported_unit",
+            Self::InvalidNumber(_) => "invalid_number",
+            Self::InvalidSolution(_) => "solution_failed_validation",
+            Self::TimeLimit => "time_limit",
+        }
+    }
+
+    /// The named refusal behind `invalid_request` / `invalid_fixed_placement`, if this is one.
+    pub fn request_error(&self) -> Option<&RequestError> {
+        match self {
+            Self::InvalidRequest(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 impl From<RequestError> for PackError {
     fn from(error: RequestError) -> Self {
         Self::InvalidRequest(error)

@@ -16,6 +16,10 @@
 
 use serde_json::{Value, json};
 
+/// Counted work, not a clock, decides where the search stops: under the default wall-clock
+/// limit a loaded host truncated one of two otherwise identical solves, and the comparisons
+/// below reported the host rather than the engine. The time limit is only a fuse, far above
+/// what one cube needs.
 fn request(doors: Option<Value>) -> String {
     let mut container = json!({
         "id": "van",
@@ -26,6 +30,7 @@ fn request(doors: Option<Value>) -> String {
     }
     json!({
         "units": { "length": "mm" },
+        "configuration": { "effort_budget": { "max_search_nodes": 20000 }, "time_limit_ms": 60000 },
         "items": [{ "id": "cube", "quantity": 1,
                     "dimensions": { "length": "100", "width": "100", "height": "100" } }],
         "containers": [container]
@@ -95,15 +100,15 @@ fn an_empty_door_list_is_accepted_and_matches_the_absent_field() {
 
 #[test]
 fn a_door_list_that_is_not_an_array_is_refused() {
-    assert!(refusal(json!("-x")).contains("must be an array"));
-    assert!(refusal(json!({ "wall": "-x" })).contains("must be an array"));
+    assert!(refusal(json!("-x")).contains("must be a list"));
+    assert!(refusal(json!({ "wall": "-x" })).contains("must be a list"));
 }
 
 #[test]
 fn a_non_string_entry_is_refused() {
-    assert!(refusal(json!([1])).contains("must be strings"));
-    assert!(refusal(json!([null])).contains("must be strings"));
-    assert!(refusal(json!([["-x"]])).contains("must be strings"));
+    assert!(refusal(json!([1])).contains("must be one of"));
+    assert!(refusal(json!([null])).contains("must be one of"));
+    assert!(refusal(json!([["-x"]])).contains("must be one of"));
 }
 
 /// Refused, not filtered out. Silently discarding an unrecognised door would leave a
@@ -114,7 +119,7 @@ fn an_unknown_direction_is_refused_rather_than_dropped() {
     for direction in ["north", "x", "+X", "+w", "", "-x "] {
         let message = refusal(json!([direction]));
         assert!(
-            message.contains("unknown movement direction"),
+            message.contains("must be one of"),
             "{direction:?} produced {message}"
         );
     }
@@ -124,5 +129,8 @@ fn an_unknown_direction_is_refused_rather_than_dropped() {
 /// something the caller did not write.
 #[test]
 fn one_bad_direction_refuses_the_whole_list() {
-    assert!(refusal(json!(["-x", "sideways", "+z"])).contains("unknown movement direction"));
+    assert!(
+        refusal(json!(["-x", "sideways", "+z"]))
+            .contains("/containers/0/access_directions/1: must be one of")
+    );
 }

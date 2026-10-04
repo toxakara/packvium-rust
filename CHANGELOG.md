@@ -4,6 +4,54 @@ What changed in `packvium` on crates.io, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0]
+
+Every error names a closed code. A misspelt configuration key is now refused (see *Fixed*).
+
+### Added
+
+- **`pack_json_with(input, ExecutionOptions)`.** `pack_json` with explicit execution options;
+  `ExecutionOptions { parallel: false }` runs independent search starts in sequence. The
+  answer is the same either way.
+- **`PackError::code()`** — the machine-readable code of every variant: `invalid_input`,
+  `invalid_request`, `invalid_fixed_placement`, `unsupported_feature`, `unsupported_unit`,
+  `invalid_number`, `solution_failed_validation`, `time_limit`. Branch on it instead of on the
+  message.
+- **`PackError::request_error()`** — the `RequestError` behind `invalid_request` and
+  `invalid_fixed_placement`, with its `reason()` and JSON Pointer `field()`, when there is one.
+
+### Changed
+
+- **Up to 41% faster on beam searches, same results.** The collision index keeps its cells in a
+  flat array instead of a tree and sizes each query's result once. Measured: beam requests 41%
+  faster, a 60-item order 34%, a 250-item order 18%, peak memory within 4%. Every result is
+  byte-identical.
+- **`pack_nested` chains levels.** A level whose request lists no items packs the previous
+  level's containers, one item each; it is not run after a level that left something unpacked.
+  A level that lists its own items runs on them as before. A non-zero `beam_width` now sets
+  every level's `container_plan_beam_width`; it was ignored.
+
+### Fixed
+
+- **`quality` with `minimum_support_ratio` answers instead of failing.** The homogeneous block
+  solver ran even when the request asked for support, and a block set on a smaller one
+  overhangs it, so the request ended in `solution_failed_validation`. Such a request is now
+  left to the per-item search. A block answer also reports the support each item really has;
+  it wrote `support_ratio` 1.0 for every item.
+- **A misspelt `configuration` key is refused.** A key the request schema does not declare in
+  `configuration` or its `effort_budget` (`profile` for `solver_profile`, `top_k` for
+  `alternatives`) was silently ignored, so the request ran on defaults. `pack_json` now returns
+  `PackError::InvalidRequest` with reason `not_allowed` and the key's pointer, for example
+  `/configuration/profile`. `parallel`, which this engine read although the schema never
+  declared it, is refused too; pass `ExecutionOptions { parallel: false }` to `pack_json_with`
+  to run search starts in sequence.
+- **An item that fits no orientation no longer spends the exact search's budget.** One such
+  item made a scene solved in about 1 ms run to its whole budget (2.7 s and `effort_limit` at
+  1M); it is now set aside before the search, which finishes in about 1 ms. Placements are
+  unchanged.
+- **An unknown `objective` or access direction is refused with its pointer** (`not_allowed`),
+  and refusal messages match the documentation.
+
 ## [1.4.0]
 
 Replanning a job that has already started, a beam search that no longer trades memory for

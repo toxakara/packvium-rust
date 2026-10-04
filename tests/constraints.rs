@@ -1,4 +1,7 @@
-use packvium_core::{ReasonProof, ResultFact, StartRecord, aggregate_termination, pack_json};
+use packvium_core::{
+    ExecutionOptions, ReasonProof, ResultFact, StartRecord, aggregate_termination, pack_json,
+    pack_json_with,
+};
 use serde_json::{Value, json};
 
 fn solve(mut value: Value) -> Value {
@@ -252,11 +255,10 @@ fn a_high_priority_item_leads_every_built_in_ordering() {
 }
 
 #[test]
-fn deterministic_placements_ignore_runtime_metadata() {
+fn concurrent_starts_leave_the_answer_unchanged() {
     let request = json!({
         "configuration": {
             "solver_profile": "quality",
-            "parallel": true,
             "time_limit_ms": 300000,
             "seed": 77
         },
@@ -266,10 +268,34 @@ fn deterministic_placements_ignore_runtime_metadata() {
         ],
         "containers": [{"id": "box", "inner_dimensions": {"length": "200", "width": "100", "height": "100"}}]
     });
-    let first = solve(request.clone());
-    let second = solve(request);
-    assert_eq!(first["containers"], second["containers"]);
-    assert_eq!(first["unpacked_items"], second["unpacked_items"]);
+    let run = |parallel| -> Value {
+        let output = pack_json_with(&request.to_string(), ExecutionOptions { parallel })
+            .expect("packing request should solve");
+        serde_json::from_str(&output).expect("result should be JSON")
+    };
+    let (concurrent, sequential) = (run(true), run(false));
+    assert_eq!(concurrent["containers"], sequential["containers"]);
+    assert_eq!(concurrent["unpacked_items"], sequential["unpacked_items"]);
+    assert_eq!(concurrent["score"], sequential["score"]);
+}
+
+#[test]
+fn parallel_is_an_execution_option_not_a_request_field() {
+    let refused = pack_json(
+        &json!({
+            "configuration": {"parallel": false},
+            "items": [{"id": "a", "dimensions": {"length": "10", "width": "10", "height": "10"}}],
+            "containers": [{"id": "c", "inner_dimensions": {"length": "20", "width": "20", "height": "20"}}]
+        })
+        .to_string(),
+    );
+    let Err(packvium_core::PackError::InvalidRequest(error)) = refused else {
+        panic!("a request naming `parallel` must be refused, got {refused:?}");
+    };
+    assert_eq!(
+        (error.reason(), error.field()),
+        ("not_allowed", "/configuration/parallel")
+    );
 }
 
 #[test]

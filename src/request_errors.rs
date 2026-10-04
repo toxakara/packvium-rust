@@ -9,6 +9,7 @@
 
 use crate::canonical_json::{MAX_EXACT_MAGNITUDE, json_integer, json_spelling};
 use crate::error::RequestError;
+use crate::fixed::unknown_keys;
 use crate::units::{MeasureKind, measure_ticks};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
@@ -16,6 +17,15 @@ use std::collections::BTreeSet;
 type Checked<T = ()> = Result<T, RequestError>;
 
 const SOLVER_PROFILES: [&str; 4] = ["fast", "balanced", "quality", "exact_small"];
+const OBJECTIVES: [&str; 6] = [
+    "default",
+    "lowest_cost",
+    "shipping_cost",
+    "lowest_landed_cost",
+    "open_dimension_height",
+    "maximum_value",
+];
+const ACCESS_DIRECTIONS: [&str; 6] = ["+x", "-x", "+y", "-y", "+z", "-z"];
 const CONFIGURATION_INTEGERS: [(&str, i64); 10] = [
     ("time_limit_ms", 1),
     ("alternatives", 1),
@@ -33,6 +43,29 @@ const EFFORT_LIMITS: [&str; 4] = [
     "max_placement_attempts",
     "max_search_nodes",
     "max_restarts",
+];
+/// Every key the request schema's `configuration` declares; it sets `additionalProperties: false`.
+const CONFIGURATION_FIELDS: [&str; 20] = [
+    "alternatives",
+    "clearance",
+    "container_plan_beam_width",
+    "container_plan_node_limit",
+    "dimensional_weight_divisor",
+    "dimensional_weight_length_unit",
+    "dimensional_weight_weight_unit",
+    "effort_budget",
+    "exact_item_limit",
+    "max_candidate_points",
+    "max_candidates_per_item",
+    "max_containers",
+    "minimum_support_ratio",
+    "multi_start_orders",
+    "objective",
+    "require_placement_coordinates",
+    "seed",
+    "solver_profile",
+    "solvers",
+    "time_limit_ms",
 ];
 const SIDES: [&str; 3] = ["length", "width", "height"];
 const AXES: [&str; 3] = ["x", "y", "z"];
@@ -83,7 +116,13 @@ fn check_configuration(raw: Option<&Value>, unit: &str) -> Checked {
     };
     let configuration = object(raw, "/configuration")?;
     let at = "/configuration";
-    optional(configuration, "solver_profile", at, one_of_profiles)?;
+    known_fields(configuration, at, &CONFIGURATION_FIELDS)?;
+    optional(configuration, "solver_profile", at, |value, field| {
+        one_of(value, field, &SOLVER_PROFILES)
+    })?;
+    optional(configuration, "objective", at, |value, field| {
+        one_of(value, field, &OBJECTIVES)
+    })?;
     for (name, minimum) in CONFIGURATION_INTEGERS {
         optional(configuration, name, at, |value, field| {
             integer(value, field, minimum)
@@ -103,6 +142,7 @@ fn check_configuration(raw: Option<&Value>, unit: &str) -> Checked {
     };
     let at = "/configuration/effort_budget";
     let budget = object(effort, at)?;
+    known_fields(budget, at, &EFFORT_LIMITS)?;
     for name in EFFORT_LIMITS {
         optional(budget, name, at, |value, field| integer(value, field, 1))?;
     }
@@ -171,6 +211,7 @@ fn check_container(raw: &Value, at: &str, unit: &str) -> Checked {
     optional(container, "void_fill_reserve_ratio", at, |value, field| {
         ratio(value, field, Some(1))
     })?;
+    optional(container, "access_directions", at, access_directions)?;
     optional(container, "tag_limits", at, tag_limits)?;
     optional(container, "rate_table", at, rate_table)?;
     optional(container, "obstacles", at, |value, field| {
@@ -307,22 +348,43 @@ fn ratio(value: &Value, field: &str, maximum: Option<i64>) -> Checked {
     }
 }
 
-fn one_of_profiles(value: &Value, field: &str) -> Checked {
-    if value
-        .as_str()
-        .is_some_and(|profile| SOLVER_PROFILES.contains(&profile))
-    {
+/// The schema closes this object: a key it does not name is refused, never ignored. The first
+/// unknown key in code-point order is named, the order every engine can share.
+fn known_fields(map: &Map<String, Value>, at: &str, known: &[&str]) -> Checked {
+    match unknown_keys(map, known).first() {
+        Some(key) => Err(RequestError::new(
+            "not_allowed",
+            join(at, key),
+            "is not a known field",
+        )),
+        None => Ok(()),
+    }
+}
+
+fn one_of(value: &Value, field: &str, allowed: &[&str]) -> Checked {
+    if value.as_str().is_some_and(|item| allowed.contains(&item)) {
         return Ok(());
     }
-    let allowed = SOLVER_PROFILES
+    let allowed_values = allowed
         .iter()
-        .map(|profile| Value::String((*profile).to_owned()))
+        .map(|item| Value::String((*item).to_owned()))
         .collect();
     Err(RequestError::new(
         "not_allowed",
         field,
-        format!("must be one of {}", json_spelling(&Value::Array(allowed))),
+        format!(
+            "must be one of {}",
+            json_spelling(&Value::Array(allowed_values))
+        ),
     ))
+}
+
+fn access_directions(raw: &Value, at: &str) -> Checked {
+    let directions = list(raw, at)?;
+    for (index, direction) in directions.iter().enumerate() {
+        one_of(direction, &join(at, &index.to_string()), &ACCESS_DIRECTIONS)?;
+    }
+    Ok(())
 }
 
 /// A measure is an integer, a string or `{value, unit}`, in a known unit, and never negative.
