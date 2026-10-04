@@ -15,8 +15,33 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub fn pack_json(input: &str) -> PackResult<String> {
+    pack_json_with(input, ExecutionOptions::default())
+}
+
+/// How one solve may use the machine.
+///
+/// Deliberately not part of the JSON request: it changes wall-clock time, never the
+/// answer, and the request is the portable contract every engine shares and every
+/// digest hashes. Python and PHP keep the same kind of setting on their typed
+/// configuration for the same reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionOptions {
+    /// Run independent search starts on scoped threads; `false` runs them in sequence,
+    /// which is what measuring total work needs. The result is the same either way.
+    pub parallel: bool,
+}
+
+impl Default for ExecutionOptions {
+    fn default() -> Self {
+        Self { parallel: true }
+    }
+}
+
+/// [`pack_json`] with explicit [`ExecutionOptions`].
+pub fn pack_json_with(input: &str, options: ExecutionOptions) -> PackResult<String> {
     let value: Value = serde_json::from_str(input)?;
-    let request = request_from_json(&value)?;
+    let mut request = request_from_json(&value)?;
+    request.config.parallel = options.parallel;
     let result = pack_request_with_policy(&request, &PolicyRuleSet::parse(value.get("policy"))?)?;
     Ok(serde_json::to_string(&result.to_json(
         &request.output_length_unit,
@@ -957,7 +982,8 @@ fn parse_config(value: Option<&Value>, length_unit: &str) -> PackResult<PackingC
             16,
             4_096,
         )?,
-        parallel: map.get("parallel").and_then(Value::as_bool).unwrap_or(true),
+        // An execution setting, not part of the request: see `ExecutionOptions`.
+        parallel: true,
         effort_budget: parse_effort_budget(map.get("effort_budget"))?,
         solvers,
         objective: objective.into(),
@@ -2232,7 +2258,7 @@ mod public_feature_tests {
             pack_json(&request_with(r#""objective":17"#))
                 .unwrap_err()
                 .to_string()
-                .contains("configuration.objective")
+                .contains("/configuration/objective")
         );
         let item = r#"{"items":[{"id":"a","dimensions":{"length":"10","width":"10","height":"10"},"max_stacked_items":"1"}],"containers":[{"id":"c","inner_dimensions":{"length":"20","width":"20","height":"20"}}]}"#;
         assert_eq!(
@@ -2353,5 +2379,581 @@ mod result_contract_tests {
         let value: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(value["objective"], "default");
         assert_eq!(value["containers"][0]["void_fill_reserve_ticks3"], "0");
+    }
+}
+
+/// The model builders re-check what `request_errors` already refused, so a library caller
+/// that skips the rule table still cannot build a malformed model. These guards are out of
+/// reach through `pack_json`; each one is exercised here directly.
+#[cfg(test)]
+mod model_builder_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn refusal<T: std::fmt::Debug>(result: PackResult<T>) -> String {
+        result.expect_err("the builder refuses").to_string()
+    }
+
+    fn object(value: Value) -> Map<String, Value> {
+        value.as_object().expect("an object").clone()
+    }
+
+    fn config(value: Value) -> String {
+        refusal(parse_config(Some(&value), "mm"))
+    }
+
+    fn item(extra: Value) -> String {
+        let mut value =
+            json!({"id": "a", "dimensions": {"length": "10", "width": "10", "height": "10"}});
+        value
+            .as_object_mut()
+            .expect("item object")
+            .extend(object(extra));
+        refusal(parse_item(&value, "mm"))
+    }
+
+    fn container(extra: Value) -> String {
+        let mut value =
+            json!({"id": "c", "inner_dimensions": {"length": "20", "width": "20", "height": "20"}});
+        value
+            .as_object_mut()
+            .expect("container object")
+            .extend(object(extra));
+        refusal(parse_container(&value, "mm"))
+    }
+
+    fn valid_request() -> PackingRequest {
+        parse_request(&object(json!({
+            "items": [{"id": "a", "dimensions": {"length": "10", "width": "10", "height": "10"}}],
+            "containers": [{"id": "c", "inner_dimensions": {"length": "20", "width": "20", "height": "20"}}]
+        })))
+        .expect("a valid request")
+    }
+
+    #[test]
+    fn catalog_references_must_be_canonical() {
+        let reference =
+            json!({"catalog_id": "items", "version": 1, "effective_at": 0, "resolved_at": 0});
+        assert!(refusal(parse_catalog_versions(Some(&json!([1])))).contains("must be an object"));
+        assert!(
+            refusal(parse_catalog_versions(Some(
+                &json!([{"catalog_id": "items"}])
+            )))
+            .contains("exactly the canonical fields")
+        );
+        let mut unnamed = reference.clone();
+        unnamed["catalog_id"] = json!("");
+        assert!(
+            refusal(parse_catalog_versions(Some(&json!([unnamed])))).contains("must be non-empty")
+        );
+        let mut unversioned = reference;
+        unversioned["version"] = json!(0);
+        assert!(
+            refusal(parse_catalog_versions(Some(&json!([unversioned]))))
+                .contains("version must be >= 1")
+        );
+    }
+
+    #[test]
+    fn configuration_values_outside_their_domain_are_refused() {
+        assert!(config(json!({"objective": "cheapest"})).contains("unknown objective"));
+        // The rule table refuses these first on every public path; the builder still holds
+        // its own line for a caller that reaches it with an unchecked value.
+        assert!(
+            config(json!({"objective": 5})).contains("configuration.objective must be a string")
+        );
+        for (directions, expected) in [
+            (json!(["+x", 5]), "entries must be strings"),
+            (json!(["upwards"]), "unknown movement direction upwards"),
+        ] {
+            assert!(refusal(parse_access_directions(Some(&directions))).contains(expected));
+        }
+        assert!(
+            config(json!({"dimensional_weight_divisor": 0}))
+                .contains("dimensional_weight_divisor must be a positive integer")
+        );
+        assert!(config(json!({"solvers": [1]})).contains("must contain strings"));
+        assert!(config(json!({"solvers": "grid"})).contains("must be an array"));
+        assert!(config(json!({"solvers": ["annealing"]})).contains("unknown solver"));
+        assert!(config(json!({"dimensional_weight_length_unit": 1})).contains("must be a string"));
+        assert!(
+            config(json!({"dimensional_weight_weight_unit": "stone"})).contains("must be one of")
+        );
+        assert!(config(json!({"effort_budget": 1})).contains("effort_budget must be object"));
+        assert!(
+            config(json!({"effort_budget": {"max_search_nodes": 0}}))
+                .contains("effort_budget.max_search_nodes must be positive")
+        );
+    }
+
+    #[test]
+    fn every_floored_configuration_count_names_its_floor() {
+        for (field, value, expected) in [
+            ("max_candidates_per_item", 0, "must be a positive integer"),
+            ("max_candidate_points", 1, "must be an integer >= 16"),
+            ("container_plan_beam_width", 0, "must be a positive integer"),
+            ("container_plan_node_limit", 0, "must be a positive integer"),
+        ] {
+            let message = config(json!({ field: value }));
+            assert!(
+                message.contains(&format!("configuration.{field} {expected}")),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            below_floor("container", "cost_minor", 0),
+            "container.cost_minor must be a non-negative integer"
+        );
+    }
+
+    #[test]
+    fn item_fields_outside_their_domain_are_refused() {
+        assert!(item(json!({"allowed_rotations": ["XYZ"]})).contains("has no allowed rotations"));
+        assert!(item(json!({"shape_type": "sphere"})).contains("is not a known shape"));
+        assert!(
+            item(json!({"shape_type": "compressible", "compression_ratio": 2.0}))
+                .contains("between zero and one")
+        );
+        assert!(
+            item(json!({"shape_type": "convex_hull", "hull_vertices": [1]}))
+                .contains("entries must be objects")
+        );
+        assert!(item(json!({"eligible_container_tags": [1]})).contains("must contain strings"));
+        assert!(item(json!({"eligible_container_tags": "x"})).contains("must be an array"));
+        assert!(item(json!({"stop_index": -1})).contains("non-negative safe integer"));
+        assert!(item(json!({"value": -1})).contains("item.value must be a non-negative integer"));
+        assert!(
+            item(json!({"ground_contact_rule": 1}))
+                .contains("ground_contact_rule must be a string")
+        );
+    }
+
+    #[test]
+    fn shape_admission_refuses_inconsistent_shapes() {
+        let dimensions = Dimensions {
+            length: Length(10),
+            width: Length(10),
+            height: Length(10),
+        };
+        let cube = |side: i64| {
+            let mut vertices = Vec::new();
+            for x in [0, side] {
+                for y in [0, side] {
+                    for z in [0, side] {
+                        vertices.push([x, y, z]);
+                    }
+                }
+            }
+            vertices
+        };
+        assert!(
+            refusal(admit_shape(
+                ShapeType::ConvexHull,
+                Some(cube(10)),
+                None,
+                None,
+                dimensions,
+                Some(Length(1)),
+            ))
+            .contains("nesting_height with shape_type convex_hull")
+        );
+        assert!(
+            refusal(admit_shape(
+                ShapeType::ConvexHull,
+                Some(cube(20)),
+                None,
+                None,
+                dimensions,
+                None,
+            ))
+            .contains("does not fit inside dimensions")
+        );
+        assert!(
+            refusal(admit_shape(
+                ShapeType::Compressible,
+                None,
+                Some(500_000),
+                None,
+                dimensions,
+                None,
+            ))
+            .contains("requires both compression_ratio")
+        );
+        assert!(
+            refusal(admit_shape(
+                ShapeType::Compressible,
+                None,
+                Some(2_000_000),
+                Some(10),
+                dimensions,
+                None,
+            ))
+            .contains("between zero and one")
+        );
+        assert!(
+            refusal(admit_shape(
+                ShapeType::Compressible,
+                None,
+                Some(500_000),
+                Some(-1),
+                dimensions,
+                None,
+            ))
+            .contains("cannot be negative")
+        );
+    }
+
+    #[test]
+    fn container_fields_outside_their_domain_are_refused() {
+        assert!(
+            container(json!({"tag_limits": {"cold": 0}}))
+                .contains("tag_limits.cold must be positive")
+        );
+        assert!(container(json!({"tag_limits": []})).contains("tag_limits must be an object"));
+        assert!(
+            container(json!({"rate_table": {"weight_brackets_g": [1000], "prices_minor": [-1]}}))
+                .contains("prices_minor must hold integers >= 0")
+        );
+        assert!(container(json!({"axles": [{}]})).contains("exactly front and rear"));
+        assert!(container(json!({"axles": [{"position": "x"}, {"position": "10"}]})).contains("x"));
+        assert!(
+            container(json!({"obstacles": [{"id": "o", "dimensions": {"length": "1", "width": "1", "height": "1"}, "additional_boxes": [1]}]}))
+                .contains("additional box must be object")
+        );
+        assert!(container(json!({"void_fill_reserve_ratio": "half"})).contains("must be a number"));
+        assert!(container(json!({"void_fill_reserve_ratio": 2.0})).contains("between 0 and 1"));
+    }
+
+    #[test]
+    fn dimensions_must_be_positive_numbers() {
+        for (dimensions, expected) in [
+            (json!({"length": "x", "width": "1", "height": "1"}), "x"),
+            (json!({"length": "1", "width": "x", "height": "1"}), "x"),
+            (json!({"length": "1", "width": "1", "height": "x"}), "x"),
+            (
+                json!({"length": "0", "width": "1", "height": "1"}),
+                "dimensions must be positive",
+            ),
+        ] {
+            let message = refusal(parse_dimensions(Some(&dimensions), "mm"));
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_fixed_placement_needs_a_known_orientation() {
+        let placement = json!({"item_type": "a", "container_type": "c", "orientation": "XYZ"});
+        assert!(
+            refusal(parse_fixed_placement(&placement, "mm")).contains("orientation is invalid")
+        );
+    }
+
+    #[test]
+    fn a_built_request_is_rechecked_before_rebalancing() {
+        let mut ratio = valid_request();
+        ratio.config.minimum_support_ratio = 2.0;
+        assert!(refusal(validate_request(&ratio)).contains("minimum_support_ratio"));
+
+        let mut duplicate_item = valid_request();
+        duplicate_item.items.push(duplicate_item.items[0].clone());
+        assert!(refusal(validate_request(&duplicate_item)).contains("duplicate item id"));
+
+        let mut item_ratio = valid_request();
+        item_ratio.items[0].minimum_support_ratio = -1.0;
+        assert!(refusal(validate_request(&item_ratio)).contains("invalid minimum_support_ratio"));
+
+        let mut stacked = valid_request();
+        stacked.items[0].max_stacked_items = Some(0);
+        assert!(refusal(validate_request(&stacked)).contains("max_stacked_items"));
+
+        let mut contact = valid_request();
+        contact.items[0].ground_contact_rule = Some("floating".into());
+        assert!(refusal(validate_request(&contact)).contains("ground_contact_rule"));
+
+        let mut duplicate_container = valid_request();
+        duplicate_container
+            .containers
+            .push(duplicate_container.containers[0].clone());
+        assert!(refusal(validate_request(&duplicate_container)).contains("duplicate container id"));
+
+        let mut reserve = valid_request();
+        reserve.containers[0].void_fill_reserve_ppm = 2_000_000;
+        assert!(refusal(validate_request(&reserve)).contains("void_fill_reserve_ratio"));
+
+        let mut axles = valid_request();
+        axles.containers[0].axles = Some([
+            Axle {
+                position: Length(10),
+                max_load: None,
+            },
+            Axle {
+                position: Length(5),
+                max_load: None,
+            },
+        ]);
+        assert!(refusal(validate_request(&axles)).contains("invalid axle positions"));
+    }
+
+    /// Every optional field at once, so this copy of the builders runs their success paths
+    /// as well as the refusals above.
+    #[test]
+    fn a_request_using_every_field_builds_its_model() {
+        let request = parse_request(&object(json!({
+            "units": {"length": "mm"},
+            "output": {"length_unit": "cm", "weight_unit": "kg"},
+            "catalog_versions_used": [
+                {"catalog_id": "items", "version": 1, "effective_at": 0, "resolved_at": 0}
+            ],
+            "configuration": {
+                "objective": "shipping_cost", "dimensional_weight_divisor": 139,
+                "solvers": ["grid"], "solver_profile": "quality",
+                "time_limit_ms": 5, "alternatives": 2, "seed": 7, "max_containers": 3,
+                "clearance": "1", "minimum_support_ratio": 0.5, "exact_item_limit": 4,
+                "multi_start_orders": 2, "max_candidates_per_item": 2,
+                "max_candidate_points": 32,
+                "effort_budget": {"max_candidates_evaluated": 1, "max_placement_attempts": 2,
+                                  "max_search_nodes": 3, "max_restarts": 4},
+                "require_placement_coordinates": false,
+                "container_plan_beam_width": 2, "container_plan_node_limit": 9
+            },
+            "items": [
+                {"id": "cup", "quantity": 2, "weight": "5",
+                 "dimensions": {"length": "10", "width": "10", "height": "10"},
+                 "keep_upright": true, "nesting_height": "2", "max_top_load": "50",
+                 "stackable": false, "must_be_on_floor": true, "minimum_support_ratio": 0.25,
+                 "group": "set", "tags": ["a"], "incompatible_tags": ["b"], "priority": 3,
+                 "metadata": {"sku": 1}, "max_stacked_items": 2, "ground_contact_rule": "single",
+                 "stop_index": 4, "eligible_container_tags": ["cold"], "value": 9},
+                {"id": "wedge", "shape_type": "convex_hull",
+                 "dimensions": {"length": "10", "width": "10", "height": "10"},
+                 "hull_vertices": [{"x": "0", "y": "0", "z": "0"}, {"x": "10", "y": "0", "z": "0"},
+                                   {"x": "0", "y": "10", "z": "0"}, {"x": "0", "y": "0", "z": "10"}]},
+                {"id": "pillow", "shape_type": "compressible", "compression_ratio": 0.5,
+                 "max_compression_pressure_kpa": 3,
+                 "dimensions": {"length": "10", "width": "10", "height": "10"}}
+            ],
+            "containers": [{
+                "id": "box", "inner_dimensions": {"length": "100", "width": "100", "height": "100"},
+                "outer_dimensions": {"length": "110", "width": "110", "height": "110"},
+                "tare_weight": "10", "max_payload": "1000", "cost_minor": 5, "quantity": 2,
+                "obstacles": [{"id": "post", "origin": {"x": "1", "y": "2", "z": "3"},
+                               "dimensions": {"length": "5", "width": "5", "height": "5"},
+                               "additional_boxes": [{"dimensions": {"length": "1", "width": "1", "height": "1"}}]}],
+                "tags": ["cold"], "max_items": 4, "metadata": {"dock": 2},
+                "axles": [{"position": "10", "max_load": "500"}, {"position": "90"}],
+                "void_fill_reserve_ratio": 0.1, "tag_limits": {"a": 2},
+                "max_stack_density": "100",
+                "rate_table": {"weight_brackets_g": [100, 200], "prices_minor": [5, 9],
+                               "minimum_charge_minor": 1, "fuel_surcharge_permille": 2},
+                "access_directions": ["+x", "-x"]
+            }],
+            "fixed_placements": [{"item_type": "cup", "container_type": "box",
+                                  "container_instance": 1, "orientation": "LWH",
+                                  "position": {"x": "0", "y": "0", "z": "0"}}]
+        })))
+        .expect("every field is admissible");
+        assert_eq!(request.output_length_unit, "cm");
+        assert_eq!(
+            request
+                .config
+                .effort_budget
+                .and_then(|budget| budget.max_restarts),
+            Some(4)
+        );
+        assert_eq!(
+            request.items[0].allowed_rotations,
+            Rotation::UPRIGHT.to_vec()
+        );
+        assert_eq!(request.items.len(), 3);
+        assert_eq!(request.containers[0].access_directions, ["+x", "-x"]);
+        assert_eq!(request.fixed_placements.len(), 1);
+        validate_request(&request).expect("the built model is consistent");
+    }
+
+    #[test]
+    fn every_builder_refuses_a_value_of_the_wrong_shape() {
+        for (request, expected) in [
+            (
+                json!({"items": {}, "containers": []}),
+                "items must be an array",
+            ),
+            (
+                json!({"items": [], "containers": {}}),
+                "containers must be an array",
+            ),
+            (
+                json!({"items": [], "containers": [], "catalog_versions_used": {}}),
+                "catalog_versions_used must be an array",
+            ),
+        ] {
+            assert!(refusal(parse_request(&object(request))).contains(expected));
+        }
+        assert!(refusal(parse_item(&json!(1), "mm")).contains("item must be object"));
+        assert!(refusal(parse_container(&json!(1), "mm")).contains("container must be object"));
+        assert!(
+            item(json!({"shape_type": "convex_hull", "hull_vertices": {}}))
+                .contains("must be an array")
+        );
+        assert!(
+            item(json!({"shape_type": "convex_hull", "hull_vertices": [{"x": "0", "y": "0"}]}))
+                .contains("entry needs z")
+        );
+        assert!(item(json!({"shape_type": "convex_hull"})).contains("requires hull_vertices"));
+        let flat = item(
+            json!({"shape_type": "convex_hull", "hull_vertices": [{"x": "0", "y": "0", "z": "0"}]}),
+        );
+        assert!(!flat.is_empty(), "a single vertex encloses no volume");
+        assert!(container(json!({"rate_table": []})).contains("rate_table must be an object"));
+        assert!(
+            container(json!({"rate_table": {"weight_brackets_g": [1], "prices_minor": [1], "minimum_charge_minor": -1}}))
+                .contains("minimum_charge_minor")
+        );
+        assert!(container(json!({"axles": {}})).contains("axles must be an array"));
+        assert!(container(json!({"axles": [1, 2]})).contains("axle must be object"));
+        assert!(container(json!({"axles": [{}, {}]})).contains("axle.position is required"));
+        assert!(container(json!({"obstacles": [1]})).contains("obstacle must be object"));
+        assert!(container(json!({"id": ""})).contains("missing id"));
+        assert!(refusal(parse_fixed_placement(&json!(1), "mm")).contains("must be object"));
+        assert!(
+            refusal(parse_fixed_placement(
+                &json!({"container_instance": "one"}),
+                "mm"
+            ))
+            .contains("counts from 1")
+        );
+        for (dimensions, expected) in [
+            (json!(1), "dimensions must be object"),
+            (json!({"width": "1", "height": "1"}), "missing length"),
+            (json!({"length": "1", "height": "1"}), "missing width"),
+            (json!({"length": "1", "width": "1"}), "missing height"),
+        ] {
+            assert!(refusal(parse_dimensions(Some(&dimensions), "mm")).contains(expected));
+        }
+    }
+
+    /// Every `?` in the builders forwards a refusal from a field parser; one bad value per
+    /// field walks each of them.
+    #[test]
+    fn a_bad_value_in_any_field_is_forwarded() {
+        for extra in [
+            json!({"id": ""}),
+            json!({"dimensions": 1}),
+            json!({"nesting_height": "x"}),
+            json!({"weight": "x"}),
+            json!({"quantity": 0}),
+            json!({"max_top_load": "x"}),
+            json!({"max_stacked_items": -1}),
+            json!({"ground_contact_rule": 1}),
+            json!({"shape_type": "convex_hull", "hull_vertices": [{"x": "x", "y": "0", "z": "0"}]}),
+        ] {
+            assert!(!item(extra.clone()).is_empty(), "{extra}");
+        }
+        for extra in [
+            json!({"id": ""}),
+            json!({"inner_dimensions": 1}),
+            json!({"outer_dimensions": 1}),
+            json!({"tare_weight": "x"}),
+            json!({"max_payload": "x"}),
+            json!({"cost_minor": -1}),
+            json!({"quantity": 0}),
+            json!({"max_items": 0}),
+            json!({"max_stack_density": "x"}),
+            json!({"access_directions": "x"}),
+            json!({"rate_table": {"weight_brackets_g": [1], "prices_minor": [1], "fuel_surcharge_permille": -1}}),
+            json!({"axles": [{"position": "1", "max_load": "x"}, {"position": "2"}]}),
+            json!({"axles": [{"position": "1"}, {"position": "x"}]}),
+            json!({"obstacles": [{"dimensions": {"length": "1", "width": "1", "height": "1"}}]}),
+            json!({"obstacles": [{"id": "o", "origin": {"x": "x"}, "dimensions": {"length": "1", "width": "1", "height": "1"}}]}),
+            json!({"obstacles": [{"id": "o", "origin": {"y": "x"}, "dimensions": {"length": "1", "width": "1", "height": "1"}}]}),
+            json!({"obstacles": [{"id": "o", "origin": {"z": "x"}, "dimensions": {"length": "1", "width": "1", "height": "1"}}]}),
+            json!({"obstacles": [{"id": "o", "dimensions": 1}]}),
+        ] {
+            assert!(!container(extra.clone()).is_empty(), "{extra}");
+        }
+        for extra in [
+            json!({"objective": "shipping_cost"}),
+            json!({"time_limit_ms": 0}),
+            json!({"alternatives": 0}),
+            json!({"max_containers": 0}),
+            json!({"clearance": "x"}),
+            json!({"exact_item_limit": 0}),
+            json!({"multi_start_orders": 0}),
+            json!({"effort_budget": {"max_candidates_evaluated": 0}}),
+            json!({"effort_budget": {"max_placement_attempts": 0}}),
+            json!({"effort_budget": {"max_restarts": 0}}),
+        ] {
+            assert!(!config(extra.clone()).is_empty(), "{extra}");
+        }
+        for placement in [
+            json!({"container_type": "c", "orientation": "LWH"}),
+            json!({"item_type": "a", "orientation": "LWH"}),
+            json!({"item_type": "a", "container_type": "c", "orientation": "LWH", "position": {"x": "x"}}),
+        ] {
+            assert!(
+                !refusal(parse_fixed_placement(&placement, "mm")).is_empty(),
+                "{placement}"
+            );
+        }
+        let items =
+            json!([{"id": "a", "dimensions": {"length": "1", "width": "1", "height": "1"}}]);
+        for (bad_items, fixed) in [
+            (json!([1]), json!([])),
+            (items.clone(), json!("x")),
+            (
+                items,
+                json!([{"item_type": "a", "container_type": "c", "orientation": "LWH",
+                            "position": {"x": "1/0"}}]),
+            ),
+        ] {
+            let request = json!({"items": bad_items, "containers": [], "fixed_placements": fixed});
+            assert!(!refusal(parse_request(&object(request))).is_empty());
+        }
+        for request in [
+            json!({"items": [], "containers": [1]}),
+            json!({"items": [], "containers": [], "catalog_versions_used": [1]}),
+        ] {
+            assert!(!refusal(parse_request(&object(request))).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_built_request_needs_items_nesting_and_obstacles_that_fit() {
+        let mut empty = valid_request();
+        empty.items.clear();
+        assert!(refusal(validate_request(&empty)).contains("items and containers are required"));
+
+        let mut nested = valid_request();
+        nested.items[0].nesting_height = Some(nested.items[0].dimensions.height);
+        assert!(refusal(validate_request(&nested)).contains("invalid nesting_height"));
+
+        let mut blocked = valid_request();
+        let outside = Aabb {
+            origin: Point { x: 0, y: 0, z: 0 },
+            dimensions: Dimensions {
+                length: Length(i64::MAX / 4),
+                width: Length(1),
+                height: Length(1),
+            },
+        };
+        blocked.containers[0].obstacles.push(Obstacle {
+            id: "wall".into(),
+            box_: outside,
+            additional_boxes: Vec::new(),
+        });
+        assert!(refusal(validate_request(&blocked)).contains("obstacle wall outside c"));
+    }
+
+    #[test]
+    fn null_stripping_leaves_non_objects_alone() {
+        assert_eq!(without_null_optionals(&json!(5)), json!(5));
+        assert_eq!(
+            without_null_optionals(&json!({"configuration": 3, "items": [1]})),
+            json!({"configuration": 3, "items": [1]})
+        );
+    }
+
+    #[test]
+    fn the_unsupported_field_guard_skips_entries_that_are_not_objects() {
+        assert!(reject_unsupported(&object(json!({"items": [1], "containers": [2]}))).is_ok());
     }
 }

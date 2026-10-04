@@ -30,7 +30,7 @@ mod units;
 mod validation;
 mod value_text;
 
-pub use api::{pack_json, pack_request, rebalance_json};
+pub use api::{ExecutionOptions, pack_json, pack_json_with, pack_request, rebalance_json};
 pub use deadline::{Clock, Deadline};
 pub use error::{PackError, PackResult, RequestError};
 pub use explain::{

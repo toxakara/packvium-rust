@@ -81,7 +81,7 @@ fn entry_shape_fault(entry: &Value, place: &str, field: &str, unit: &str) -> Opt
     let unknown = unknown_keys(map, &FIELDS);
     if !unknown.is_empty() {
         return fault(
-            format!("{place} does not carry {}", spell_names(&unknown)),
+            format!("{place} cannot carry {}", spell_names(&unknown)),
             field,
         );
     }
@@ -139,7 +139,7 @@ fn point_shape_fault(point: &Value, place: &str, field: &str) -> Option<Fault> {
     let unknown = unknown_keys(map, &AXES);
     if !unknown.is_empty() {
         return fault(
-            format!("{place} does not carry {}", spell_names(&unknown)),
+            format!("{place} cannot carry {}", spell_names(&unknown)),
             field,
         );
     }

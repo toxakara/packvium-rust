@@ -561,7 +561,8 @@ pub fn find_candidates_at_points(
                 state
                     .spatial_index
                     .query(envelope_box)
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .any(|index| {
                         metrics.collision_checks = metrics.collision_checks.saturating_add(1);
                         let existing = &state.packed.placements[index];
@@ -2502,24 +2503,16 @@ struct ContainerBeamNode {
     unplaced: Vec<ItemInstance>,
 }
 
-fn count_with_capacity(sorted_costs: &[i128], capacity: i128) -> usize {
-    let mut used = 0_i128;
-    sorted_costs
-        .iter()
-        .take_while(|cost| {
-            if used.saturating_add(**cost) > capacity {
-                false
-            } else {
-                used = used.saturating_add(**cost);
-                true
-            }
-        })
-        .count()
+/// How many of the cheapest costs fit in `capacity`, read off their prefix sums. Costs are
+/// non-negative, so the sums never decrease and the count is one binary search: `O(log f)`
+/// per node instead of the `O(f)` walk.
+fn count_with_capacity(cumulative_costs: &[i128], capacity: i128) -> usize {
+    cumulative_costs.partition_point(|&used| used <= capacity)
 }
 
-/// The future items' costs, sorted once for a whole beam step rather than per node: the
-/// bound below reads them for every node in the beam, and sorting them there was the loop's
-/// own cost, not the search's.
+/// Prefix sums of the future items' ascending costs, built once for a whole beam step rather
+/// than per node: the bound below reads them for every node in the beam, and sorting them
+/// there was the loop's own cost, not the search's.
 struct PrecomputedFuture {
     volumes: Option<Vec<i128>>,
     weights: Option<Vec<i128>>,
@@ -2540,9 +2533,9 @@ impl PrecomputedFuture {
         let volumes = future
             .iter()
             .all(|item| item.item.nesting_height.is_none())
-            .then(|| sorted(future.iter().map(|item| item.item.dimensions.volume())));
+            .then(|| cumulative(future.iter().map(|item| item.item.dimensions.volume())));
         let weights =
-            weighed.then(|| sorted(future.iter().map(|item| i128::from(item.item.weight.0))));
+            weighed.then(|| cumulative(future.iter().map(|item| i128::from(item.item.weight.0))));
         Self {
             volumes,
             weights,
@@ -2551,9 +2544,14 @@ impl PrecomputedFuture {
     }
 }
 
-fn sorted(costs: impl Iterator<Item = i128>) -> Vec<i128> {
+fn cumulative(costs: impl Iterator<Item = i128>) -> Vec<i128> {
     let mut costs: Vec<i128> = costs.collect();
     costs.sort_unstable();
+    let mut used = 0_i128;
+    for cost in &mut costs {
+        used = used.saturating_add(*cost);
+        *cost = used;
+    }
     costs
 }
 
@@ -3262,6 +3260,28 @@ pub(super) fn explain_unfit(request: &PackingRequest, item: &ItemInstance) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_sum_count_is_the_largest_cardinality_the_resource_admits() {
+        let cases: [&[i128]; 4] = [&[2, 3, 5], &[1, 4, 4, 9], &[3, 3, 3, 7, 8], &[0, 0, 2, 6]];
+        for costs in cases {
+            let prefix = cumulative(costs.iter().copied());
+            for capacity in 0..=costs.iter().sum::<i128>() {
+                let exact = (0_u32..1 << costs.len())
+                    .filter(|mask| {
+                        (0..costs.len())
+                            .filter(|bit| mask & (1 << bit) != 0)
+                            .map(|bit| costs[bit])
+                            .sum::<i128>()
+                            <= capacity
+                    })
+                    .map(|mask| mask.count_ones() as usize)
+                    .max()
+                    .unwrap_or(0);
+                assert_eq!(count_with_capacity(&prefix, capacity), exact);
+            }
+        }
+    }
 
     fn dimensions(length: i64, width: i64, height: i64) -> Dimensions {
         Dimensions {

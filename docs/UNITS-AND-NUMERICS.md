@@ -8,7 +8,7 @@ One internal length tick is `1/16000 mm`.
 - `1 international inch = 25.4 mm = 406,400 ticks`
 - common fractional inches through at least `1/128 in` are exact integers
 
-Accepted inputs include integers, decimal strings, fractions (`3/16`) and mixed fractions (`12 3/8`), with `mm`, `cm`, `m`, `in`, `ft`, and ticks. Binary floating-point input is intentionally rejected by the Python API; PHP type declarations accept only integer/string/structured values.
+Accepted inputs include integers, decimal strings, fractions (`3/16`) and mixed fractions (`12 3/8`), with `mm`, `cm`, `m`, `in`, `ft`, and ticks. A binary float with a fractional part is intentionally rejected by the Python API, by `Length` and `Weight` alike (`TypeError`); an integral float such as `100.0` is exact, and is what JavaScript sends for `100`, so it is accepted as that integer. PHP type declarations accept only integer/string/structured values.
 
 ## Weight
 

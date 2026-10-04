@@ -18,8 +18,11 @@
 //! `registry_and_nested.rs` records: an in-file module counts towards its own file's
 //! coverage, which is the inflation the instrument exists to avoid.
 
+mod support;
+
+use packvium_core::ItemInstance;
 use packvium_core::bounds::{
-    Bounds, ContainerType, Instance, MAX_BOUND_SUM, MAX_BOUND_VALUE, from_reduced,
+    Bounds, ContainerType, Instance, MAX_BOUND_SUM, MAX_BOUND_VALUE, compute, from_reduced,
 };
 
 fn instance(volume: i128) -> Instance {
@@ -152,4 +155,102 @@ fn no_key_of_a_bound_is_ever_negative() {
             assert!(*key >= 0, "key {index} of {bounds:?} is negative");
         }
     }
+}
+
+/// `compute` is `from_reduced` over the engine's own objects; the reduction is what is
+/// checked here, by comparing the two on the same request.
+#[test]
+fn computing_from_engine_objects_matches_the_reduced_form() {
+    let mut item = support::item("cube");
+    item.quantity = 2;
+    let instances = (1..=2)
+        .map(|sequence| ItemInstance {
+            item: item.clone(),
+            sequence,
+        })
+        .collect::<Vec<_>>();
+    let container = support::container();
+    let reduced = from_reduced(
+        &[Instance {
+            volume: item.dimensions.volume(),
+            weight: i128::from(item.weight.0),
+            shrinks: false,
+        }; 2],
+        &[ContainerType {
+            usable: container.inner_dimensions.volume(),
+            inner: container.inner_dimensions.volume(),
+            base_area: container.inner_dimensions.base_area(),
+            height: i128::from(container.inner_dimensions.height.0),
+            payload: None,
+            max_items: None,
+            quantity: None,
+            cost_minor: 0,
+        }],
+    );
+    assert_eq!(compute(&instances, &[container]), reduced);
+}
+
+/// A declared inventory multiplies a per-container capacity; both the multiplication and
+/// the running sum are refused past the ceiling rather than wrapped.
+#[test]
+fn an_inventory_capacity_past_the_ceiling_is_refused() {
+    let counted = |usable: i128, quantity: i128| ContainerType {
+        quantity: Some(quantity),
+        ..roomy(usable)
+    };
+    for container in [
+        counted(i128::MAX / 2, 3),
+        counted(MAX_BOUND_SUM / 2 + 1, 2),
+        ContainerType {
+            payload: Some(i128::MAX / 2),
+            ..counted(1_000, 3)
+        },
+    ] {
+        let error = from_reduced(&[instance(1_000)], &[container])
+            .expect_err("an overflowing capacity is refused");
+        assert!(error.to_string().contains("container capacity"), "{error}");
+    }
+}
+
+/// A container type with no floor or no volume makes the geometric keys vacuous rather than
+/// dividing by zero.
+#[test]
+fn a_degenerate_container_type_leaves_the_geometric_keys_at_zero() {
+    let flat = ContainerType {
+        base_area: 0,
+        ..roomy(10_000)
+    };
+    let hollow = ContainerType {
+        inner: 0,
+        usable: 0,
+        ..roomy(0)
+    };
+    for containers in [vec![flat], vec![hollow, roomy(10_000)]] {
+        let bounds = from_reduced(&[instance(1_000)], &containers).expect("answerable");
+        assert_eq!(bounds.stack_height_ppm.min(bounds.unused_volume_ppm), 0);
+    }
+}
+
+/// Two volumes whose running sum wraps `i128` are refused by the checked addition, not the
+/// ceiling, because the first stays under it.
+#[test]
+fn a_sum_that_would_wrap_is_refused_before_it_can() {
+    let error = from_reduced(&[instance(1), instance(i128::MAX)], &[roomy(10_000)])
+        .expect_err("a wrapping sum is refused");
+    assert!(
+        error.to_string().contains("overflows the exact range"),
+        "{error}"
+    );
+}
+
+#[test]
+fn computing_reads_payload_and_item_limits_from_the_container() {
+    let mut container = support::container();
+    container.max_payload = Some(packvium_core::Weight(1_000));
+    container.max_items = Some(1);
+    let instance = ItemInstance {
+        item: support::item("cube"),
+        sequence: 1,
+    };
+    compute(&[instance], &[container]).expect("answerable");
 }

@@ -18,7 +18,17 @@
 use serde_json::{Value, json};
 
 /// Pack one request and print only what the shape changed.
-fn summarise(label: &str, request: Value) {
+fn summarise(label: &str, mut request: Value) {
+    // Counted work bounds the search, so the answer is the same on every host; the time
+    // limit is only a safety fuse against a genuine hang.
+    request["configuration"] = json!({
+        "time_limit_ms": 60000,
+        "effort_budget": {
+            "max_candidates_evaluated": 1000000,
+            "max_placement_attempts": 1000000,
+            "max_search_nodes": 1000000
+        }
+    });
     let packed = packvium_core::pack_json(&request.to_string()).expect("well-formed request");
     let result: Value = serde_json::from_str(&packed).expect("the engine answers JSON");
     let containers = result["containers"].as_array().map_or(0, Vec::len);

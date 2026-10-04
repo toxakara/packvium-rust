@@ -276,20 +276,8 @@ pub(crate) fn subtract_all(
         .collect::<Vec<_>>();
     let mut result = Vec::with_capacity(pieces.len());
     for (index, (space, is_new)) in pieces.iter().enumerate() {
-        if *is_new {
-            let candidate = extents[index];
-            let dominated = extents.iter().enumerate().any(|(other_index, other)| {
-                other_index != index
-                    && other[0] <= candidate[0]
-                    && other[1] <= candidate[1]
-                    && other[2] <= candidate[2]
-                    && candidate[3] <= other[3]
-                    && candidate[4] <= other[4]
-                    && candidate[5] <= other[5]
-            });
-            if dominated {
-                continue;
-            }
+        if *is_new && is_contained(&extents, index) {
+            continue;
         }
         result.push(*space);
     }
@@ -315,6 +303,27 @@ pub(crate) fn subtract_all(
         });
     }
     result
+}
+
+/// Whether another extent contains `extents[index]`, for extents ordered by origin x.
+///
+/// A container starts at or before what it contains, so the scan stops at the first
+/// extent that starts further along x: `O(prefix)` instead of `O(s)`, with no index to
+/// build.
+fn is_contained(extents: &[[i64; 6]], index: usize) -> bool {
+    let candidate = extents[index];
+    extents
+        .iter()
+        .enumerate()
+        .take_while(|(_, other)| other[0] <= candidate[0])
+        .any(|(other_index, other)| {
+            other_index != index
+                && other[1] <= candidate[1]
+                && other[2] <= candidate[2]
+                && candidate[3] <= other[3]
+                && candidate[4] <= other[4]
+                && candidate[5] <= other[5]
+        })
 }
 
 fn subtract(space: Space, occupied: Aabb) -> Vec<Space> {
