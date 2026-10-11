@@ -190,6 +190,13 @@ impl IndependentValidator {
             if axle_overloaded(&packed.container, &packed.placements, None) {
                 issue(&mut issues, "axle_overloaded", "gross axle limit exceeded");
             }
+            // The girth rule over the envelopes alone; the frame is checked above.
+            if !packed
+                .container
+                .girth_admits(envelope_extent(&packed.placements))
+            {
+                issue(&mut issues, "bag_girth_exceeded", &packed.id());
+            }
             for (tag, maximum) in &packed.container.tag_limits {
                 if tag_counts.get(tag).copied().unwrap_or_default() > *maximum {
                     issue(&mut issues, "tag_count_exceeded", tag);
@@ -338,8 +345,13 @@ fn validate_top_loads_with_graph(
             };
             distributed = distributed.saturating_add(share);
             let support = &container.placements[edge.index].instance.item;
-            if !support.stackable {
-                issue(issues, "non_stackable", &support.id);
+            let upper_group = container.placements[upper_index]
+                .instance
+                .item
+                .stacking_group
+                .as_deref();
+            if let Some(code) = support.stacking_refusal(upper_group) {
+                issue(issues, code, &support.id);
             }
             loads[edge.index] = loads[edge.index].saturating_add(share);
             if let Some(maximum) = support.max_top_load
@@ -507,6 +519,8 @@ mod tests {
             hull_vertices: None,
             compression_ratio_ppm: None,
             max_compression_pressure_kpa: None,
+            stacking_group: None,
+            accepts_stacking_groups: Default::default(),
         };
         let placements = (0..count)
             .map(|index| Placement {
@@ -556,6 +570,8 @@ mod tests {
                 rate_table: None,
                 access_directions: Vec::new(),
                 preloaded: Vec::new(),
+                deformable_boundary: None,
+                made_to_measure: None,
             },
             sequence: 1,
             placements,

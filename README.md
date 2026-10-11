@@ -11,7 +11,7 @@ coordinates and rotations for each item, with a reason for anything that did not
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.5.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.6.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-rust/blob/main/docs/GUARANTEES.md)
@@ -57,6 +57,11 @@ The result is JSON text. Read it with `serde_json` into your own `#[derive(Deser
 structs, naming only the fields you use; [`basic.rs`](https://github.com/toxakara/packvium-rust/blob/main/examples/basic.rs)
 does exactly that. Every length and weight comes back as exact integer `ticks` beside a
 rendered decimal `value`: compute with the ticks, print the value.
+
+Support is not required by default: `minimum_support_ratio` is 0, so an item may rest on
+nothing above the container floor, and the result then says so in `warnings`
+(`unsupported_placements: N placement(s) rest on nothing above the container floor; ...`).
+To require support, set it above 0 — `"configuration": {"minimum_support_ratio": 0.75}` for three quarters of the base.
 
 ## Examples
 
@@ -223,7 +228,7 @@ CodeMeta form.
 @software{packvium_rust,
   author  = {{Packvium contributors}},
   title   = {Packvium for Rust},
-  version = {1.5.0},
+  version = {1.6.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

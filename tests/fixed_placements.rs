@@ -356,6 +356,8 @@ fn domain(quantity: usize, weight_g: i64, boxes: usize) -> PackingRequest {
         hull_vertices: None,
         compression_ratio_ppm: None,
         max_compression_pressure_kpa: None,
+        stacking_group: None,
+        accepts_stacking_groups: Default::default(),
     };
     let container = Container {
         id: "box".into(),
@@ -380,6 +382,8 @@ fn domain(quantity: usize, weight_g: i64, boxes: usize) -> PackingRequest {
         rate_table: None,
         access_directions: Vec::new(),
         preloaded: Vec::new(),
+        deformable_boundary: None,
+        made_to_measure: None,
     };
     PackingRequest {
         items: vec![item],
@@ -621,4 +625,36 @@ fn incompatible_fixed_items_are_refused_by_the_ordinary_validator() {
     data.as_object_mut().unwrap().remove("fixed_placements");
     let result = pack(&data);
     assert_eq!(result["containers"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn a_fixed_set_that_breaks_the_stacking_group_rule_is_refused_before_search() {
+    // Admission runs the validator over the fixed set alone, so the new code arrives with
+    // no admission code of its own.
+    let mut pallet = cube(1);
+    pallet["accepts_stacking_groups"] = json!(["A"]);
+    let mut drum = cube(1);
+    drum["id"] = json!("drum");
+    drum["stacking_group"] = json!("C");
+    let mut on_top = fixed("0", "100", 1);
+    on_top["item_type"] = json!("drum");
+    let data = request(
+        json!([pallet, drum.clone()]),
+        json!([boxes(1)]),
+        json!([fixed("0", "0", 1), on_top.clone()]),
+        json!({}),
+    );
+    assert!(
+        refusal(&data).starts_with("invalid_fixed_placement: stacking_group_incompatible: "),
+        "{}",
+        refusal(&data)
+    );
+    drum["stacking_group"] = json!("A");
+    let accepted = request(
+        json!([pallet, drum]),
+        json!([boxes(1)]),
+        json!([fixed("0", "0", 1), on_top]),
+        json!({}),
+    );
+    assert!(pack_json(&unhurried(&accepted).to_string()).is_ok());
 }

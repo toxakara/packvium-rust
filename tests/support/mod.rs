@@ -45,6 +45,8 @@ pub fn item(id: &str) -> Item {
         hull_vertices: None,
         compression_ratio_ppm: None,
         max_compression_pressure_kpa: None,
+        stacking_group: None,
+        accepts_stacking_groups: Default::default(),
     }
 }
 
@@ -68,6 +70,8 @@ pub fn container() -> Container {
         rate_table: None,
         access_directions: Vec::new(),
         preloaded: Vec::new(),
+        deformable_boundary: None,
+        made_to_measure: None,
     }
 }
 

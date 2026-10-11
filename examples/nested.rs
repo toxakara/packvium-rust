@@ -18,11 +18,10 @@
 //! placements and weights are exact integers.
 
 use packvium_core::{
-    Container, Dimensions, Item, Length, NestedLevel, NestedPackingRequest, PackResult,
-    PackingConfig, PackingRequest, Rotation, ShapeType, SolverProfile, Weight, pack_nested,
+    Container, Dimensions, EffortBudget, Item, Length, NestedLevel, NestedPackingRequest,
+    PackResult, PackingConfig, PackingRequest, SolverProfile, Weight, pack_nested,
 };
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
 
 fn length(text: &str) -> PackResult<Length> {
     Length::parse(&json!(text), "mm")
@@ -40,35 +39,11 @@ fn dimensions(length_mm: &str, width_mm: &str, height_mm: &str) -> PackResult<Di
     })
 }
 
-/// An item with no rule beyond its size, weight and count. Every field is public and has to
-/// be named; these are the values a JSON request gets when it leaves the field out.
+/// An item with no rule beyond its size, weight and count. `Item::new` fills every other
+/// field with the value a JSON request gets when it leaves the field out; to set one, use
+/// struct update syntax: `Item { stackable: false, ..Item::new(id, size, weight, 1) }`.
 fn item(id: &str, size: Dimensions, item_weight: Weight, quantity: usize) -> Item {
-    Item {
-        id: id.into(),
-        dimensions: size,
-        weight: item_weight,
-        quantity,
-        allowed_rotations: Rotation::ALL.to_vec(),
-        stackable: true,
-        must_be_on_floor: false,
-        max_top_load: None,
-        minimum_support_ratio: 0.0,
-        group: None,
-        tags: BTreeSet::new(),
-        incompatible_tags: BTreeSet::new(),
-        priority: 0,
-        metadata: BTreeMap::new(),
-        nesting_height: None,
-        max_stacked_items: None,
-        ground_contact_rule: None,
-        stop_index: None,
-        eligible_container_tags: BTreeSet::new(),
-        value: None,
-        shape_type: ShapeType::RigidCuboid,
-        hull_vertices: None,
-        compression_ratio_ppm: None,
-        max_compression_pressure_kpa: None,
-    }
+    Item::new(id, size, item_weight, quantity)
 }
 
 struct ContainerSpec<'a> {
@@ -82,41 +57,28 @@ struct ContainerSpec<'a> {
 
 fn container(spec: ContainerSpec<'_>) -> Container {
     Container {
-        id: spec.id.into(),
-        inner_dimensions: spec.inner,
         outer_dimensions: spec.outer,
         tare_weight: spec.tare,
         max_payload: Some(spec.max_payload),
         cost_minor: spec.cost_minor,
-        quantity: None,
-        obstacles: Vec::new(),
-        tags: BTreeSet::new(),
-        max_items: None,
-        metadata: BTreeMap::new(),
-        axles: None,
-        void_fill_reserve_ppm: 0,
-        tag_limits: BTreeMap::new(),
-        max_stack_density: None,
-        rate_table: None,
-        access_directions: Vec::new(),
-        preloaded: Vec::new(),
+        ..Container::new(spec.id, spec.inner)
     }
 }
 
 /// Counted work bounds the search, so each level gives the same answer on every host; the
 /// time limit is only a safety fuse. One deterministic start is plenty for this scene.
 fn configuration() -> PackingConfig {
-    let mut config = PackingConfig {
+    PackingConfig {
         profile: SolverProfile::Fast,
         time_limit_ms: 60_000,
+        effort_budget: Some(EffortBudget {
+            max_candidates_evaluated: Some(1_000_000),
+            max_placement_attempts: Some(1_000_000),
+            max_search_nodes: Some(1_000_000),
+            ..EffortBudget::default()
+        }),
         ..PackingConfig::default()
-    };
-    let mut budget = config.effort_budget.unwrap_or_default();
-    budget.max_candidates_evaluated = Some(1_000_000);
-    budget.max_placement_attempts = Some(1_000_000);
-    budget.max_search_nodes = Some(1_000_000);
-    config.effort_budget = Some(budget);
-    config
+    }
 }
 
 fn request(items: Vec<Item>, containers: Vec<Container>) -> PackingRequest {

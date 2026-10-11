@@ -105,6 +105,125 @@ fn an_undeclared_value_leaves_the_ordering_untouched() {
     );
 }
 
+/// One large box that fills the container's footprint, and small boxes that can only
+/// use the same space without it: eight of them, for less volume than the large one.
+fn large_against_small(objective: &str, small_quantity: usize, profile: &str) -> Value {
+    solve(json!({
+        "units": {"length": "mm"},
+        "configuration": {"objective": objective, "solver_profile": profile},
+        "items": [
+            {"id": "large", "dimensions": {"length": "100", "width": "100", "height": "90"}},
+            {"id": "small", "quantity": small_quantity,
+             "dimensions": {"length": "40", "width": "40", "height": "40"}}
+        ],
+        "containers": [{"id": "c", "quantity": 1,
+                        "inner_dimensions": {"length": "100", "width": "100", "height": "100"}}]
+    }))
+}
+
+fn placed_types(result: &Value) -> Vec<String> {
+    result["containers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|container| container["placements"].as_array().unwrap())
+        .map(|placement| placement["item_type"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// `algorithm.duration_ms` is wall clock, on the answer and on every alternative; nothing
+/// else in a result may differ between two runs of one request.
+fn without_wall_clock(mut result: Value) -> Value {
+    for alternative in result["alternatives"].as_array_mut().into_iter().flatten() {
+        alternative["algorithm"]
+            .as_object_mut()
+            .unwrap()
+            .remove("duration_ms");
+    }
+    result["algorithm"]
+        .as_object_mut()
+        .unwrap()
+        .remove("duration_ms");
+    result
+}
+
+#[test]
+fn maximum_volume_scores_the_share_of_requested_volume_left_unpacked() {
+    // One of two equal cubes stays behind: half the requested volume, one piece, and
+    // the default objective's container count, cost and unused volume after them.
+    let result = solve(json!({
+        "configuration": {"objective": "maximum_volume", "max_containers": 1},
+        "items": [{"id": "a", "quantity": 2,
+                   "dimensions": {"length": "50", "width": "50", "height": "50"}}],
+        "containers": [{"id": "c", "cost_minor": 7,
+                        "inner_dimensions": {"length": "50", "width": "50", "height": "50"}}]
+    }));
+    assert_eq!(result["objective"], "maximum_volume");
+    assert_eq!(result["score"], json!([500_000, 1, 1, 7, 0]));
+}
+
+#[test]
+fn maximum_volume_rounds_a_tiny_remainder_up_and_scores_a_complete_answer_zero() {
+    // A freight container's cubic ticks overflow 64 bits, and one stray millimetre cube
+    // is far less than a millionth of the load. It must still not score as complete.
+    let request = |tiny_quantity: usize| {
+        json!({
+            "units": {"length": "mm"},
+            "configuration": {"objective": "maximum_volume"},
+            "items": [
+                {"id": "load", "allowed_rotations": ["LWH"],
+                 "dimensions": {"length": "12000", "width": "2300", "height": "2400"}},
+                {"id": "tiny", "quantity": tiny_quantity,
+                 "dimensions": {"length": "1", "width": "1", "height": "1"}}
+            ],
+            "containers": [{"id": "c", "quantity": tiny_quantity,
+                            "inner_dimensions": {"length": "12000", "width": "2300", "height": "2400"}}]
+        })
+    };
+
+    let incomplete = solve(request(1));
+    assert_eq!(placed_types(&incomplete), ["load"]);
+    assert_eq!(incomplete["score"], json!([1, 1, 1, 0, 0]));
+
+    let complete = solve(request(2));
+    assert_eq!(complete["summary"]["unpacked_item_count"], 0);
+    assert_eq!(complete["score"][0], 0);
+    assert_eq!(complete["score"][1], 0);
+}
+
+#[test]
+fn maximum_volume_keeps_the_large_box_where_the_default_keeps_more_pieces() {
+    // Within `exact_item_limit` the exhaustive search answers, so this holds both
+    // objectives to their optimum: one box of 900 000 mm3 against five of 64 000.
+    let by_volume = large_against_small("maximum_volume", 5, "balanced");
+    assert_eq!(placed_types(&by_volume), ["large"]);
+    assert_eq!(by_volume["summary"]["unpacked_item_count"], 5);
+
+    let by_count = large_against_small("default", 5, "balanced");
+    assert_eq!(placed_types(&by_count), ["small"; 5]);
+    assert_eq!(by_count["unpacked_items"][0]["item_type"], "large");
+}
+
+#[test]
+fn maximum_volume_steers_the_heuristic_search_as_well_as_the_exact_one() {
+    // Eleven instances are past `exact_item_limit`, so orderings, the beam and the block
+    // solver decide. Eight small boxes fit without the large one: 512 000 mm3 to 900 000.
+    let by_volume = large_against_small("maximum_volume", 10, "quality");
+    assert_eq!(placed_types(&by_volume), ["large"]);
+    assert_eq!(by_volume["score"], json!([415_585, 10, 1, 0, 100_000]));
+
+    let by_count = large_against_small("default", 10, "quality");
+    assert_eq!(placed_types(&by_count), ["small"; 8]);
+    assert_eq!(by_count["score"][0], 3);
+}
+
+#[test]
+fn maximum_volume_gives_one_answer_for_one_request() {
+    let first = large_against_small("maximum_volume", 10, "quality");
+    let second = large_against_small("maximum_volume", 10, "quality");
+    assert_eq!(without_wall_clock(first), without_wall_clock(second));
+}
+
 #[test]
 fn an_item_with_no_stop_never_buries_one_that_has_a_stop() {
     // `route_contact_allowed` used to wave through any pair where either
@@ -493,4 +612,179 @@ fn an_unknown_future_result_fact_round_trips_verbatim() {
     let raw = json!({"code": "node_limit", "limit": 10_000});
     let fact = ResultFact::from_json(&raw).expect("open result fact should parse");
     assert_eq!(fact.to_json(), raw);
+}
+
+// ------------------------------------------------------------ stacking groups
+
+fn sorted_types(result: &Value) -> Vec<String> {
+    let mut types = placed_types(result);
+    types.sort();
+    types
+}
+
+fn two_tier(lower: Value, upper: Value) -> Value {
+    let mut lower_item = json!({"id": "lower", "must_be_on_floor": true,
+        "dimensions": {"length": "100", "width": "100", "height": "100"}});
+    let mut upper_item = json!({"id": "upper",
+        "dimensions": {"length": "100", "width": "100", "height": "100"}});
+    for (target, extra) in [(&mut lower_item, lower), (&mut upper_item, upper)] {
+        for (key, value) in extra.as_object().unwrap() {
+            target[key] = value.clone();
+        }
+    }
+    solve(json!({
+        "items": [lower_item, upper_item],
+        "containers": [{"id": "crate", "quantity": 1,
+            "inner_dimensions": {"length": "100", "width": "100", "height": "200"}}]
+    }))
+}
+
+#[test]
+fn stacking_groups_admit_an_accepted_group_and_refuse_an_omitted_one() {
+    let lower = json!({"stacking_group": "A", "accepts_stacking_groups": ["A", "B"]});
+    assert_eq!(
+        sorted_types(&two_tier(lower.clone(), json!({"stacking_group": "B"}))),
+        ["lower", "upper"]
+    );
+    assert_eq!(
+        sorted_types(&two_tier(lower, json!({"stacking_group": "C"}))),
+        ["lower"]
+    );
+}
+
+#[test]
+fn stacking_groups_treat_an_empty_list_as_open_and_a_non_empty_one_as_closed() {
+    for lower in [
+        json!({}),
+        json!({"accepts_stacking_groups": null}),
+        json!({"accepts_stacking_groups": []}),
+    ] {
+        assert_eq!(
+            sorted_types(&two_tier(lower, json!({}))),
+            ["lower", "upper"]
+        );
+    }
+    assert_eq!(
+        sorted_types(&two_tier(
+            json!({"accepts_stacking_groups": ["A"]}),
+            json!({})
+        )),
+        ["lower"]
+    );
+    assert_eq!(
+        sorted_types(&two_tier(
+            json!({"accepts_stacking_groups": ["B"]}),
+            json!({"stacking_group": "b"})
+        )),
+        ["lower"]
+    );
+}
+
+#[test]
+fn stacking_groups_yield_to_non_stackable() {
+    let lower = json!({"stackable": false, "accepts_stacking_groups": ["B"]});
+    assert_eq!(
+        sorted_types(&two_tier(lower, json!({"stacking_group": "B"}))),
+        ["lower"]
+    );
+}
+
+#[test]
+fn stacking_groups_require_every_supporter_of_a_bridge_to_accept() {
+    let request = |accepts: Value| {
+        json!({
+            "items": [
+                {"id": "left", "must_be_on_floor": true, "allowed_rotations": ["LWH"],
+                 "accepts_stacking_groups": accepts,
+                 "dimensions": {"length": "50", "width": "100", "height": "100"}},
+                {"id": "right", "must_be_on_floor": true, "allowed_rotations": ["LWH"],
+                 "dimensions": {"length": "50", "width": "100", "height": "100"}},
+                {"id": "wide", "keep_upright": true, "stacking_group": "B",
+                 "dimensions": {"length": "100", "width": "100", "height": "40"}}
+            ],
+            "containers": [{"id": "crate", "quantity": 1,
+                "inner_dimensions": {"length": "100", "width": "100", "height": "140"}}]
+        })
+    };
+    assert_eq!(
+        sorted_types(&solve(request(json!(["A"])))),
+        ["left", "right"]
+    );
+    assert_eq!(
+        sorted_types(&solve(request(json!(["B"])))),
+        ["left", "right", "wide"]
+    );
+}
+
+#[test]
+fn stacking_groups_judge_a_candidate_slid_under_a_fixed_item_by_its_own_list() {
+    let request = |accepts: Value| {
+        json!({
+            "items": [
+                {"id": "drum", "stacking_group": "C",
+                 "dimensions": {"length": "100", "width": "100", "height": "50"}},
+                {"id": "crate", "accepts_stacking_groups": accepts,
+                 "dimensions": {"length": "100", "width": "100", "height": "100"}}
+            ],
+            "containers": [{"id": "bay", "quantity": 1,
+                "inner_dimensions": {"length": "100", "width": "100", "height": "150"}}],
+            "fixed_placements": [{"item_type": "drum", "container_type": "bay",
+                "orientation": "LWH", "position": {"x": "0", "y": "0", "z": "100"}}]
+        })
+    };
+    assert_eq!(sorted_types(&solve(request(json!(["A"])))), ["drum"]);
+    assert_eq!(
+        sorted_types(&solve(request(json!(["C"])))),
+        ["crate", "drum"]
+    );
+}
+
+#[test]
+fn stacking_groups_need_a_nesting_item_to_accept_its_own_group() {
+    let request = |accepts: Value| {
+        json!({
+            "configuration": {"solvers": ["extreme_points"]},
+            "items": [{"id": "tote", "quantity": 3, "nesting_height": "5",
+                "allowed_rotations": ["LWH"], "stacking_group": "T",
+                "accepts_stacking_groups": accepts,
+                "dimensions": {"length": "10", "width": "10", "height": "10"}}],
+            "containers": [{"id": "rack", "quantity": 1,
+                "inner_dimensions": {"length": "10", "width": "10", "height": "20"}}]
+        })
+    };
+    assert_eq!(placed_types(&solve(request(json!(["U"])))).len(), 1);
+    assert_eq!(placed_types(&solve(request(json!(["T"])))).len(), 3);
+}
+
+#[test]
+fn stacking_groups_cap_the_grid_lattice_when_a_type_refuses_its_own_group() {
+    let request = |accepts: Value| {
+        json!({
+            "configuration": {"solver_profile": "fast"},
+            "items": [{"id": "tile", "quantity": 8, "stacking_group": "A",
+                "accepts_stacking_groups": accepts,
+                "dimensions": {"length": "40", "width": "40", "height": "40"}}],
+            "containers": [{"id": "box", "quantity": 1,
+                "inner_dimensions": {"length": "100", "width": "100", "height": "100"}}]
+        })
+    };
+    assert_eq!(placed_types(&solve(request(json!(["B"])))).len(), 4);
+    assert_eq!(placed_types(&solve(request(json!(["A"])))).len(), 8);
+}
+
+#[test]
+fn stacking_groups_make_the_block_solver_delegate() {
+    let result = solve(json!({
+        "configuration": {"solver_profile": "quality", "solvers": ["homogeneous_blocks"]},
+        "items": [
+            {"id": "a", "allowed_rotations": ["LWH"], "stacking_group": "A",
+             "accepts_stacking_groups": ["A"],
+             "dimensions": {"length": "100", "width": "100", "height": "50"}},
+            {"id": "b", "quantity": 8, "stacking_group": "B",
+             "dimensions": {"length": "50", "width": "50", "height": "50"}}
+        ],
+        "containers": [{"id": "cube", "quantity": 1,
+            "inner_dimensions": {"length": "200", "width": "100", "height": "100"}}]
+    }));
+    assert_eq!(placed_types(&result).len(), 9);
 }

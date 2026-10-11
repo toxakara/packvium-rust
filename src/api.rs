@@ -3,6 +3,7 @@ use crate::error::{PackError, PackResult, RequestError};
 use crate::fixed;
 use crate::geometry::{ALL_DIRECTIONS, Aabb, Dimensions, Point, Rotation, ShapeType};
 use crate::hull::{self, Vertex};
+use crate::made_to_measure::{MAX_EXACT_INTEGER, MadeToMeasure, sides_of};
 use crate::model::*;
 use crate::policy::{PolicyConstraint, PolicyRuleSet};
 use crate::rebalance::rebalance_weight;
@@ -43,11 +44,11 @@ pub fn pack_json_with(input: &str, options: ExecutionOptions) -> PackResult<Stri
     let mut request = request_from_json(&value)?;
     request.config.parallel = options.parallel;
     let result = pack_request_with_policy(&request, &PolicyRuleSet::parse(value.get("policy"))?)?;
-    Ok(serde_json::to_string(&result.to_json(
+    Ok(result.to_json_string(
         &request.output_length_unit,
         &request.output_weight_unit,
         true,
-    ))?)
+    )?)
 }
 
 /// Rebalance an already-produced canonical result without routing through a
@@ -422,6 +423,7 @@ pub fn pack_request_with_policy(
     };
     let mut result = registry.solve(request)?;
     cite_policy_rejections(&mut result, request, policy);
+    cite_limit_rejections(&mut result, request);
     result.catalog_versions_used = request.catalog_versions_used.clone();
     // Independent validation re-derives every guarantee from per-item placements.
     // A container built by GridSolver's compact fast path carries a
@@ -468,7 +470,37 @@ pub fn pack_request_with_policy(
     result.alternatives.retain(|alternative| {
         crate::solvers::unpriceable_container(&alternative.containers, &request.config).is_none()
     });
+    warn_unsupported_placements(&mut result, request.config.minimum_support_ratio);
     Ok(result)
+}
+
+/// Appends the warning to a result and, by the same rule, to each alternative.
+///
+/// The default `minimum_support_ratio` of 0 is kept so that no packing answer changes; a
+/// caller who never set it is told instead. The count reads the support ratio every
+/// placement already reports, `O(placements)` with no geometry: an obstacle is geometry
+/// only and gives no support, so an item on one counts, while a fixed placement is a
+/// supporter like any other. A lattice summary is always floor-up and has no placements.
+/// Every engine emits this text byte for byte.
+fn warn_unsupported_placements(result: &mut PackingResult, minimum_support_ratio: f64) {
+    for alternative in &mut result.alternatives {
+        warn_unsupported_placements(alternative, minimum_support_ratio);
+    }
+    if minimum_support_ratio != 0.0 {
+        return;
+    }
+    let count = result
+        .containers
+        .iter()
+        .flat_map(|container| &container.placements)
+        .filter(|placement| placement.support_ratio == 0.0 && placement.position.z > 0)
+        .count();
+    if count > 0 {
+        result.warnings.push(format!(
+            "unsupported_placements: {count} placement(s) rest on nothing above the container \
+             floor; set configuration.minimum_support_ratio above 0 to require support"
+        ));
+    }
 }
 
 /// Names the rule that left an item behind, where one provably did.
@@ -514,6 +546,104 @@ fn cite_policy_rejections(
     for alternative in &mut result.alternatives {
         cite_policy_rejections(alternative, request, policy);
     }
+}
+
+/// Names the container limit behind a `search_exhausted` or `exact_search_incomplete`
+/// item, with the rule and precedence every engine shares. Group
+/// members keep their reason, as the group check ranks first in the other engines.
+/// Alternatives too, for the reason `cite_policy_rejections` gives.
+fn cite_limit_rejections(result: &mut PackingResult, request: &PackingRequest) {
+    let mut opened: BTreeMap<String, usize> = BTreeMap::new();
+    for container in &result.containers {
+        *opened.entry(container.container.id.clone()).or_default() += 1;
+    }
+    for index in 0..result.unpacked.len() {
+        let unpacked = &result.unpacked[index];
+        if unpacked.instance.item.group.is_some()
+            || !matches!(
+                unpacked.reason.as_str(),
+                "search_exhausted" | "exact_search_incomplete"
+            )
+        {
+            continue;
+        }
+        let Some(reason) = limit_reason(&unpacked.instance, request, &opened) else {
+            continue;
+        };
+        let instance = unpacked.instance.clone();
+        result.unpacked[index] = UnpackedItem::new(instance, reason.into(), Vec::new());
+    }
+    for alternative in &mut result.alternatives {
+        cite_limit_rejections(alternative, request);
+    }
+}
+
+/// The container limit that left `instance` out, or `None` when no limit explains it.
+///
+/// Only containers that admit the item on every structural count -- a fitting rotation,
+/// its weight, its eligibility tags -- are asked. When an axle refuses the item alone in
+/// every one of them, the axle is the reason. Otherwise, when every one that would take
+/// it alone is out of stock, or `max_containers` is reached, the reason is the
+/// inventory: `max_items`, cumulative `max_payload`, `tag_limits`, the stop-access rule
+/// and an axle's share of a full load can only refuse an item a fresh container would
+/// take. `opened` counts the layout's containers per template, built once; `O(C*R)`.
+fn limit_reason(
+    instance: &ItemInstance,
+    request: &PackingRequest,
+    opened: &BTreeMap<String, usize>,
+) -> Option<&'static str> {
+    let item = &instance.item;
+    let envelopes: Vec<Dimensions> = item
+        .dimensions
+        .unique_rotations(&item.allowed_rotations)
+        .into_iter()
+        .map(|(_, dimensions)| dimensions.expand(request.config.clearance))
+        .collect();
+    let mut compatible = false;
+    let mut admitting = Vec::new();
+    for container in &request.containers {
+        let fitting: Vec<&Dimensions> = envelopes
+            .iter()
+            .filter(|envelope| container.fits_alone(**envelope))
+            .collect();
+        let weight_fits = container
+            .max_payload
+            .map(|maximum| item.weight.0 <= maximum.0)
+            .unwrap_or(true);
+        let eligible = item.eligible_container_tags.is_empty()
+            || !item.eligible_container_tags.is_disjoint(&container.tags);
+        if fitting.is_empty() || !weight_fits || !eligible {
+            continue;
+        }
+        compatible = true;
+        if fitting
+            .iter()
+            .any(|envelope| axle_admits_alone(container, item.weight, envelope.length.0))
+        {
+            admitting.push(container);
+        }
+    }
+    if !compatible {
+        return None;
+    }
+    if admitting.is_empty() {
+        return Some("axle_overloaded");
+    }
+    if request
+        .config
+        .max_containers
+        .is_some_and(|maximum| opened.values().sum::<usize>() >= maximum)
+    {
+        return Some("container_inventory_exhausted");
+    }
+    admitting
+        .iter()
+        .all(|container| {
+            container
+                .quantity
+                .is_some_and(|quantity| opened.get(&container.id).copied().unwrap_or(0) >= quantity)
+        })
+        .then_some("container_inventory_exhausted")
 }
 
 fn expand_for_validation(result: &PackingResult) -> PackingResult {
@@ -639,6 +769,7 @@ fn reject_listed_fields(
             found.push(format!("item.shape_type={shape}"));
         }
     }
+    found.extend(made_to_measure_combinations(object));
     if found.is_empty() {
         return Ok(());
     }
@@ -651,6 +782,58 @@ fn reject_listed_fields(
     )))
 }
 
+/// The made-to-measure combinations 1.6 refuses (D10): each reads a container
+/// dimension or position the fabricated box does not keep. Checked on the raw request,
+/// before any request error. `O(containers + fixed placements)`.
+fn made_to_measure_combinations(object: &Map<String, Value>) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut measured = BTreeSet::new();
+    let entries = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(Value::as_object)
+            .collect::<Vec<_>>()
+    };
+    for container in entries("containers") {
+        if container.get("made_to_measure").is_none_or(Value::is_null) {
+            continue;
+        }
+        if let Some(id) = container.get("id").and_then(Value::as_str) {
+            measured.insert(id.to_string());
+        }
+        if container.get("axles").is_some_and(|axles| !axles.is_null()) {
+            found.push("container.made_to_measure+axles".to_string());
+        }
+        if container
+            .get("obstacles")
+            .and_then(Value::as_array)
+            .is_some_and(|obstacles| !obstacles.is_empty())
+        {
+            found.push("container.made_to_measure+obstacles".to_string());
+        }
+        if container
+            .get("void_fill_reserve_ratio")
+            .and_then(Value::as_f64)
+            .is_some_and(|ratio| ratio > 0.0)
+        {
+            found.push("container.made_to_measure+void_fill_reserve_ratio".to_string());
+        }
+    }
+    if entries("fixed_placements").iter().any(|entry| {
+        entry
+            .get("container_type")
+            .and_then(Value::as_str)
+            .is_some_and(|name| measured.contains(name))
+    }) {
+        found.push("fixed_placements+container.made_to_measure".to_string());
+    }
+    found
+}
+
 /// The request a JSON document describes, or the first rule it breaks.
 ///
 /// Unsupported fields are refused first, as `unsupported_feature`; then the schema's rule
@@ -658,7 +841,7 @@ fn reject_listed_fields(
 /// that still fails there is a request error too, without a field. The tariff rule runs last,
 /// outside that wrapping, because it is the solver's precondition rather than a malformed
 /// value -- the reference raises it from its packer.
-fn request_from_json(value: &Value) -> PackResult<PackingRequest> {
+pub(crate) fn request_from_json(value: &Value) -> PackResult<PackingRequest> {
     let object = value
         .as_object()
         .ok_or_else(|| RequestError::new("wrong_type", "", "must be an object"))?;
@@ -869,9 +1052,10 @@ fn parse_config(value: Option<&Value>, length_unit: &str) -> PackResult<PackingC
             | "lowest_landed_cost"
             | "open_dimension_height"
             | "maximum_value"
+            | "maximum_volume"
     ) {
         return Err(PackError::InvalidInput(format!(
-            "unknown objective {objective:?}; expected default, lowest_cost, shipping_cost, lowest_landed_cost, open_dimension_height or maximum_value"
+            "unknown objective {objective:?}; expected default, lowest_cost, shipping_cost, lowest_landed_cost, open_dimension_height, maximum_value or maximum_volume"
         )));
     }
     let dimensional_weight_divisor = match map.get("dimensional_weight_divisor") {
@@ -1172,6 +1356,13 @@ fn parse_item(value: &Value, unit: &str) -> PackResult<Item> {
         hull_vertices,
         compression_ratio_ppm,
         max_compression_pressure_kpa,
+        // Strict, unlike `string_set`: a dropped non-string name would turn a closed list
+        // into a different list, or into an unconstrained one.
+        stacking_group: optional_string(map, "stacking_group", "item")?,
+        accepts_stacking_groups: optional_string_set(
+            map.get("accepts_stacking_groups"),
+            "item.accepts_stacking_groups",
+        )?,
     })
 }
 
@@ -1363,7 +1554,51 @@ fn parse_container(value: &Value, unit: &str) -> PackResult<Container> {
         rate_table: parse_rate_table(map.get("rate_table"))?,
         access_directions: parse_access_directions(map.get("access_directions"))?,
         preloaded: Vec::new(),
+        deformable_boundary: parse_deformable_boundary(map.get("deformable_boundary"))?,
+        made_to_measure: parse_made_to_measure(map.get("made_to_measure"), unit)?,
     })
+}
+
+/// `container.made_to_measure`. `request_errors` has already refused every
+/// malformed value, every axis off the machine grid and every price past `2^53 - 1`.
+fn parse_made_to_measure(value: Option<&Value>, unit: &str) -> PackResult<Option<MadeToMeasure>> {
+    let Some(map) = value.and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let sides = |name: &str| -> PackResult<[i64; 3]> {
+        let Some(sides) = map.get(name).filter(|value| !value.is_null()) else {
+            return Ok([0, 0, 0]);
+        };
+        let mut ticks = [0_i64; 3];
+        for (axis, side) in ["length", "width", "height"].into_iter().enumerate() {
+            ticks[axis] = Length::parse(sides.get(side).unwrap_or(&Value::Null), unit)?.0;
+        }
+        Ok(ticks)
+    };
+    Ok(Some(MadeToMeasure {
+        minimum: sides("minimum")?,
+        increment: sides("increment")?,
+        cost_per_square_metre_minor: map
+            .get("cost_per_square_metre_minor")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        tare_per_square_metre: parse_optional_weight(map.get("tare_per_square_metre"), "g")?.0,
+        outer_allowance: sides("outer_allowance")?,
+    }))
+}
+
+/// `container.deformable_boundary`. `request_errors` has already refused every
+/// malformed shape and every excluded neighbour, so only the kind is read here.
+fn parse_deformable_boundary(value: Option<&Value>) -> PackResult<Option<DeformableBoundary>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(boundary) if boundary.get("kind").and_then(Value::as_str) == Some("flat_bag") => {
+            Ok(Some(DeformableBoundary::FlatBag))
+        }
+        Some(_) => Err(PackError::InvalidInput(
+            "container.deformable_boundary.kind must be flat_bag".into(),
+        )),
+    }
 }
 
 /// The container walls an item may be unloaded through.
@@ -1597,6 +1832,42 @@ fn parse_dimensions(value: Option<&Value>, unit: &str) -> PackResult<Dimensions>
     Ok(dimensions)
 }
 
+/// A library caller's machine, held to the rules `request_errors` applies to JSON: positive
+/// sizes, a grid that lands on the maximum, and a largest box whose price fits `2^53 - 1`.
+/// The largest box's tare must also fit the `i64` every weight is carried in. `O(1)`.
+fn admit_machine(container: &Container, machine: MadeToMeasure) -> PackResult<()> {
+    let maximum = sides_of(container.inner_dimensions);
+    let refuse = |detail: &str| {
+        Err(PackError::InvalidInput(format!(
+            "container {} made_to_measure {detail}",
+            container.id
+        )))
+    };
+    for ((minimum, increment), maximum) in
+        machine.minimum.iter().zip(machine.increment).zip(maximum)
+    {
+        if *minimum <= 0 || increment <= 0 {
+            return refuse("minimum and increment must be positive");
+        }
+        if *minimum > maximum || (maximum - minimum) % increment != 0 {
+            return refuse("must land on inner_dimensions");
+        }
+    }
+    if machine.cost_per_square_metre_minor < 0
+        || machine.tare_per_square_metre < 0
+        || machine.outer_allowance.iter().any(|side| *side < 0)
+    {
+        return refuse("prices and allowances cannot be negative");
+    }
+    if machine.largest_box_cost_minor(maximum, container.cost_minor) > MAX_EXACT_INTEGER {
+        return refuse("prices the largest box above 9007199254740991");
+    }
+    if machine.largest_box_tare(maximum, container.tare_weight.0) > i128::from(i64::MAX) {
+        return refuse("weighs the largest box beyond the weight range");
+    }
+    Ok(())
+}
+
 fn validate_request(request: &PackingRequest) -> PackResult<()> {
     if request.items.is_empty() || request.containers.is_empty() {
         return Err(PackError::InvalidInput(
@@ -1672,6 +1943,9 @@ fn validate_request(request: &PackingRequest) -> PackResult<()> {
                 "container {} has invalid axle positions",
                 container.id
             )));
+        }
+        if let Some(machine) = container.made_to_measure {
+            admit_machine(container, machine)?;
         }
         for obstacle in &container.obstacles {
             if obstacle.boxes().any(|box_| !boundary.contains(box_)) {

@@ -265,3 +265,43 @@ fn a_later_stop_resting_on_an_earlier_one_breaks_unloading_order() {
         ["unloading_order_violation"]
     );
 }
+
+#[test]
+fn an_item_on_one_that_does_not_accept_its_stacking_group_is_refused() {
+    let mut base = item("base");
+    base.stacking_group = Some("A".into());
+    base.accepts_stacking_groups = BTreeSet::from(["A".to_owned(), "B".to_owned()]);
+    for (group, refused) in [("C", true), ("B", false)] {
+        let mut load = item("load");
+        load.stacking_group = Some(group.into());
+        let issues = judge(
+            vec![base.clone(), load.clone()],
+            container(),
+            stacked_pair(&base, &load),
+        );
+        assert_eq!(
+            issues.contains(&"stacking_group_incompatible".to_owned()),
+            refused,
+            "{group}: {issues:?}"
+        );
+    }
+}
+
+#[test]
+fn a_non_stackable_item_with_a_list_reports_only_non_stackable() {
+    let mut base = item("base");
+    base.stackable = false;
+    base.accepts_stacking_groups = BTreeSet::from(["B".to_owned()]);
+    let mut load = item("load");
+    load.stacking_group = Some("C".into());
+    let issues = judge(
+        vec![base.clone(), load.clone()],
+        container(),
+        stacked_pair(&base, &load),
+    );
+    assert!(issues.contains(&"non_stackable".to_owned()), "{issues:?}");
+    assert!(
+        !issues.contains(&"stacking_group_incompatible".to_owned()),
+        "{issues:?}"
+    );
+}

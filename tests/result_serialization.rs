@@ -5,8 +5,8 @@
 mod support;
 
 use packvium_core::{
-    AlgorithmReport, PackedContainer, PackingResult, PackingStatus, StartRecord,
-    aggregate_termination, pack_json,
+    AlgorithmReport, ItemInstance, PackedContainer, PackingResult, PackingStatus, StartRecord,
+    UnpackedItem, aggregate_termination, pack_json,
 };
 use serde_json::{Value, json};
 use support::{container, item, placed};
@@ -130,4 +130,54 @@ fn an_errored_run_terminates_as_an_error() {
         global_deadline_reached: false,
     };
     assert_eq!(aggregate_termination(&[start], true).code, "error");
+}
+
+/// A result with two containers, a fixed placement, unpacked items and two alternatives,
+/// the first carrying alternatives of its own that the written form must leave out.
+fn with_alternatives() -> PackingResult {
+    let brick = item("brick");
+    let mut fixed = placed(&brick, 3, 0, 0);
+    fixed.fixed = true;
+    let mut result = hand_built(PackingStatus::BestFound);
+    result.containers.push(PackedContainer {
+        container: container(),
+        sequence: 2,
+        placements: vec![fixed, placed(&brick, 4, 0, 10)],
+        lattice_summary: None,
+        lattice_items: Vec::new(),
+    });
+    result.unpacked = vec![UnpackedItem::new(
+        ItemInstance {
+            item: brick.clone(),
+            sequence: 9,
+        },
+        "search_exhausted".into(),
+        vec!["detail".into()],
+    )];
+    result.warnings = vec!["a warning".into()];
+    let mut first = hand_built(PackingStatus::Feasible);
+    first.alternatives = vec![hand_built(PackingStatus::TimeLimit)];
+    result.alternatives = vec![first, hand_built(PackingStatus::Infeasible)];
+    result
+}
+
+#[test]
+fn the_written_text_is_the_tree_written_out_byte_for_byte() {
+    for result in [hand_built(PackingStatus::Feasible), with_alternatives()] {
+        for include_alternatives in [false, true] {
+            for (length, weight) in [("mm", "g"), ("in", "lb")] {
+                let tree = result.to_json(length, weight, include_alternatives);
+                assert_eq!(
+                    result
+                        .to_json_string(length, weight, include_alternatives)
+                        .expect("written"),
+                    serde_json::to_string(&tree).expect("tree written"),
+                );
+            }
+        }
+    }
+    let tree = with_alternatives().to_json("mm", "g", true);
+    assert_eq!(tree["alternatives"].as_array().map(Vec::len), Some(2));
+    assert_eq!(tree["alternatives"][0]["alternatives"], json!([]));
+    assert_eq!(tree["containers"][1]["placements"][0]["fixed"], json!(true));
 }
