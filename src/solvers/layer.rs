@@ -14,7 +14,7 @@ pub fn pack_layer_order(
     deadline: &Deadline,
 ) -> PackingResult {
     let mut ordered = items.to_vec();
-    ordered.sort_by_key(|item| {
+    ordered.sort_by_cached_key(|item| {
         (
             ordering_lead(item, &request.config.objective),
             Reverse(item.item.dimensions.base_area()),

@@ -54,6 +54,8 @@ fn item(id: &str, side_mm: i64) -> Item {
         hull_vertices: None,
         compression_ratio_ppm: None,
         max_compression_pressure_kpa: None,
+        stacking_group: None,
+        accepts_stacking_groups: Default::default(),
     }
 }
 
@@ -81,6 +83,8 @@ fn container(id: &str, side_mm: i64) -> Container {
         rate_table: None,
         access_directions: Vec::new(),
         preloaded: Vec::new(),
+        deformable_boundary: None,
+        made_to_measure: None,
     }
 }
 

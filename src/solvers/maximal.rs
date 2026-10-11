@@ -1,6 +1,6 @@
 use super::extreme::{
     ContainerState, OpenedContainers, apply_candidate, container_order_key,
-    find_candidates_at_points, open_fixed_containers, score_solution,
+    find_candidates_at_points, open_fixed_containers, score_solution, trial_container,
 };
 use crate::deadline::Deadline;
 use crate::geometry::{Aabb, Dimensions, Point};
@@ -62,7 +62,15 @@ pub fn pack_maximal_order(
             break;
         };
         let sequence = sequences.get(&container.id).copied().unwrap_or(0) + 1;
-        let (state, next) = fill(container.clone(), sequence, &remaining, &mut metrics);
+        let (state, next, _) = trial_container(
+            &container,
+            sequence,
+            &remaining,
+            request,
+            deadline,
+            &mut metrics,
+            &fill,
+        );
         if state.packed.placements.is_empty() {
             inventory.insert(container.id.clone(), Some(0));
             remaining = next;
@@ -436,9 +444,7 @@ fn choose_container(
                         .unique_rotations(&item.item.allowed_rotations)
                         .iter()
                         .any(|(_, dimensions)| {
-                            dimensions
-                                .expand(request.config.clearance)
-                                .fits_inside(container.inner_dimensions)
+                            container.fits_alone(dimensions.expand(request.config.clearance))
                         })
                 })
         })

@@ -410,3 +410,45 @@ fn a_fixed_coordinate_that_is_not_a_length_is_malformed() {
         );
     }
 }
+
+#[test]
+fn malformed_stacking_groups_are_refused_by_name() {
+    let cases: [(Edit, &str, &str, &str); 5] = [
+        (
+            |r| r["items"][0]["stacking_group"] = json!(7),
+            "wrong_type",
+            "/items/0/stacking_group",
+            "must be a string",
+        ),
+        (
+            |r| r["items"][0]["stacking_group"] = json!(""),
+            "invalid_value",
+            "/items/0/stacking_group",
+            "must not be empty",
+        ),
+        (
+            |r| r["items"][0]["accepts_stacking_groups"] = json!("A"),
+            "wrong_type",
+            "/items/0/accepts_stacking_groups",
+            "must be a list",
+        ),
+        (
+            |r| r["items"][0]["accepts_stacking_groups"] = json!(["A", 3]),
+            "wrong_type",
+            "/items/0/accepts_stacking_groups/1",
+            "must be a string",
+        ),
+        (
+            |r| r["items"][0]["accepts_stacking_groups"] = json!(["A", ""]),
+            "invalid_value",
+            "/items/0/accepts_stacking_groups/1",
+            "must not be empty",
+        ),
+    ];
+    for (edit, reason, field, detail) in cases {
+        assert_eq!(
+            reason_and_field(edit),
+            (reason.to_owned(), field.to_owned(), detail.to_owned())
+        );
+    }
+}

@@ -10,6 +10,7 @@
 use crate::canonical_json::{MAX_EXACT_MAGNITUDE, json_integer, json_spelling};
 use crate::error::RequestError;
 use crate::fixed::unknown_keys;
+use crate::made_to_measure::MadeToMeasure;
 use crate::units::{MeasureKind, measure_ticks};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
@@ -17,13 +18,14 @@ use std::collections::BTreeSet;
 type Checked<T = ()> = Result<T, RequestError>;
 
 const SOLVER_PROFILES: [&str; 4] = ["fast", "balanced", "quality", "exact_small"];
-const OBJECTIVES: [&str; 6] = [
+const OBJECTIVES: [&str; 7] = [
     "default",
     "lowest_cost",
     "shipping_cost",
     "lowest_landed_cost",
     "open_dimension_height",
     "maximum_value",
+    "maximum_volume",
 ];
 const ACCESS_DIRECTIONS: [&str; 6] = ["+x", "-x", "+y", "-y", "+z", "-z"];
 const CONFIGURATION_INTEGERS: [(&str, i64); 10] = [
@@ -183,7 +185,26 @@ fn check_item(raw: &Value, at: &str, unit: &str) -> Checked {
     })?;
     optional(item, "compression_ratio", at, |value, field| {
         ratio(value, field, None)
+    })?;
+    optional(item, "stacking_group", at, stacking_group_name)?;
+    optional(item, "accepts_stacking_groups", at, |value, field| {
+        for (index, name) in list(value, field)?.iter().enumerate() {
+            stacking_group_name(name, &join(field, &index.to_string()))?;
+        }
+        Ok(())
     })
+}
+
+fn stacking_group_name(value: &Value, field: &str) -> Checked {
+    match value.as_str() {
+        None => Err(wrong_type(field, "must be a string")),
+        Some("") => Err(RequestError::new(
+            "invalid_value",
+            field,
+            "must not be empty",
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
 fn check_container(raw: &Value, at: &str, unit: &str) -> Checked {
@@ -216,7 +237,167 @@ fn check_container(raw: &Value, at: &str, unit: &str) -> Checked {
     optional(container, "rate_table", at, rate_table)?;
     optional(container, "obstacles", at, |value, field| {
         obstacles(value, field, unit)
+    })?;
+    optional(container, "deformable_boundary", at, |value, field| {
+        deformable_boundary(container, value, field, at)
+    })?;
+    optional(container, "made_to_measure", at, |value, field| {
+        made_to_measure(container, value, field, at, unit)
     })
+}
+
+/// Every key the request schema's `made_to_measure` declares; it sets `additionalProperties: false`.
+const MADE_TO_MEASURE_FIELDS: [&str; 5] = [
+    "cost_per_square_metre_minor",
+    "increment",
+    "minimum",
+    "outer_allowance",
+    "tare_per_square_metre",
+];
+
+/// The made-to-measure block's shape top to bottom, then each axis's four rules,
+/// then the price ceiling. Run after every other container field, so an existing error
+/// always wins. `O(1)`.
+fn made_to_measure(
+    container: &Map<String, Value>,
+    raw: &Value,
+    field: &str,
+    at: &str,
+    unit: &str,
+) -> Checked {
+    let machine = object(raw, field)?;
+    known_fields(machine, field, &MADE_TO_MEASURE_FIELDS)?;
+    for name in ["minimum", "increment"] {
+        required(machine, name, field)?;
+    }
+    for name in ["minimum", "increment", "outer_allowance"] {
+        optional(machine, name, field, |value, at| {
+            dimensions(value, at, unit)
+        })?;
+    }
+    optional(
+        machine,
+        "cost_per_square_metre_minor",
+        field,
+        |value, at| integer(value, at, 0),
+    )?;
+    optional(machine, "tare_per_square_metre", field, |value, at| {
+        measure(value, at, MeasureKind::Weight, "g")
+    })?;
+    if present(container.get("outer_dimensions")).is_some() {
+        return Err(RequestError::new(
+            "not_allowed",
+            join(at, "outer_dimensions"),
+            "cannot be combined with made_to_measure",
+        ));
+    }
+    let ticks = |name: &str, map: &Map<String, Value>| -> [i64; 3] {
+        let sides = map.get(name).and_then(Value::as_object);
+        std::array::from_fn(|axis| {
+            sides
+                .and_then(|sides| sides.get(SIDES[axis]))
+                .and_then(|side| measure_ticks(side, unit, MeasureKind::Length).ok())
+                // A length past `i64` is refused when the model is built.
+                .map_or(0, |ticks| i64::try_from(ticks).unwrap_or(i64::MAX))
+        })
+    };
+    let inner = ticks("inner_dimensions", container);
+    let minimum = ticks("minimum", machine);
+    let increment = ticks("increment", machine);
+    for (axis, side) in SIDES.into_iter().enumerate() {
+        let invalid = |name: &str, detail: &str| {
+            Err(RequestError::new(
+                "invalid_value",
+                join(&join(field, name), side),
+                detail,
+            ))
+        };
+        if minimum[axis] == 0 {
+            return invalid("minimum", "must be positive");
+        }
+        if increment[axis] == 0 {
+            return invalid("increment", "must be positive");
+        }
+        if minimum[axis] > inner[axis] {
+            return invalid("minimum", "exceeds inner_dimensions");
+        }
+        if (inner[axis] - minimum[axis]) % increment[axis] != 0 {
+            return invalid(
+                "increment",
+                "does not divide inner_dimensions minus minimum",
+            );
+        }
+    }
+    let price = present(machine.get("cost_per_square_metre_minor"))
+        .and_then(json_integer)
+        .unwrap_or(0);
+    let fee = present(container.get("cost_minor"))
+        .and_then(json_integer)
+        .unwrap_or(0);
+    let largest = MadeToMeasure {
+        minimum,
+        increment,
+        cost_per_square_metre_minor: price,
+        tare_per_square_metre: 0,
+        outer_allowance: [0, 0, 0],
+    }
+    .largest_box_cost_minor(inner, fee);
+    if largest > i128::from(MAX_EXACT_MAGNITUDE) {
+        return Err(RequestError::new(
+            "invalid_value",
+            join(field, "cost_per_square_metre_minor"),
+            format!("prices the largest box above {MAX_EXACT_MAGNITUDE}"),
+        ));
+    }
+    Ok(())
+}
+
+/// The kinds `deformable_boundary` admits.
+const DEFORMABLE_BOUNDARY_KINDS: [&str; 1] = ["flat_bag"];
+/// Container fields a flat bag refuses, in reporting order (docs/DEFORMABLE-CONTAINERS.md).
+const BAG_EXCLUSIONS: [&str; 7] = [
+    "obstacles",
+    "axles",
+    "access_directions",
+    "max_stack_density",
+    "outer_dimensions",
+    "void_fill_reserve_ratio",
+    "made_to_measure",
+];
+
+fn deformable_boundary(
+    container: &Map<String, Value>,
+    raw: &Value,
+    field: &str,
+    at: &str,
+) -> Checked {
+    let boundary = object(raw, field)?;
+    one_of(
+        required(boundary, "kind", field)?,
+        &join(field, "kind"),
+        &DEFORMABLE_BOUNDARY_KINDS,
+    )?;
+    known_fields(boundary, field, &["kind"])?;
+    for name in BAG_EXCLUSIONS {
+        if set_beside_a_bag(name, present(container.get(name))) {
+            return Err(RequestError::new(
+                "not_allowed",
+                join(at, name),
+                "cannot be combined with deformable_boundary",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// An empty obstacle list and a zero reserve change nothing, so only they are let through.
+fn set_beside_a_bag(name: &str, value: Option<&Value>) -> bool {
+    match (name, value) {
+        (_, None) => false,
+        ("obstacles", Some(value)) => value.as_array().is_some_and(|list| !list.is_empty()),
+        ("void_fill_reserve_ratio", Some(value)) => value.as_f64().is_some_and(|ratio| ratio > 0.0),
+        _ => true,
+    }
 }
 
 fn dimensions(raw: &Value, at: &str, unit: &str) -> Checked {

@@ -4,6 +4,54 @@ What changed in `packvium` on crates.io, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0]
+
+Boxes cut to measure, flat bags, stacking groups and a volume-first objective, and a fix for
+small orders with a `convex_hull` item that ran out the clock.
+
+### Added
+
+- **`EffortBudget` is re-exported from the crate root**, and **`Item::new` / `Container::new`**
+  fill every other field with the value a JSON request gets when it omits it.
+- **`MadeToMeasure` and `Container::made_to_measure`.** An on-demand box machine (largest box,
+  minimum, cut step, board price and weight per m²); each packed box is the load's extent
+  rounded up onto the machine grid and priced as cut, reported by
+  `PackedContainer::achieved_dimensions()` and the result's `made_to_measure`.
+- **`DeformableBoundary::FlatBag` and `Container::deformable_boundary`.** A poly mailer admits a
+  load when length plus thickness and width plus thickness fit.
+- **`Item::stacking_group` and `Item::accepts_stacking_groups`.** Which item classes may rest
+  directly on which.
+- **`objective: "maximum_volume"`**, ranking the volume left behind ahead of the piece count.
+- **A warning for items resting on nothing** when `minimum_support_ratio` is 0. No answer
+  changes.
+
+Code that builds `Item` or `Container` with a struct literal must add the new fields; `None`
+and an empty set keep 1.5.0's behaviour.
+
+### Changed
+
+- **An unpacked item names the limit that left it out, the same in every engine.**
+  Where the search used to fall back to `no_feasible_placement` or `search_exhausted`, an item a
+  fresh container would take but none is left reports `container_inventory_exhausted`, and one
+  that overloads an axle wherever it stands alone reports `axle_overloaded`; both are
+  `inferred`. Code that matched the old reason for these cases must match the new one.
+- **An explicit `solvers: ["homogeneous_blocks"]` request packs in the profile's start order
+  when the block solver declines the scene**, so the answer no longer depends on the
+  order the items are listed in.
+- **`quality` orders its beam by a `convex_hull` item's own solid**, not its box, so
+  it no longer assumes a second wedge cannot fit when it can.
+- **The container plan counts a `convex_hull` item by its own solid too**, so
+  `quality` no longer ranks a plan as if wedges that share a container each needed their own.
+- **`fast` and `balanced` add the block solver as one more start** and keep its answer only
+  when strictly better.
+
+### Fixed
+
+- **Small orders with a `convex_hull` item no longer run out the clock.** The exact search
+  bounded a hull by its box volume, so it never stopped early: a five-item order with one jar
+  took the whole time limit and now takes 6 search nodes. The same bound left one of two
+  wedges that share a crate unpacked. Every release since 1.0.0.
+
 ## [1.5.0]
 
 Every error names a closed code. A misspelt configuration key is now refused (see *Fixed*).

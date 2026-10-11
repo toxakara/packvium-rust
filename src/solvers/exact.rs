@@ -1,6 +1,6 @@
 use super::extreme::{
-    ContainerState, SCORE_SCALE, apply_candidate, container_order_key, dimensional_weight_ticks,
-    find_candidates, score_solution,
+    ContainerState, SCORE_SCALE, apply_candidate, billed_dimensional_weight, container_order_key,
+    find_candidates, ranks_by_volume, score_solution, volume_share_ppm,
 };
 use crate::deadline::Deadline;
 use crate::geometry::ShapeType;
@@ -29,6 +29,13 @@ pub fn pack_exact_one(
         || request.containers.is_empty()
         || items.iter().any(|item| item.item.group.is_some())
         || !request.fixed_containers.is_empty()
+        // Its exhaustive claim is about one declared container; a box cut to measure is a
+        // heuristic rung choice, so the extreme-point path with the rung chain answers
+        // (D13).
+        || request
+            .containers
+            .iter()
+            .any(|container| container.made_to_measure.is_some())
     {
         return None;
     }
@@ -240,7 +247,11 @@ pub fn pack_exact_one(
 /// once per container search instead of re-deriving rotations inside the DFS.
 #[derive(Clone, Copy)]
 struct ExactItemProfile {
+    /// Declared box volume: the currency of the `maximum_volume` share.
     volume: i128,
+    /// Space the item takes once placed, which is what `used_volume` adds up and what the
+    /// capacity, unused-volume and height floors must bound.
+    occupied_volume: i128,
     minimum_height: i64,
     weight: i64,
 }
@@ -262,9 +273,31 @@ fn exact_item_profile(item: &ItemInstance, config: &PackingConfig) -> ExactItemP
         .unwrap_or(0);
     ExactItemProfile {
         volume: item.item.dimensions.volume(),
+        occupied_volume: occupied_item_volume(&item.item),
         minimum_height,
         weight: item.item.weight.0,
     }
+}
+
+/// The volume `model::occupied_volume` will count for this item in any orientation.
+///
+/// A hull occupies its authored solid, not its bounding box, and a proper rotation keeps that
+/// volume, so one orientation answers for all six. Bounding the search with the box volume
+/// left the unused-volume floor short of every reachable score, so the early exit on a
+/// matched floor never fired and a five-item order with one jar searched its whole
+/// permutation tree; it also overstated the height and capacity floors for hulls
+/// whose boxes interlock. A compressible item keeps its declared volume here, as before.
+pub(super) fn occupied_item_volume(item: &Item) -> i128 {
+    if item.shape_type == ShapeType::ConvexHull
+        && let Some(vertices) = &item.hull_vertices
+        && let Some(shape) = crate::hull::shape_for(
+            vertices,
+            crate::hull::source_axes(crate::geometry::Rotation::Lwh),
+        )
+    {
+        return shape.volume;
+    }
+    item.dimensions.volume()
 }
 
 fn item_can_fit_container(
@@ -293,11 +326,7 @@ fn item_can_fit_container(
         .dimensions
         .unique_rotations(&item.item.allowed_rotations)
         .iter()
-        .any(|(_, dimensions)| {
-            dimensions
-                .expand(config.clearance)
-                .fits_inside(container.inner_dimensions)
-        })
+        .any(|(_, dimensions)| container.fits_alone(dimensions.expand(config.clearance)))
 }
 
 /// Reuses the canonical finished-result objective at every visited exact-search node.
@@ -370,7 +399,7 @@ fn optimistic_completion_score(
 
     let mut volumes = remaining
         .iter()
-        .map(|(_, profile)| profile.volume)
+        .map(|(_, profile)| profile.occupied_volume)
         .collect::<Vec<_>>();
     volumes.sort_unstable();
     let mut placeable = remaining.len();
@@ -415,13 +444,23 @@ fn optimistic_completion_score(
     let smallest_volume_sum = volumes.iter().take(placeable).sum::<i128>();
     let unpacked_floor = (remaining.len() - placeable) as i128 + unfit.len() as i128;
 
+    let largest_volume_sum = volumes.iter().rev().take(placeable).sum::<i128>();
+    let volume_floor = if ranks_by_volume(config) {
+        unpacked_volume_floor_ppm(state, remaining, unfit, largest_volume_sum)
+    } else {
+        0
+    };
+
     if placeable == 0 && state.packed.placements.is_empty() {
         // No descendant can open this container at all: every one scores exactly
         // like this empty node, so the floor is that score with optimistic zeros.
-        return vec![unpacked_floor, 0, 0, 0, 0];
+        return if ranks_by_volume(config) {
+            vec![volume_floor, unpacked_floor, 0, 0, 0]
+        } else {
+            vec![unpacked_floor, 0, 0, 0, 0]
+        };
     }
 
-    let largest_volume_sum = volumes.iter().rev().take(placeable).sum::<i128>();
     let used_ceiling = (used_now + largest_volume_sum).min(volume.max(used_now));
     let unused = if volume > 0 {
         (volume - used_ceiling) * SCORE_SCALE / volume
@@ -468,7 +507,7 @@ fn optimistic_completion_score(
         config.objective.as_str(),
         "shipping_cost" | "lowest_landed_cost"
     ) {
-        i128::from(gross_weight).max(dimensional_weight_ticks(container, config))
+        i128::from(gross_weight).max(billed_dimensional_weight(&state.packed, config))
     } else {
         0
     };
@@ -485,8 +524,57 @@ fn optimistic_completion_score(
         "lowest_landed_cost" => vec![unpacked_floor, landed, 1, unused, height],
         "open_dimension_height" => vec![unpacked_floor, minimum_height, 1, cost, unused],
         "maximum_value" => vec![unpacked_floor, 0, 1, cost, unused],
+        "maximum_volume" => vec![volume_floor, unpacked_floor, 1, cost, unused],
         _ => vec![unpacked_floor, 1, cost, unused, height],
     }
+}
+
+/// The least share of the requested volume any descendant can leave unpacked, in parts
+/// per million. What cannot fit this container stays behind whatever is placed, and no
+/// descendant loads more of the rest than the free space holds or than `largest_placeable`,
+/// the volume of the most instances the count bound admits, taken largest first.
+///
+/// Both caps need declared volumes to add up to occupied space. Nesting, a hull and a
+/// compressible item each occupy less than they declare, so with any of them in the
+/// scene the floor assumes everything remaining may still be loaded. O(n).
+fn unpacked_volume_floor_ppm(
+    state: &ContainerState,
+    remaining: &[(ItemInstance, ExactItemProfile)],
+    unfit: &[(ItemInstance, ExactItemProfile)],
+    largest_placeable: i128,
+) -> i128 {
+    let placed = &state.packed.placements;
+    let placed_volume = placed
+        .iter()
+        .map(|placement| placement.instance.item.dimensions.volume())
+        .sum::<i128>();
+    let remaining_volume = total_volume(remaining);
+    let unfit_volume = total_volume(unfit);
+    let additive = placed
+        .iter()
+        .map(|placement| &placement.instance)
+        .chain(remaining.iter().map(|(instance, _)| instance))
+        .all(|instance| occupies_its_declared_volume(&instance.item));
+    let loadable = if additive {
+        let container_volume = state.packed.container.inner_dimensions.volume();
+        largest_placeable.min((container_volume - placed_volume).max(0))
+    } else {
+        remaining_volume
+    };
+    volume_share_ppm(
+        unfit_volume + remaining_volume - loadable,
+        placed_volume + remaining_volume + unfit_volume,
+    )
+}
+
+fn total_volume(items: &[(ItemInstance, ExactItemProfile)]) -> i128 {
+    items.iter().map(|(_, profile)| profile.volume).sum()
+}
+
+fn occupies_its_declared_volume(item: &Item) -> bool {
+    item.nesting_height.is_none()
+        && item.shape_type != ShapeType::ConvexHull
+        && item.max_compression_pressure_kpa.is_none()
 }
 
 /// A search state up to the labelling of interchangeable instances. Item types are
@@ -578,9 +666,12 @@ fn search(
     metrics.search_nodes_expanded = metrics.search_nodes_expanded.saturating_add(1);
     // This node's own score leads with `remaining.len() + unfit.len()` unpacked, so it can only
     // beat the incumbent when that count does not already lose the first element;
-    // skipping the `O(n^2)` scoring otherwise changes no incumbent decision.
+    // skipping the `O(n^2)` scoring otherwise changes no incumbent decision. A
+    // volume-first score leads with a share of volume instead, which a count says
+    // nothing about, so every node is scored there.
+    let by_volume = ranks_by_volume(&request.config);
     let total_unpacked = (remaining.len() + unfit.len()) as i128;
-    if total_unpacked <= best_score[0] {
+    if by_volume || total_unpacked <= best_score[0] {
         let score = score_state(state, &remaining, unfit, &request.config);
         if score < *best_score {
             *best = state.clone();
@@ -590,8 +681,11 @@ fn search(
     if best_score.as_slice() == complete_lower_bound {
         return;
     }
+    // Fewer pieces can still be more volume, so the piece-count cut stands down when the
+    // objective fills volume first; the admissible floor below prunes there instead.
     if remaining.is_empty()
-        || state.packed.placements.len() + remaining.len() < best.packed.placements.len()
+        || (!by_volume
+            && state.packed.placements.len() + remaining.len() < best.packed.placements.len())
     {
         return;
     }
@@ -818,5 +912,141 @@ mod tests {
         assert_eq!(unpacked.len(), 1);
         assert_eq!(unpacked[0]["item_id"], "pallet-jack#1");
         assert_eq!(unpacked[0]["proof"]["level"], "proven");
+    }
+
+    /// An octagonal-prism jar 80 x 80 x 100 mm, in the item's own frame.
+    fn octagonal_jar() -> serde_json::Value {
+        let ring = [
+            (23, 0),
+            (57, 0),
+            (80, 23),
+            (80, 57),
+            (57, 80),
+            (23, 80),
+            (0, 57),
+            (0, 23),
+        ];
+        let vertices = [0, 100]
+            .iter()
+            .flat_map(|z| {
+                ring.iter().map(move |(x, y)| {
+                    serde_json::json!({"x": x.to_string(), "y": y.to_string(), "z": z.to_string()})
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "id": "jar3", "quantity": 1,
+            "dimensions": {"length": "80", "width": "80", "height": "100"},
+            "shape_type": "convex_hull", "hull_vertices": vertices
+        })
+    }
+
+    fn mailer_with_a_jar(configuration: serde_json::Value) -> String {
+        let cuboid = |id: &str, length: &str, width: &str, height: &str| {
+            serde_json::json!({"id": id, "quantity": 1,
+                "dimensions": {"length": length, "width": width, "height": height}})
+        };
+        serde_json::json!({
+            "units": {"length": "mm"},
+            "configuration": configuration,
+            "items": [
+                cuboid("phonecase0", "180", "100", "25"),
+                cuboid("socks1", "200", "100", "40"),
+                cuboid("tshirt2", "280", "200", "30"),
+                octagonal_jar(),
+                cuboid("mugbox4", "120", "100", "110"),
+            ],
+            "containers": [{"id": "frame", "quantity": 1,
+                "inner_dimensions": {"length": "610", "width": "480", "height": "300"}}]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn exact_small_reaches_its_floor_on_a_scene_with_a_hull() {
+        // The floors added up declared box volumes while the score counts the jar's
+        // own solid, so the unused-volume floor sat below every reachable score, the early
+        // exit never fired, and this order searched 3.68 million nodes (the whole default
+        // second, or 60 s when given it). The first complete branch already meets the floor.
+        let output = pack_json(&mailer_with_a_jar(serde_json::json!({
+            "solvers": ["exact_small"],
+            "solver_profile": "exact_small",
+            "time_limit_ms": 300000,
+            "effort_budget": {
+                "max_candidates_evaluated": 1000000,
+                "max_placement_attempts": 1000000,
+                "max_search_nodes": 1000
+            }
+        })))
+        .expect("a mailer order with a jar");
+        let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["algorithm"]["effort_limit_reached"], false);
+        assert_eq!(result["algorithm"]["metrics"]["search_nodes_expanded"], 6);
+        assert_eq!(
+            result["score"],
+            serde_json::json!([0, 1, 0, 945535, 333333])
+        );
+    }
+
+    #[test]
+    fn the_fast_profile_completes_a_jar_order_inside_a_counted_budget() {
+        // The `fast` portfolio runs exact-small as a start for orders of up to seven items;
+        // before that start alone exhausted any budget, so every start must finish.
+        let output = pack_json(&mailer_with_a_jar(serde_json::json!({
+            "solver_profile": "fast",
+            "time_limit_ms": 300000,
+            "effort_budget": {
+                "max_candidates_evaluated": 100000,
+                "max_placement_attempts": 100000,
+                "max_search_nodes": 1000
+            }
+        })))
+        .expect("a mailer order with a jar");
+        let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(result["termination"]["code"], "complete");
+        assert_eq!(result["termination"]["any_start_truncated"], false);
+        assert_eq!(
+            result["score"],
+            serde_json::json!([0, 1, 0, 945535, 333333])
+        );
+    }
+
+    #[test]
+    fn exact_small_seats_two_wedges_whose_boxes_each_fill_the_crate() {
+        // Counted by box volume, each wedge claimed the whole crate, so the capacity floor
+        // said only one could ever be placed and the search pruned the packing that holds
+        // both. Exact-small alone answered one wedge unpacked.
+        let wedge = |id: &str, corners: [[u8; 3]; 6]| {
+            let vertices = corners
+                .iter()
+                .map(|[x, y, z]| {
+                    serde_json::json!({"x": (u32::from(*x) * 100).to_string(),
+                        "y": (u32::from(*y) * 100).to_string(),
+                        "z": (u32::from(*z) * 100).to_string()})
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({"id": id, "quantity": 1,
+                "dimensions": {"length": "100", "width": "100", "height": "100"},
+                "shape_type": "convex_hull", "hull_vertices": vertices})
+        };
+        let request = serde_json::json!({
+            "units": {"length": "mm"},
+            "configuration": {"solvers": ["exact_small"], "time_limit_ms": 300000},
+            "items": [
+                wedge("wedge-lower", [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 1], [0, 1, 1]]),
+                wedge("wedge-upper", [[1, 1, 0], [1, 0, 0], [0, 1, 0], [1, 1, 1], [1, 0, 1], [0, 1, 1]]),
+            ],
+            "containers": [{"id": "crate",
+                "inner_dimensions": {"length": "100", "width": "100", "height": "100"}}]
+        });
+
+        let output = pack_json(&request.to_string()).expect("two complementary wedges");
+        let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["score"], serde_json::json!([0, 1, 0, 0, 1000000]));
     }
 }

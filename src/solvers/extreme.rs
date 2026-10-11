@@ -4,6 +4,7 @@ use crate::contact_graph::{ContactEdge, ContactGraph};
 use crate::deadline::Deadline;
 use crate::geometry::{self, Aabb, Dimensions, Point, Rotation, ShapeType};
 use crate::hull::{self, HullShape};
+use crate::made_to_measure::sides_of;
 use crate::model::*;
 use crate::solver::{CandidateScorer, PlacementConstraint, SolverContext};
 use crate::spatial_index::SpatialIndex;
@@ -101,12 +102,10 @@ impl CandidateAccumulator {
                     .expect("candidate ordinal cannot exceed addressable memory");
                 if worst_first.len() < *limit {
                     worst_first.push(ranked);
-                } else if worst_first
-                    .peek()
-                    .is_some_and(|worst| ranked.cmp(worst) == Ordering::Less)
+                } else if let Some(mut worst) = worst_first.peek_mut()
+                    && ranked.cmp(&worst) == Ordering::Less
                 {
-                    worst_first.pop();
-                    worst_first.push(ranked);
+                    *worst = ranked;
                 }
             }
         }
@@ -138,6 +137,8 @@ pub struct ContainerState {
     stack_sensitive: bool,
     route_sensitive: bool,
     compression_sensitive: bool,
+    /// Largest envelope `x2`, `y2` and `z2` so far: a flat bag's running extents.
+    extent: [i64; 3],
     /// Candidate origins ordered by (z, y, x), matching the reference engines.
     points: BTreeSet<(i64, i64, i64)>,
     spatial_index: SpatialIndex,
@@ -176,6 +177,7 @@ impl ContainerState {
             stack_sensitive: false,
             route_sensitive: false,
             compression_sensitive: false,
+            extent: [0, 0, 0],
             points: BTreeSet::new(),
             spatial_index,
         };
@@ -506,7 +508,10 @@ pub fn find_candidates_at_points(
     // freeze and had to be a per-container one -- two doors on one trailer and none on
     // another is the case that makes the rule worth having -- while `PackingConfig` stays
     // as the default for the library callers who set the doors in code.
-    let doors: &[String] = if state.packed.container.access_directions.is_empty() {
+    // A flat bag has no walls, so it inherits no doors either.
+    let doors: &[String] = if state.packed.container.is_flat_bag() {
+        &[]
+    } else if state.packed.container.access_directions.is_empty() {
         &request.config.access_directions
     } else {
         &state.packed.container.access_directions
@@ -521,6 +526,7 @@ pub fn find_candidates_at_points(
             doors,
         )
     });
+    let flat_bag = state.packed.container.is_flat_bag();
     let mut candidates = CandidateAccumulator::new(limit);
     for (point_index, point) in points.into_iter().enumerate() {
         if point_index > 0 && (deadline.expired() || effort_exhausted(request, metrics)) {
@@ -538,6 +544,16 @@ pub fn find_candidates_at_points(
                 dimensions: envelope,
             };
             if !boundary.contains(envelope_box) {
+                continue;
+            }
+            // A flat bag also needs a + c <= L and b + c <= W over the running extents grown
+            // by the candidate: O(1), and the extents only grow, so no verdict flips.
+            if flat_bag
+                && !state
+                    .packed
+                    .container
+                    .girth_admits(grown_extent(state.extent, envelope_box))
+            {
                 continue;
             }
             let clearance = request.config.clearance.0;
@@ -805,15 +821,25 @@ pub fn pack_order(
                 if deadline.expired() {
                     break;
                 }
-                let (state, next) = try_pack_into(
+                let (state, next, _) = trial_container(
                     &container,
                     sequences.get(&container.id).copied().unwrap_or(0) + 1,
                     &remaining,
                     request,
-                    constraints,
-                    scorers,
                     deadline,
                     &mut metrics,
+                    |container, sequence, items, metrics| {
+                        try_pack_into(
+                            &container,
+                            sequence,
+                            items,
+                            request,
+                            constraints,
+                            scorers,
+                            deadline,
+                            metrics,
+                        )
+                    },
                 );
                 let placed = state.packed.placements.len();
                 if placed == 0 {
@@ -903,6 +929,89 @@ pub fn pack_order(
         objective: request.config.objective.clone(),
         catalog_versions_used: Vec::new(),
     }
+}
+
+/// One container's trial for a round, and how many single-container solves it spent.
+///
+/// A stock container is one solve of `fill`. A made-to-measure one tries each solving
+/// envelope in ascending order and keeps the first trial that places every item, already
+/// fabricated; failing that, the trial this round's own key prefers, the smaller rung on a
+/// tie. At most four solves and two trial states alive. A rung choice is a
+/// heuristic, so nothing here is ever claimed exhaustive (D13).
+pub(crate) fn trial_container<F>(
+    container: &Container,
+    sequence: usize,
+    remaining: &[ItemInstance],
+    request: &PackingRequest,
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+    mut fill: F,
+) -> (ContainerState, Vec<ItemInstance>, usize)
+where
+    F: FnMut(
+        Container,
+        usize,
+        &[ItemInstance],
+        &mut SolverMetrics,
+    ) -> (ContainerState, Vec<ItemInstance>),
+{
+    let Some(machine) = container.made_to_measure else {
+        let (state, next) = fill(container.clone(), sequence, remaining, metrics);
+        return (state, next, 1);
+    };
+    let grow = 2 * request.config.clearance.0;
+    let edges = remaining.iter().map(|instance| {
+        let size = instance.item.dimensions;
+        [
+            size.length.0 + grow,
+            size.width.0 + grow,
+            size.height.0 + grow,
+        ]
+    });
+    let rungs = machine.solving_envelopes(sides_of(container.inner_dimensions), edges);
+    let mut best: Option<ContainerTrial> = None;
+    let mut last = None;
+    let mut trials = 0;
+    for rung in rungs {
+        let (state, next) = fill(container.with_envelope(rung), sequence, remaining, metrics);
+        trials += 1;
+        if state.packed.placements.is_empty() {
+            last = Some((state, next));
+        } else {
+            let state = fabricated(container, state);
+            if next.is_empty() {
+                return (state, next, trials);
+            }
+            let key = container_selection_key(&state, next.len(), remaining.len(), &request.config);
+            if best.as_ref().is_none_or(|best| key < best.ordering_key) {
+                best = Some(ContainerTrial {
+                    state,
+                    remaining: next,
+                    ordering_key: key,
+                });
+            }
+        }
+        if deadline.expired() || effort_exhausted(request, metrics) {
+            break;
+        }
+    }
+    match best {
+        Some(best) => (best.state, best.remaining, trials),
+        None => {
+            let (state, next) = last.expect("a chain tries at least the machine maximum");
+            (state, next, trials)
+        }
+    }
+}
+
+/// A rung trial as the box cut for it: the achieved extent of its placements, envelope far
+/// faces with clearance, rounded up onto the machine grid (D14). `O(p)`.
+fn fabricated(declared: &Container, mut state: ContainerState) -> ContainerState {
+    let achieved = envelope_extent(&state.packed.placements);
+    state.packed.container = declared
+        .fabricate(achieved)
+        .expect("only a made-to-measure container is fabricated");
+    state
 }
 
 /// Containers opened so far, what is left to place, and each type's inventory and count.
@@ -1015,7 +1124,7 @@ fn additional_container_lower_bound(plan: &MultiContainerPlan, request: &Packing
             let required = plan
                 .remaining
                 .iter()
-                .map(|item| item.item.dimensions.volume())
+                .map(|item| super::exact::occupied_item_volume(&item.item))
                 .sum::<i128>();
             lower = lower.max(((required + capacity - 1) / capacity) as usize);
         }
@@ -1090,17 +1199,29 @@ fn pack_container_plans(
                     exhausted = true;
                     break;
                 }
-                plan_nodes += 1;
-                let (state, remaining) = try_pack_into(
+                let (state, remaining, trials) = trial_container(
                     &container,
                     plan.sequences.get(&container.id).copied().unwrap_or(0) + 1,
                     &plan.remaining,
                     request,
-                    constraints,
-                    scorers,
                     deadline,
                     metrics,
+                    |container, sequence, items, metrics| {
+                        try_pack_into(
+                            &container,
+                            sequence,
+                            items,
+                            request,
+                            constraints,
+                            scorers,
+                            deadline,
+                            metrics,
+                        )
+                    },
                 );
+                // Each rung is one single-container solve, so the node limit keeps bounding
+                // the work of a made-to-measure chain.
+                plan_nodes += trials;
                 if state.packed.placements.is_empty() {
                     continue;
                 }
@@ -1170,6 +1291,15 @@ pub fn apply_candidate(state: &mut ContainerState, item: ItemInstance, candidate
 
 /// Record one placement in the state: payload, volume, the spatial index, candidate points
 /// and top loads. A searched candidate and a fixed item go through the same bookkeeping.
+/// The running extents once `envelope` is added: three comparisons, `O(1)`.
+fn grown_extent([a, b, c]: [i64; 3], envelope: Aabb) -> [i64; 3] {
+    [
+        a.max(envelope.x2()),
+        b.max(envelope.y2()),
+        c.max(envelope.z2()),
+    ]
+}
+
 fn commit_placement(state: &mut ContainerState, placement: Placement) {
     state.payload = state
         .payload
@@ -1190,6 +1320,7 @@ fn commit_placement(state: &mut ContainerState, placement: Placement) {
     state.compression_sensitive = compression_sensitive;
     state.packed.placements.push(placement);
     let envelope_box = state.packed.placements[placement_index].envelope_box();
+    state.extent = grown_extent(state.extent, envelope_box);
     // Retiring a point because it falls inside a solid's box assumes the box *is* the solid.
     // For a hull it is not: a placement origin is a corner of a bounding box, and a hull
     // leaves most of that box -- including, for a wedge, the origin itself -- available to the
@@ -1514,15 +1645,18 @@ fn load_rules_hold<T: LoadSubject>(
 }
 
 /// The item facts the bearing rules read about one box, and nothing else. `Placement`
-/// answers from its item; `LoadBody` is the same six facts copied out once per sweep, so
-/// a candidate check never clones an `Item` -- its id, tags and metadata -- to read them.
+/// answers from its item; `LoadBody` is the same facts copied or borrowed out once per
+/// sweep, so a candidate check never clones an `Item` -- its id, tags and metadata -- to
+/// read them.
 pub(crate) trait LoadSubject {
     fn envelope(&self) -> Aabb;
     fn weight_ticks(&self) -> i64;
-    fn stackable(&self) -> bool;
     fn max_top_load_ticks(&self) -> Option<i64>;
     fn max_stacked_items(&self) -> Option<usize>;
     fn max_compression_pressure_kpa(&self) -> Option<i64>;
+    fn stacking_group(&self) -> Option<&str>;
+    /// The code refusing an item of `upper_group` resting directly on this box.
+    fn stacking_refusal(&self, upper_group: Option<&str>) -> Option<&'static str>;
 }
 
 impl LoadSubject for Placement {
@@ -1531,9 +1665,6 @@ impl LoadSubject for Placement {
     }
     fn weight_ticks(&self) -> i64 {
         self.instance.item.weight.0
-    }
-    fn stackable(&self) -> bool {
-        self.instance.item.stackable
     }
     fn max_top_load_ticks(&self) -> Option<i64> {
         self.instance.item.max_top_load.map(|weight| weight.0)
@@ -1544,20 +1675,30 @@ impl LoadSubject for Placement {
     fn max_compression_pressure_kpa(&self) -> Option<i64> {
         self.instance.item.max_compression_pressure_kpa
     }
+    fn stacking_group(&self) -> Option<&str> {
+        self.instance.item.stacking_group.as_deref()
+    }
+    fn stacking_refusal(&self, upper_group: Option<&str>) -> Option<&'static str> {
+        self.instance.item.stacking_refusal(upper_group)
+    }
 }
 
+/// The stacking facts are borrowed from the placed item rather than copied, so a body
+/// stays `Copy` and a request with no stacking groups pays nothing for them.
 #[derive(Clone, Copy, Debug)]
-struct LoadBody {
+struct LoadBody<'a> {
     envelope: Aabb,
     weight: i64,
     stackable: bool,
     max_top_load: Option<i64>,
     max_stacked_items: Option<usize>,
     max_compression_pressure_kpa: Option<i64>,
+    stacking_group: Option<&'a str>,
+    accepts_stacking_groups: &'a BTreeSet<String>,
 }
 
-impl LoadBody {
-    fn of(item: &Item, envelope: Aabb) -> Self {
+impl<'a> LoadBody<'a> {
+    fn of(item: &'a Item, envelope: Aabb) -> Self {
         Self {
             envelope,
             weight: item.weight.0,
@@ -1565,19 +1706,23 @@ impl LoadBody {
             max_top_load: item.max_top_load.map(|weight| weight.0),
             max_stacked_items: item.max_stacked_items,
             max_compression_pressure_kpa: item.max_compression_pressure_kpa,
+            stacking_group: item.stacking_group.as_deref(),
+            accepts_stacking_groups: &item.accepts_stacking_groups,
         }
+    }
+
+    /// Whether anything at all may be refused on this body's top face.
+    fn refuses_load(&self) -> bool {
+        !self.stackable || !self.accepts_stacking_groups.is_empty()
     }
 }
 
-impl LoadSubject for LoadBody {
+impl LoadSubject for LoadBody<'_> {
     fn envelope(&self) -> Aabb {
         self.envelope
     }
     fn weight_ticks(&self) -> i64 {
         self.weight
-    }
-    fn stackable(&self) -> bool {
-        self.stackable
     }
     fn max_top_load_ticks(&self) -> Option<i64> {
         self.max_top_load
@@ -1587,6 +1732,12 @@ impl LoadSubject for LoadBody {
     }
     fn max_compression_pressure_kpa(&self) -> Option<i64> {
         self.max_compression_pressure_kpa
+    }
+    fn stacking_group(&self) -> Option<&str> {
+        self.stacking_group
+    }
+    fn stacking_refusal(&self, upper_group: Option<&str>) -> Option<&'static str> {
+        stacking_refusal(self.stackable, self.accepts_stacking_groups, upper_group)
     }
 }
 
@@ -1602,9 +1753,9 @@ impl LoadSubject for LoadBody {
 /// the one a from-scratch rebuild gives; the differential test below holds it to that.
 /// Cost per candidate is `O(|affected| * degree)` instead of `O(n log n + e)` plus a
 /// deep clone of the scene.
-struct LoadSweep {
+struct LoadSweep<'a> {
     graph: ContactGraph,
-    bodies: Vec<LoadBody>,
+    bodies: Vec<LoadBody<'a>>,
     /// `None` when the placed scene breaks a bearing edge on its own.
     base_loads: Option<Vec<i128>>,
     /// Whether the placed scene passes every bearing rule by itself. When it does not,
@@ -1615,8 +1766,8 @@ struct LoadSweep {
     max_density: Option<Weight>,
 }
 
-impl LoadSweep {
-    fn new(state: &ContainerState, widest_footprint: i64) -> Self {
+impl<'a> LoadSweep<'a> {
+    fn new(state: &'a ContainerState, widest_footprint: i64) -> Self {
         let bodies = state
             .packed
             .placements
@@ -1641,7 +1792,7 @@ impl LoadSweep {
         }
     }
 
-    fn allows(&self, candidate: LoadBody) -> bool {
+    fn allows(&self, candidate: LoadBody<'_>) -> bool {
         let footprint = candidate
             .envelope
             .dimensions
@@ -1656,12 +1807,23 @@ impl LoadSweep {
         };
         let below = self.graph.contacts_below(candidate.envelope);
         let above = self.graph.contacts_above(candidate.envelope);
-        // The only new edges: a non-stackable supporter refuses the candidate, and a
-        // non-stackable candidate refuses whatever already rests on its top face.
-        if below.iter().any(|edge| !self.bodies[edge.index].stackable) {
+        // The only new edges: a supporter may refuse the candidate, and the candidate may
+        // refuse whatever already rests on its top face -- `stackable: false` or a stacking
+        // group its list omits, one test per edge.
+        if below.iter().any(|edge| {
+            self.bodies[edge.index]
+                .stacking_refusal(candidate.stacking_group)
+                .is_some()
+        }) {
             return false;
         }
-        if !above.is_empty() && !candidate.stackable {
+        if candidate.refuses_load()
+            && above.iter().any(|edge| {
+                candidate
+                    .stacking_refusal(self.bodies[edge.index].stacking_group)
+                    .is_some()
+            })
+        {
             return false;
         }
         let scene = CandidateScene {
@@ -1729,7 +1891,7 @@ impl LoadSweep {
     }
 
     /// The from-scratch verdict, for the cases the delta cannot answer.
-    fn rebuilt_with(&self, candidate: LoadBody) -> bool {
+    fn rebuilt_with(&self, candidate: LoadBody<'_>) -> bool {
         let mut bodies = self.bodies.clone();
         bodies.push(candidate);
         let boxes = bodies.iter().map(|body| body.envelope).collect::<Vec<_>>();
@@ -1748,8 +1910,8 @@ impl LoadSweep {
 /// the candidate takes the next index, rests on `below`, and joins the supporter list of
 /// every box in `above` at the end.
 struct CandidateScene<'a> {
-    sweep: &'a LoadSweep,
-    candidate: LoadBody,
+    sweep: &'a LoadSweep<'a>,
+    candidate: LoadBody<'a>,
     below: &'a [ContactEdge],
     above: &'a [ContactEdge],
 }
@@ -1759,7 +1921,7 @@ impl CandidateScene<'_> {
         self.sweep.bodies.len()
     }
 
-    fn body(&self, index: usize) -> LoadBody {
+    fn body(&self, index: usize) -> LoadBody<'_> {
         if index == self.candidate_index() {
             self.candidate
         } else {
@@ -2307,7 +2469,10 @@ fn calculate_top_loads_with_graph<T: LoadSubject>(
             // non-stackable one transferred nothing and so was waved through, and since
             // nothing here self-validates the answer came back `feasible` while the
             // shared validator called it `non_stackable`.
-            if !support.stackable() {
+            if support
+                .stacking_refusal(bodies[upper_index].stacking_group())
+                .is_some()
+            {
                 return None;
             }
             loads[edge.index] = loads[edge.index].saturating_add(share);
@@ -2362,9 +2527,7 @@ fn eligible_containers(
                             .unique_rotations(&item.item.allowed_rotations)
                             .iter()
                             .any(|(_, dimensions)| {
-                                dimensions
-                                    .expand(request.config.clearance)
-                                    .fits_inside(container.inner_dimensions)
+                                container.fits_alone(dimensions.expand(request.config.clearance))
                             })
                 })
         })
@@ -2529,11 +2692,19 @@ impl PrecomputedFuture {
             };
         }
         // A nesting item's volume is not what it occupies, so the volume bound stands down
-        // for the whole set, exactly as it did when it was computed per node.
+        // for the whole set, exactly as it did when it was computed per node. The rest count
+        // what they occupy, as the free space they are compared with does: two wedges each
+        // declaring the whole crate both fit in it.
         let volumes = future
             .iter()
             .all(|item| item.item.nesting_height.is_none())
-            .then(|| cumulative(future.iter().map(|item| item.item.dimensions.volume())));
+            .then(|| {
+                cumulative(
+                    future
+                        .iter()
+                        .map(|item| super::exact::occupied_item_volume(&item.item)),
+                )
+            });
         let weights =
             weighed.then(|| cumulative(future.iter().map(|item| i128::from(item.item.weight.0))));
         Self {
@@ -2577,12 +2748,54 @@ fn unpacked_lower_bound(
     unplaced_count + future.len - possible
 }
 
+/// Whether the request's objective fills volume before it counts pieces.
+pub(crate) fn ranks_by_volume(config: &PackingConfig) -> bool {
+    config.objective == "maximum_volume"
+}
+
+/// An upper bound on the volume a beam node can still end with: what is placed, plus the
+/// future items' total volume capped by the free space. Nominal volumes are not additive
+/// under nesting, so there the free space alone is the bound.
+fn reachable_volume(state: &ContainerState, future: &PrecomputedFuture) -> i128 {
+    if future.len == 0 {
+        return state.used_volume;
+    }
+    let free = (state.packed.container.inner_dimensions.volume() - state.used_volume).max(0);
+    let fillable = future
+        .volumes
+        .as_ref()
+        .and_then(|volumes| volumes.last())
+        .map_or(free, |total| free.min(*total));
+    state.used_volume + fillable
+}
+
 /// The numeric part of a container-plan beam node's order. Nodes whose ranks tie are
 /// ordered by their placement signature -- see `beam_order`.
-type BeamRank = (usize, usize, Reverse<usize>, i128, Reverse<i128>);
+///
+/// One search builds one variant only, chosen by the objective, so the variant order
+/// never decides a comparison.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BeamRank {
+    /// Unpacked lower bound, unplaced count, placed count, stack top, used volume.
+    Pieces(usize, usize, Reverse<usize>, i128, Reverse<i128>),
+    /// `maximum_volume`: reachable volume, used volume, unplaced count, stack top.
+    Volume(Reverse<i128>, Reverse<i128>, usize, i128),
+}
 
-fn container_beam_rank(node: &ContainerBeamNode, future: &PrecomputedFuture) -> BeamRank {
-    (
+fn container_beam_rank(
+    node: &ContainerBeamNode,
+    future: &PrecomputedFuture,
+    by_volume: bool,
+) -> BeamRank {
+    if by_volume {
+        return BeamRank::Volume(
+            Reverse(reachable_volume(&node.state, future)),
+            Reverse(node.state.used_volume),
+            node.unplaced.len(),
+            node.state.packed.max_z_ticks(),
+        );
+    }
+    BeamRank::Pieces(
         unpacked_lower_bound(&node.state, node.unplaced.len(), future),
         node.unplaced.len(),
         Reverse(node.state.packed.placements.len()),
@@ -2593,10 +2806,18 @@ fn container_beam_rank(node: &ContainerBeamNode, future: &PrecomputedFuture) -> 
 
 /// The rank `node` would have once `pending` more items were added to its unplaced list,
 /// without cloning it to find out: with nothing left to come, the lower bound on unpacked
-/// items is exactly the unplaced count.
-fn completed_beam_rank(node: &ContainerBeamNode, pending: usize) -> BeamRank {
+/// items is exactly the unplaced count, and the reachable volume is exactly the used one.
+fn completed_beam_rank(node: &ContainerBeamNode, pending: usize, by_volume: bool) -> BeamRank {
     let unplaced = node.unplaced.len() + pending;
-    (
+    if by_volume {
+        return BeamRank::Volume(
+            Reverse(node.state.used_volume),
+            Reverse(node.state.used_volume),
+            unplaced,
+            node.state.packed.max_z_ticks(),
+        );
+    }
+    BeamRank::Pieces(
         unplaced,
         unplaced,
         Reverse(node.state.packed.placements.len()),
@@ -2763,11 +2984,12 @@ fn try_pack_into_beam(
     };
     let mut beam = vec![initial];
     let mut nodes = 0_usize;
+    let by_volume = ranks_by_volume(&request.config);
     //: Which batch the loop stopped before, when it stopped early. The surviving beam
     //: nodes have consumed batches `0..pending_from` and nothing after, so completing one
     //: of them means adding `batches[pending_from..]` to its unplaced list -- see the
     //: final selection below for why leaving that out lost items outright.
-    let mut incumbent_rank = completed_beam_rank(&incumbent, 0);
+    let mut incumbent_rank = completed_beam_rank(&incumbent, 0, by_volume);
     let mut pending_from: Option<usize> = None;
 
     for (position, batch) in batches.iter().enumerate() {
@@ -2843,7 +3065,7 @@ fn try_pack_into_beam(
             });
         }
         for node in &expansions {
-            let rank = completed_beam_rank(node, future.len());
+            let rank = completed_beam_rank(node, future.len(), by_volume);
             if beam_order(&rank, &node.state, &incumbent_rank, &incumbent.state).is_lt() {
                 let mut complete = node.clone();
                 complete.unplaced.extend(future.iter().cloned());
@@ -2860,6 +3082,7 @@ fn try_pack_into_beam(
             expansions,
             &precomputed,
             request.config.container_plan_beam_width,
+            by_volume,
         );
     }
     // Every node still in the beam has to account for the batches the loop never reached
@@ -2881,7 +3104,7 @@ fn try_pack_into_beam(
         .unwrap_or_default();
     let mut best: Option<(BeamRank, ContainerBeamNode)> = None;
     for node in beam {
-        let rank = completed_beam_rank(&node, pending.len());
+        let rank = completed_beam_rank(&node, pending.len(), by_volume);
         let better = best.as_ref().is_none_or(|(best_rank, best_node)| {
             beam_order(&rank, &node.state, best_rank, &best_node.state).is_lt()
         });
@@ -2906,6 +3129,7 @@ fn best_beam_nodes(
     expansions: Vec<ContainerBeamNode>,
     future: &PrecomputedFuture,
     width: usize,
+    by_volume: bool,
 ) -> Vec<ContainerBeamNode> {
     if width == 0 {
         return Vec::new();
@@ -2913,7 +3137,7 @@ fn best_beam_nodes(
     let mut ranked: Vec<(BeamRank, usize)> = expansions
         .iter()
         .enumerate()
-        .map(|(index, node)| (container_beam_rank(node, future), index))
+        .map(|(index, node)| (container_beam_rank(node, future, by_volume), index))
         .collect();
     let order = |(rank, index): &(BeamRank, usize), (other_rank, other): &(BeamRank, usize)| {
         beam_order(
@@ -2941,9 +3165,22 @@ fn best_beam_nodes(
 pub(crate) const SCORE_SCALE: i128 = 1_000_000;
 
 pub(crate) fn dimensional_weight_ticks(container: &Container, config: &PackingConfig) -> i128 {
-    let dimensions = container
-        .outer_dimensions
-        .unwrap_or(container.inner_dimensions);
+    dimensional_weight_of(
+        container
+            .outer_dimensions
+            .unwrap_or(container.inner_dimensions),
+        config,
+    )
+}
+
+/// What a carrier bills by volume for this container as filled: a flat bag's achieved
+/// package (empty: nothing), which only grows as items are added and so also bounds any
+/// completion from below, else the declared outer size. `O(p)` for a bag.
+pub(crate) fn billed_dimensional_weight(packed: &PackedContainer, config: &PackingConfig) -> i128 {
+    dimensional_weight_of(packed.billed_dimensions(), config)
+}
+
+fn dimensional_weight_of(dimensions: Dimensions, config: &PackingConfig) -> i128 {
     let length_ticks_per_unit = match config.dimensional_weight_length_unit.as_str() {
         "mm" => Length::TICKS_PER_MM as i128,
         "cm" => (Length::TICKS_PER_MM * 10) as i128,
@@ -2983,7 +3220,7 @@ pub(crate) fn unpriceable_container(
         return None;
     }
     containers.iter().find_map(|packed| {
-        let dimensional = dimensional_weight_ticks(&packed.container, config);
+        let dimensional = billed_dimensional_weight(packed, config);
         let billed = i128::from(packed.gross_weight().0).max(dimensional);
         let grams = RateTable::grams(billed as i64);
         // A container with no table at all is refused at admission, so `parse_request`
@@ -3049,7 +3286,7 @@ fn container_selection_key(
     };
     let billable =
         if config.objective == "shipping_cost" || config.objective == "lowest_landed_cost" {
-            i128::from(packed.gross_weight().0).max(dimensional_weight_ticks(container, config))
+            i128::from(packed.gross_weight().0).max(billed_dimensional_weight(packed, config))
         } else {
             0
         };
@@ -3086,6 +3323,15 @@ fn container_selection_key(
         // every priceable alternative rather than winning on being light.
         "lowest_landed_cost" => vec![landed, containers_needed, -placed, unused_ppm, height_ppm],
         "open_dimension_height" => vec![top, containers_needed, cost, -placed, unused_ppm],
+        // `maximum_volume` ranks by the volume left behind, so the round keeps the trial
+        // that loaded the most volume, not the one that seated the most pieces.
+        "maximum_volume" => vec![
+            -state.used_volume,
+            containers_needed,
+            cost,
+            unused_ppm,
+            height_ppm,
+        ],
         // `maximum_value` ranks by value forgone, which is a property of what is left
         // unpacked overall rather than of the container being opened, so a per-round
         // choice cannot see it. Item ordering is where that objective is served; this
@@ -3145,7 +3391,7 @@ pub fn score_solution(
         }
 
         if config.objective == "shipping_cost" || config.objective == "lowest_landed_cost" {
-            let dimensional = dimensional_weight_ticks(&packed.container, config);
+            let dimensional = billed_dimensional_weight(packed, config);
             let billed = i128::from(packed.gross_weight().0).max(dimensional);
             billable += billed;
             if config.objective == "lowest_landed_cost" {
@@ -3209,9 +3455,58 @@ pub fn score_solution(
             default[2],
             default[3],
         ]
+    } else if ranks_by_volume(config) {
+        // Volume left behind leads and the piece count follows. The share is rounded up,
+        // so an incomplete answer never scores zero and a complete one still beats it --
+        // the guarantee `unpacked_count` gives the other objectives by leading them.
+        vec![
+            unpacked_volume_ppm(containers, unpacked),
+            default[0],
+            default[1],
+            default[2],
+            default[3],
+        ]
     } else {
         default
     }
+}
+
+/// `ceil(unpacked volume x 10^6 / requested volume)` in nominal item volume, zero when
+/// nothing was requested. A ratio rather than the raw volume because cubic ticks
+/// overflow a 64-bit integer for an ordinary freight container; `i128` carries the
+/// products exactly. O(n) for `n` item instances.
+fn unpacked_volume_ppm(containers: &[PackedContainer], unpacked: &[UnpackedItem]) -> i128 {
+    let unpacked_volume = unpacked
+        .iter()
+        .map(|item| item.instance.item.dimensions.volume())
+        .sum::<i128>();
+    let packed_volume = containers.iter().map(nominal_item_volume).sum::<i128>();
+    volume_share_ppm(unpacked_volume, unpacked_volume + packed_volume)
+}
+
+/// `ceil(part x 10^6 / whole)`, zero for an empty whole.
+pub(crate) fn volume_share_ppm(part: i128, whole: i128) -> i128 {
+    if whole <= 0 {
+        return 0;
+    }
+    (part * SCORE_SCALE + whole - 1) / whole
+}
+
+/// The declared volume of every item a container holds. The compact lattice keeps its
+/// instances apart from `placements`, which stays empty for it.
+fn nominal_item_volume(packed: &PackedContainer) -> i128 {
+    if !packed.lattice_items.is_empty() {
+        return packed
+            .lattice_items
+            .iter()
+            .map(|instance| instance.item.dimensions.volume())
+            .sum();
+    }
+    packed
+        .placements
+        .iter()
+        .map(|placement| placement.instance.item.dimensions.volume())
+        .sum()
 }
 
 pub(super) fn explain_unfit(request: &PackingRequest, item: &ItemInstance) -> String {
@@ -3222,9 +3517,7 @@ pub(super) fn explain_unfit(request: &PackingRequest, item: &ItemInstance) -> St
                 .unique_rotations(rotations)
                 .iter()
                 .any(|(_, dimensions)| {
-                    dimensions
-                        .expand(request.config.clearance)
-                        .fits_inside(container.inner_dimensions)
+                    container.fits_alone(dimensions.expand(request.config.clearance))
                 })
         })
     };
@@ -3262,6 +3555,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_running_flat_bag_extent_equals_the_extent_from_scratch() {
+        // A fixed-seed linear congruential sequence: the property is checked over many
+        // random scenes without making the suite depend on a random source.
+        let mut seed = 2602_u64;
+        let mut next = |bound: i64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            1 + (seed >> 33) as i64 % bound
+        };
+        for _ in 0..200 {
+            let boxes = (0..next(12))
+                .map(|_| Aabb {
+                    origin: Point {
+                        x: next(5_000),
+                        y: next(5_000),
+                        z: next(5_000),
+                    },
+                    dimensions: Dimensions {
+                        length: Length(next(5_000)),
+                        width: Length(next(5_000)),
+                        height: Length(next(5_000)),
+                    },
+                })
+                .collect::<Vec<_>>();
+            let mut running = [0, 0, 0];
+            let mut verdicts = Vec::new();
+            for envelope in &boxes {
+                running = grown_extent(running, *envelope);
+                let [a, b, c] = running;
+                verdicts.push(a + c <= 12_000 && b + c <= 12_000);
+            }
+            let scratch = boxes.iter().fold([0, 0, 0], |[a, b, c], envelope| {
+                [
+                    a.max(envelope.x2()),
+                    b.max(envelope.y2()),
+                    c.max(envelope.z2()),
+                ]
+            });
+            assert_eq!(running, scratch);
+            // Extents only grow, so a refused prefix is never admitted again.
+            assert!(verdicts.windows(2).all(|pair| pair[0] || !pair[1]));
+        }
+    }
+
+    #[test]
     fn prefix_sum_count_is_the_largest_cardinality_the_resource_admits() {
         let cases: [&[i128]; 4] = [&[2, 3, 5], &[1, 4, 4, 9], &[3, 3, 3, 7, 8], &[0, 0, 2, 6]];
         for costs in cases {
@@ -3281,6 +3618,76 @@ mod tests {
                 assert_eq!(count_with_capacity(&prefix, capacity), exact);
             }
         }
+    }
+
+    fn wedge(id: &str, side: i64, upper: bool) -> ItemInstance {
+        let base = if upper {
+            [[side, side], [side, 0], [0, side]]
+        } else {
+            [[0, 0], [side, 0], [0, side]]
+        };
+        let mut wedge = item(id);
+        wedge.dimensions = dimensions(side, side, side);
+        wedge.allowed_rotations = vec![Rotation::Lwh];
+        wedge.shape_type = ShapeType::ConvexHull;
+        wedge.hull_vertices = Some(
+            [0, side]
+                .iter()
+                .flat_map(|&z| base.iter().map(move |&[x, y]| [x, y, z]))
+                .collect(),
+        );
+        ItemInstance {
+            item: wedge,
+            sequence: 1,
+        }
+    }
+
+    #[test]
+    fn the_beam_ordering_bound_lets_the_second_wedge_fit() {
+        // With one wedge placed, half the crate is free and the other wedge occupies
+        // exactly that half. Its declared box is the whole crate, and counting that against
+        // occupied free space claimed it could never fit.
+        let side = 1_000;
+        let mut state = ContainerState::new(container(), 1);
+        let mut lower = candidate(0, Point::ZERO, Rotation::Lwh, 1.0);
+        lower.dimensions = dimensions(side, side, side);
+        lower.envelope_dimensions = lower.dimensions;
+        apply_candidate(&mut state, wedge("lower", side, false), &lower);
+        assert_eq!(state.used_volume, i128::from(side * side * side / 2));
+        let future = PrecomputedFuture::new(&[wedge("upper", side, true)], false);
+        assert_eq!(unpacked_lower_bound(&state, 0, &future), 0);
+    }
+
+    #[test]
+    fn the_container_plan_bound_counts_a_wedge_pair_as_one_crate() {
+        // Two wedges that fill one crate between them have boxes worth two crates.
+        // Counted by box, the plan bound said a second crate was unavoidable.
+        let side = 1_000;
+        let pair = [wedge("lower", side, false), wedge("upper", side, true)];
+        let mut crate_ = container();
+        crate_.quantity = Some(2);
+        let request = request(&pair[0].item, &crate_, None);
+        let plan = OpenedContainers {
+            packed: Vec::new(),
+            remaining: pair.to_vec(),
+            inventory: BTreeMap::from([(crate_.id.clone(), Some(2))]),
+            sequences: BTreeMap::new(),
+        };
+        assert_eq!(additional_container_lower_bound(&plan, &request), 1);
+    }
+
+    #[test]
+    fn the_unpacked_volume_share_rounds_up_and_is_zero_only_when_nothing_is_left() {
+        // A 40 ft container in micrometre ticks: past `i64`, inside `i128`.
+        let freight = 12_000_000_i128 * 2_300_000 * 2_400_000;
+        assert!(freight > i128::from(i64::MAX));
+
+        assert_eq!(volume_share_ppm(0, 0), 0);
+        assert_eq!(volume_share_ppm(0, freight), 0);
+        assert_eq!(volume_share_ppm(1, freight), 1);
+        assert_eq!(volume_share_ppm(1, 3), 333_334);
+        assert_eq!(volume_share_ppm(freight / 2, freight), 500_000);
+        assert_eq!(volume_share_ppm(freight, freight), SCORE_SCALE);
     }
 
     fn dimensions(length: i64, width: i64, height: i64) -> Dimensions {
@@ -3381,6 +3788,8 @@ mod tests {
             hull_vertices: None,
             compression_ratio_ppm: None,
             max_compression_pressure_kpa: None,
+            stacking_group: None,
+            accepts_stacking_groups: Default::default(),
         }
     }
 
@@ -3456,6 +3865,8 @@ mod tests {
             rate_table: None,
             access_directions: Vec::new(),
             preloaded: Vec::new(),
+            deformable_boundary: None,
+            made_to_measure: None,
         }
     }
 
@@ -3559,6 +3970,60 @@ mod tests {
                 "extent {extent}, width {width}, limit {limit}, {count} instances",
             );
         }
+    }
+
+    /// The item types the beam placed when offered one large box, then eight small ones
+    /// that only fit without it.
+    fn beam_choice_between_one_large_and_eight_small(objective: &str) -> Vec<String> {
+        let mut large = item("large");
+        large.dimensions = dimensions(1_000, 1_000, 900);
+        let mut small = item("small");
+        small.dimensions = dimensions(400, 400, 400);
+        let mut instances = vec![ItemInstance {
+            item: large.clone(),
+            sequence: 1,
+        }];
+        instances.extend((1..=8).map(|sequence| ItemInstance {
+            item: small.clone(),
+            sequence,
+        }));
+        let mut request = request(&large, &container(), None);
+        request.config.container_plan_beam_width = 4;
+        request.config.container_plan_node_limit = 100;
+        request.config.objective = objective.into();
+
+        let (state, unplaced) = try_pack_into_beam(
+            &container(),
+            1,
+            &instances,
+            &request,
+            &[],
+            &[],
+            &Deadline::new(request.config.time_limit_ms),
+            &mut SolverMetrics::default(),
+        );
+
+        assert_eq!(state.packed.placements.len() + unplaced.len(), 9);
+        state
+            .packed
+            .placements
+            .iter()
+            .map(|placement| placement.instance.item.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_container_beam_ranks_by_volume_only_under_the_volume_objective() {
+        // Skipping the large box seats eight pieces and leaves one; keeping it seats one
+        // piece of 900 000 000 against their 512 000 000. Each objective takes its own.
+        assert_eq!(
+            beam_choice_between_one_large_and_eight_small("default"),
+            ["small"; 8]
+        );
+        assert_eq!(
+            beam_choice_between_one_large_and_eight_small("maximum_volume"),
+            ["large"]
+        );
     }
 
     #[test]
@@ -4029,8 +4494,23 @@ mod tests {
         }
     }
 
-    fn load_body(lcg: &mut Lcg, origin: Point) -> LoadBody {
+    /// Stacking facts for the differential scenes: no class, a class with no list, a list
+    /// that accepts its own class, and one that refuses it.
+    type StackingFacts = (Option<&'static str>, BTreeSet<String>);
+
+    fn stacking_pool() -> Vec<StackingFacts> {
+        let only_a = BTreeSet::from(["A".to_owned()]);
+        vec![
+            (None, BTreeSet::new()),
+            (Some("A"), BTreeSet::new()),
+            (Some("A"), only_a.clone()),
+            (Some("B"), only_a),
+        ]
+    }
+
+    fn load_body<'a>(lcg: &mut Lcg, origin: Point, pool: &'a [StackingFacts]) -> LoadBody<'a> {
         let side = 10 + lcg.next(3) as i64 * 10;
+        let (stacking_group, accepts_stacking_groups) = &pool[lcg.next(pool.len() as u64) as usize];
         LoadBody {
             envelope: Aabb {
                 origin,
@@ -4041,6 +4521,8 @@ mod tests {
             max_top_load: (lcg.next(3) == 0).then(|| lcg.next(4) as i64 * 1_500),
             max_stacked_items: (lcg.next(4) == 0).then(|| lcg.next(3) as usize),
             max_compression_pressure_kpa: (lcg.next(4) == 0).then(|| 1 + lcg.next(3) as i64),
+            stacking_group: *stacking_group,
+            accepts_stacking_groups,
         }
     }
 
@@ -4052,6 +4534,8 @@ mod tests {
         item.max_top_load = body.max_top_load.map(Weight);
         item.max_stacked_items = body.max_stacked_items;
         item.max_compression_pressure_kpa = body.max_compression_pressure_kpa;
+        item.stacking_group = body.stacking_group.map(str::to_owned);
+        item.accepts_stacking_groups = body.accepts_stacking_groups.clone();
         ItemInstance { item, sequence }
     }
 
@@ -4083,6 +4567,7 @@ mod tests {
         // land under existing boxes as often as on top of them, which is the case where a
         // supporter list changes and the settled shares move.
         let mut lcg = Lcg(20_260_902);
+        let pool = stacking_pool();
         let mut agreements = (0_usize, 0_usize);
         for scene in 0..400 {
             let mut container = container();
@@ -4096,7 +4581,7 @@ mod tests {
                     y: lcg.next(4) as i64 * 10,
                     z: lcg.next(4) as i64 * 10,
                 };
-                let body = load_body(&mut lcg, origin);
+                let body = load_body(&mut lcg, origin, &pool);
                 if bodies
                     .iter()
                     .any(|placed: &LoadBody| placed.envelope.intersects(body.envelope))
@@ -4122,7 +4607,7 @@ mod tests {
                     y: lcg.next(5) as i64 * 10,
                     z: lcg.next(5) as i64 * 10,
                 };
-                let candidate = load_body(&mut lcg, origin);
+                let candidate = load_body(&mut lcg, origin, &pool);
                 if bodies
                     .iter()
                     .any(|placed| placed.envelope.intersects(candidate.envelope))
@@ -4206,5 +4691,157 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod made_to_measure_chain_tests {
+    use super::*;
+    use crate::api::request_from_json;
+    use serde_json::json;
+
+    const MM: i64 = 16_000;
+
+    fn request(effort: u64) -> PackingRequest {
+        request_from_json(&json!({
+            "configuration": {"solver_profile": "fast", "time_limit_ms": 60000,
+                              "effort_budget": {"max_search_nodes": effort}},
+            "items": [{"id": "cube", "quantity": 3,
+                       "dimensions": {"length": "100", "width": "100", "height": "100"}}],
+            "containers": [{"id": "machine", "cost_minor": 40,
+                "inner_dimensions": {"length": "1510", "width": "1510", "height": "1510"},
+                "made_to_measure": {"minimum": {"length": "60", "width": "60", "height": "60"},
+                                    "increment": {"length": "25", "width": "25", "height": "25"},
+                                    "cost_per_square_metre_minor": 1000}}]
+        }))
+        .expect("the scene is a valid request")
+    }
+
+    /// Places a scripted number of items per rung, along x at the scripted pitch.
+    fn chain(
+        request: &PackingRequest,
+        script: &[(usize, i64)],
+    ) -> (ContainerState, Vec<ItemInstance>, usize, Vec<Dimensions>) {
+        let mut envelopes = Vec::new();
+        let mut metrics = SolverMetrics::default();
+        let items = request.instances();
+        let (state, next, trials) = trial_container(
+            &request.containers[0],
+            1,
+            &items,
+            request,
+            &Deadline::new(60_000),
+            &mut metrics,
+            |container, sequence, items, metrics| {
+                let (count, pitch) = script[envelopes.len()];
+                envelopes.push(container.inner_dimensions);
+                metrics.search_nodes_expanded += 1;
+                let mut state = ContainerState::new(container, sequence);
+                for (index, instance) in items.iter().take(count).enumerate() {
+                    let origin = Point {
+                        x: index as i64 * pitch * MM,
+                        y: 0,
+                        z: 0,
+                    };
+                    let size = instance.item.dimensions;
+                    commit_placement(
+                        &mut state,
+                        Placement {
+                            instance: instance.clone(),
+                            position: origin,
+                            rotation: Rotation::Lwh,
+                            dimensions: size,
+                            envelope_origin: origin,
+                            envelope_dimensions: size,
+                            support_ratio: 1.0,
+                            top_load: Weight(0),
+                            fixed: false,
+                        },
+                    );
+                }
+                (state, items[count..].to_vec())
+            },
+        );
+        (state, next, trials, envelopes)
+    }
+
+    #[test]
+    fn the_first_complete_rung_is_kept_without_trying_a_larger_one() {
+        let (state, next, trials, envelopes) = chain(&request(1_000), &[(3, 100); 4]);
+        assert_eq!((trials, envelopes.len(), next.len()), (1, 1, 0));
+        let inner = state.packed.container.inner_dimensions;
+        assert_eq!(
+            [inner.length.0, inner.width.0, inner.height.0],
+            [310 * MM, 110 * MM, 110 * MM]
+        );
+    }
+
+    #[test]
+    fn an_incomplete_chain_keeps_the_round_key_choice_and_the_smaller_rung_on_a_tie() {
+        let (state, _, trials, _) =
+            chain(&request(1_000), &[(1, 100), (2, 100), (1, 100), (2, 105)]);
+        assert_eq!(trials, 4);
+        let xs = state
+            .packed
+            .placements
+            .iter()
+            .map(|placement| placement.position.x)
+            .collect::<Vec<_>>();
+        assert_eq!(xs, vec![0, 100 * MM]);
+    }
+
+    #[test]
+    fn a_chain_that_places_nothing_stays_a_zero_placement_trial() {
+        let (state, next, trials, _) = chain(&request(1_000), &[(0, 100); 4]);
+        assert_eq!((trials, next.len()), (4, 3));
+        assert!(state.packed.placements.is_empty());
+    }
+
+    #[test]
+    fn a_counted_limit_reached_mid_chain_stops_it_with_the_best_so_far() {
+        let (state, next, trials, _) = chain(&request(1), &[(1, 100); 4]);
+        assert_eq!(
+            (trials, next.len(), state.packed.placements.len()),
+            (1, 2, 1)
+        );
+    }
+
+    #[test]
+    fn candidate_accumulator_bounded_peek_mut_replaces_worst_and_preserves_fifo() {
+        let make_cand = |score: i128, z: i64| Candidate {
+            envelope_origin: Point { x: 0, y: 0, z },
+            position: Point { x: 0, y: 0, z },
+            rotation: Rotation::Lwh,
+            dimensions: Dimensions {
+                length: Length(10),
+                width: Length(10),
+                height: Length(10),
+            },
+            envelope_dimensions: Dimensions {
+                length: Length(10),
+                width: Length(10),
+                height: Length(10),
+            },
+            support_ratio: 1.0,
+            score,
+        };
+
+        let mut acc = CandidateAccumulator::new(3);
+        acc.push(make_cand(50, 0));
+        acc.push(make_cand(10, 0));
+        acc.push(make_cand(30, 0));
+        // Capacity is 3, currently has scores 10, 30, 50
+        // Push worse candidate (score 60) -> should be ignored
+        acc.push(make_cand(60, 0));
+        // Push better candidate (score 20) -> should replace 50, now 10, 20, 30
+        acc.push(make_cand(20, 0));
+        // Push candidate with score 25 -> replaces 30, now 10, 20, 25
+        acc.push(make_cand(25, 0));
+
+        let finished = acc.finish();
+        assert_eq!(finished.len(), 3);
+        assert_eq!(finished[0].score, 10);
+        assert_eq!(finished[1].score, 20);
+        assert_eq!(finished[2].score, 25);
     }
 }

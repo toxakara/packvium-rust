@@ -6,7 +6,7 @@ mod layer;
 mod maximal;
 mod portfolio;
 
-pub(crate) use blocks::pack_homogeneous_blocks;
+pub(crate) use blocks::{pack_block_start, pack_homogeneous_blocks, supports_block_start};
 pub(crate) use exact::pack_exact_one;
 pub use extreme::Candidate;
 pub(crate) use extreme::{calculate_top_loads, pack_order, unpriceable_container};

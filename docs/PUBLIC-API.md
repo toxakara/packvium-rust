@@ -3,6 +3,20 @@
 ## Core inputs
 
 - `Item`: id, dimensions, weight, quantity, rotations, upright/floor/stacking rules, top-load limit, support ratio, group, tags, metadata, and an optional `nesting_height` (how much this item sinks into an identical one beneath it when stacked). Only the same item type with the exact same footprint may nest; its adjacent predecessor is one full-footprint direct supporter for support ratio, ground-contact, stack/load and route rules, while non-adjacent same-column face coincidences are shadowed. An optional, exact non-negative integer `value` (no unit or currency — the caller's own economic scale) means nothing to placement or to any other objective; only the `maximum_value` objective reads it.
+- **Building a Rust `Item` or `Container` in code.** `Item::new(id, dimensions,
+  weight, quantity)` and `Container::new(id, inner_dimensions)` fill every other field with
+  the value a JSON request gets when it leaves that field out. Set the rest with struct update
+  syntax (`Item { stackable: false, ..Item::new(...) }`), which keeps compiling when a release
+  adds a field; a full struct literal does not.
+- **Stacking groups.** `stacking_group` (a non-empty string, default none) names an
+  item's class; `accepts_stacking_groups` (non-empty strings, default empty) lists the classes
+  it may carry directly on its top face. Empty is unconstrained; a non-empty list refuses every
+  other class and every item with no class, edge by edge, never transitively; `stackable:
+  false` dominates. The engines expose the same two fields on their item type: Python
+  `Item.stacking_group` / `Item.accepts_stacking_groups`, PHP trailing constructor parameters
+  `$stackingGroup` / `$acceptsStackingGroups`, Rust `Item::stacking_group` /
+  `Item::accepts_stacking_groups`, and the TypeScript request type. See
+  STACKING-GROUPS.md.
 - **Item geometry beyond the box.** `shape_type` is an enum —
   `rigid_cuboid` (the default), `convex_hull`, `compressible` — accompanied by
   `hull_vertices`, `compression_ratio` and `max_compression_pressure_kpa`. **A request that
@@ -45,12 +59,51 @@
   scorer precisely so all four engines can be held to the same price; only the
   `lowest_landed_cost` objective reads it, and a request that omits it behaves exactly
   as it did before the field existed.
+- **Flat bags.** `deformable_boundary: {"kind": "flat_bag"}` (absent or `null`: a rigid
+  container) makes the container a two-sheet bag of usable flat size `inner_dimensions.length`
+  x `.width`, filled to at most `.height`. A packing is admitted only when, with `a`, `b`, `c`
+  the largest envelope `x2`, `y2`, `z2` of its placements, `a + c <= L` and `b + c <= W` as well
+  as the ordinary boundary; equality fits. Each packed bag reports `achieved_dimensions`
+  `(a, b, c)`, the package dimensional weight is billed on (and the size a nested level packs
+  it as); objective key 3 still uses the declared `L·W·H`. Next to `obstacles` (non-empty),
+  `axles`, `access_directions`, `max_stack_density`, `outer_dimensions`, `made_to_measure` or a
+  positive `void_fill_reserve_ratio` it is refused with `invalid_request` / `not_allowed`, and a
+  fixed set past its girth with `invalid_fixed_placement` / `cannot_hold`, detail
+  `bag_girth_exceeded: <instance id>`. The engines expose it as Python
+  `Container.deformable_boundary` (`"flat_bag"` or None, last field) with
+  `PackedContainer.achieved_dimensions` / `.billed_dimensions`, PHP the trailing constructor
+  parameter `$deformableBoundary` with `PackedContainer::achievedDimensions()` /
+  `billedDimensions()`, Rust `Container::deformable_boundary: Option<DeformableBoundary>` with
+  `PackedContainer::achieved_dimensions()` / `billed_dimensions()`, and the TypeScript request
+  type. See DEFORMABLE-CONTAINERS.md.
+- **Made-to-measure containers.** `made_to_measure` (absent or `null`: a stock
+  container) makes the container an on-demand box machine whose largest box is
+  `inner_dimensions`: `minimum` and `increment` per axis (required; `minimum` equal to
+  `inner_dimensions` pins an axis, and `inner_dimensions - minimum` must be a multiple of
+  `increment`), `cost_per_square_metre_minor` (integer, default 0), `tare_per_square_metre`
+  (a weight measure, default 0) and `outer_allowance` (per axis, default 0). Each packed
+  container is the box cut for it: `inner_dimensions` the achieved extent rounded up onto the
+  grid, `outer_dimensions` that plus `outer_allowance`, and a `made_to_measure` result block
+  with its `cost_minor` (declared `cost_minor` plus `ceil(price x 2(LW + LH + WH) / 1 m^2)`)
+  and `tare_weight` (declared tare plus the board, rounded up the same way), both inside every
+  objective and `gross_weight`; `achieved_dimensions` reports the extent before rounding.
+  `outer_dimensions` or `deformable_boundary` next to it is `invalid_request` / `not_allowed`;
+  `axles`, non-empty `obstacles`, a positive `void_fill_reserve_ratio` or a fixed placement in
+  the container is `unsupported_feature`; a largest box priced above `2^53 - 1` is
+  `invalid_value`. The engines expose it as Python `Container.made_to_measure` (a
+  `packvium.MadeToMeasure`, last field), PHP the trailing constructor parameter
+  `?MadeToMeasure $madeToMeasure` (`Packvium\Domain\MadeToMeasure`), Rust
+  `Container::made_to_measure: Option<MadeToMeasure>`, and the TypeScript request type. See
+  MADE-TO-MEASURE-CONTAINERS.md.
 - `PackingConfig`: solver profile, deadline, alternatives, deterministic seed, clearance,
-  support threshold, exact-search limit, beam/order budgets, the portable
+  support threshold (`minimum_support_ratio`, default 0: support is not required, and an
+  item may rest on nothing above the floor; set it above 0 to require that share of the
+  base to be carried), exact-search limit, beam/order budgets, the portable
   `max_candidate_points` search-memory bound, deterministic global-plan controls
   `container_plan_beam_width` / `container_plan_node_limit`, and an optional `effort_budget`
   that bounds all four stable implementations by counted work instead of wall-clock
-  time. `solvers` is an ordered list: every named strategy is run, stable ties prefer
+  time. In code it is Python `packvium.EffortBudget`, PHP `Packvium\Config\EffortBudget` and
+  Rust `packvium_core::EffortBudget`. `solvers` is an ordered list: every named strategy is run, stable ties prefer
   the earlier name, and an unknown name is a structured error. The optional
   The stable solver names are `grid`, `extreme_points`, `homogeneous_blocks`, `layer`,
   `maximal_spaces` and `exact_small`. `homogeneous_blocks` is the unrestricted
@@ -124,7 +177,10 @@ move backwards. This is a testing seam, not a serialized request field.
 - objective score — a five-key lexicographic vector of exact integers, identical across every implementation (OBJECTIVE.md) — and solver statistics;
 - the exact `catalog_versions_used` lineage from the request (an empty array when no
   catalog was involved), preserved by Python, PHP, Rust and JavaScript;
-- warnings and top-K alternatives.
+- warnings and top-K alternatives. With `minimum_support_ratio` at its default 0, a result
+  with a placement resting on nothing above the floor carries one
+  `unsupported_placements: N placement(s) rest on nothing above the container floor; ...`
+  line, byte-identical in every engine; each alternative carries its own.
 
 ### `alternatives`, and what it is not
 
@@ -315,6 +371,10 @@ by the same `packvium_core::rebalance_json` adapter:
 - Python/PyO3 and WebAssembly: `rebalance_json(request, result, max_moves)`;
 - N-API: `rebalanceJson(request, result, maxMoves)`.
 
+`@packvium/browser` wraps the WebAssembly operation as `rebalanceWeight(request, result,
+{maxMoves})`, the Node package's name and signature, resolving to the same document
+.
+
 The Node package's public `rebalanceWeight` automatically uses that N-API operation
 when the addon is healthy and otherwise runs the deterministic JavaScript
 implementation. Boundary adapters exchange canonical JSON and do not duplicate the
@@ -439,6 +499,17 @@ details. A structural bound takes precedence over a deadline: an oversized item 
 `proven` even if the overall run timed out. Conversely, `time_limit`, `search_exhausted`
 and other unfinished-search outcomes can never carry `proven`.
 
+Container, axle and stop limits have one code each, the same in every engine.
+Among the containers that admit an item on every structural count, an axle that would be
+overloaded wherever the item stood alone in each of them gives `axle_overloaded`. Failing
+that, when every such container that would take the item alone is out of stock, or
+`max_containers` is reached, the item is `container_inventory_exhausted`: `max_items`, a
+cumulative `max_payload`, `tag_limits`, stop accessibility and an axle's share of a full
+load can only refuse an item a fresh container would take, so they all end there. Both are
+`inferred` -- neither is a certificate, since a counterweight behind the rear axle can
+relieve the front one -- and both rank after the structural proofs, the deadline, the
+effort budget and `group_cannot_fit_together`.
+
 ## Commercial and control-plane API
 
 Three deterministic functions over one canonical JSON document -- a carrier quote, an
@@ -559,7 +630,9 @@ looked up in the plan's order and never re-ordered.
 **Replay is stated, not assumed.** `provenance.replay.level` is `exact` only when solving the
 embedded request again must reproduce the result. When the search stopped on wall-clock time,
 or the result does not record how it was solved, the level is `not_guaranteed`, and `because`
-names the field that decided it.
+names the field that decided it. Python `packvium.artifacts.replay_level(result)` and PHP
+`OperationalArtifact::replayLevel($result)` answer the same level without building the
+artifact.
 
 **Refusals use one closed set of codes** in every language (`invalid_request`, `invalid_result`,
 `invalid_plan_input`, `mixed_units`, `number_out_of_range`, `invalid_string`, `invalid_value`,

@@ -16,6 +16,7 @@ mod explain;
 mod fixed;
 mod geometry;
 mod hull;
+mod made_to_measure;
 mod model;
 mod nested;
 mod policy;
@@ -38,11 +39,12 @@ pub use explain::{
     explanation_for_unpacked_item,
 };
 pub use geometry::{Aabb, Dimensions, Point, Rotation, ShapeType};
+pub use made_to_measure::MadeToMeasure;
 pub use model::{
-    AlgorithmReport, Container, FixedPlacement, Item, ItemInstance, Obstacle, PackedContainer,
-    PackingConfig, PackingRequest, PackingResult, PackingStatus, Placement, ReasonProof,
-    RejectionObservation, ResultFact, SolverMetrics, SolverProfile, StartRecord, UnpackedItem,
-    aggregate_termination,
+    AlgorithmReport, Container, DeformableBoundary, EffortBudget, FixedPlacement, Item,
+    ItemInstance, Obstacle, PackedContainer, PackingConfig, PackingRequest, PackingResult,
+    PackingStatus, Placement, ReasonProof, RejectionObservation, ResultFact, SolverMetrics,
+    SolverProfile, StartRecord, UnpackedItem, aggregate_termination,
 };
 pub use nested::{NestedLevel, NestedPackingRequest, NestedPackingResult, pack_nested};
 pub use policy::{PolicyConstraint, PolicyRule, PolicyRuleSet, RuleForm, ShipmentContext};

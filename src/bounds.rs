@@ -842,6 +842,8 @@ mod tests {
             hull_vertices: None,
             compression_ratio_ppm: None,
             max_compression_pressure_kpa: None,
+            stacking_group: None,
+            accepts_stacking_groups: Default::default(),
         };
         assert!(!occupies_less_than_its_box(&item));
 

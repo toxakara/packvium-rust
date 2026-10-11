@@ -127,6 +127,12 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
                 || container.void_fill_reserve_ppm > 0
                 || !container.tag_limits.is_empty()
                 || container.max_stack_density.is_some()
+                // The lattice counts cells against the rigid frame alone; a bag's girth rule
+                // couples the axes, which the per-candidate check applies exactly.
+                || container.is_flat_bag()
+                // A lattice sized against the machine maximum describes no box cut to
+                // measure; the general search runs the rung chain (D12).
+                || container.made_to_measure.is_some()
         })
     {
         return None;
@@ -167,7 +173,9 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
                 } else {
                     (container.inner_dimensions.height.0 - envelope.height.0) / layer_step + 1
                 };
-                if item.must_be_on_floor || !item.stackable {
+                // Every lattice edge joins two items of this one type, so the stacking-group
+                // rule holds for the whole lattice exactly when the type carries itself.
+                if item.must_be_on_floor || !item.carries_itself() {
                     nz = nz.min(1);
                 }
                 if let Some(maximum) = item.max_top_load
@@ -183,7 +191,8 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
                 if let Some(maximum) = container.max_payload
                     && item.weight.0 > 0
                 {
-                    capacity = capacity.min((maximum.0 / item.weight.0) as usize);
+                    capacity = capacity
+                        .min(usize::try_from(maximum.0 / item.weight.0).unwrap_or(usize::MAX));
                 }
                 let useful = capacity.min(item.quantity);
                 let per_layer = ((nx as i128) * (ny as i128)).max(1) as usize;
@@ -478,6 +487,8 @@ mod tests {
                 hull_vertices: None,
                 compression_ratio_ppm: None,
                 max_compression_pressure_kpa: None,
+                stacking_group: None,
+                accepts_stacking_groups: Default::default(),
                 eligible_container_tags: BTreeSet::new(),
             }],
             containers: vec![Container {
@@ -503,6 +514,8 @@ mod tests {
                 rate_table: None,
                 access_directions: Vec::new(),
                 preloaded: Vec::new(),
+                deformable_boundary: None,
+                made_to_measure: None,
             }],
             config: PackingConfig {
                 profile: SolverProfile::Fast,
@@ -576,6 +589,8 @@ mod tests {
                 rate_table: None,
                 access_directions: Vec::new(),
                 preloaded: Vec::new(),
+                deformable_boundary: None,
+                made_to_measure: None,
             },
         );
         let result = try_grid(&req, &no_deadline()).expect("grid should apply");
@@ -629,6 +644,8 @@ mod tests {
                 rate_table: None,
                 access_directions: Vec::new(),
                 preloaded: Vec::new(),
+                deformable_boundary: None,
+                made_to_measure: None,
             },
         );
         let result = try_grid(&req, &no_deadline()).expect("grid should apply");

@@ -73,6 +73,9 @@ pub fn explain_reason(reason: &str) -> Result<&'static str, UnknownReasonError> 
         "container_inventory_exhausted" => {
             "requires another compatible container, but the declared inventory is exhausted"
         }
+        "axle_overloaded" => {
+            "would overload an axle wherever it stood alone in any container that otherwise admits it"
+        }
         _ => {
             return Err(UnknownReasonError {
                 reason: reason.into(),
@@ -153,6 +156,8 @@ mod tests {
             hull_vertices: None,
             compression_ratio_ppm: None,
             max_compression_pressure_kpa: None,
+            stacking_group: None,
+            accepts_stacking_groups: Default::default(),
             eligible_container_tags: BTreeSet::new(),
         };
         UnpackedItem::new(
@@ -196,6 +201,7 @@ mod tests {
             "search_exhausted",
             "exact_search_incomplete",
             "container_inventory_exhausted",
+            "axle_overloaded",
         ] {
             let message =
                 explain_reason(reason).unwrap_or_else(|_| panic!("{reason} has no message"));

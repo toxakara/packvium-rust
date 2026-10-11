@@ -3,6 +3,7 @@ use std::rc::Rc;
 use crate::compression;
 use crate::geometry::{Aabb, Dimensions, Point, Rotation, ShapeType};
 use crate::hull::{self, HullShape, Vertex};
+use crate::made_to_measure::MadeToMeasure;
 use crate::units::{Length, Weight};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -125,6 +126,21 @@ impl Default for PackingConfig {
     }
 }
 
+/// The one stacking-group predicate, shared by every holder of the three facts it reads.
+pub(crate) fn stacking_refusal(
+    stackable: bool,
+    accepts: &BTreeSet<String>,
+    upper_group: Option<&str>,
+) -> Option<&'static str> {
+    if !stackable {
+        return Some("non_stackable");
+    }
+    if accepts.is_empty() || upper_group.is_some_and(|group| accepts.contains(group)) {
+        return None;
+    }
+    Some("stacking_group_incompatible")
+}
+
 #[derive(Clone, Debug)]
 pub struct Item {
     pub id: String,
@@ -161,6 +177,13 @@ pub struct Item {
     pub hull_vertices: Option<Vec<Vertex>>,
     pub compression_ratio_ppm: Option<i64>,
     pub max_compression_pressure_kpa: Option<i64>,
+    /// This item's stacking class (docs/STACKING-GROUPS.md). `None` is no class,
+    /// which no non-empty `accepts_stacking_groups` admits: a forgotten classification
+    /// fails closed, never open.
+    pub stacking_group: Option<String>,
+    /// The classes this item may carry directly on its top face. Empty is unconstrained,
+    /// matching `tags`; `stackable: false` overrides it.
+    pub accepts_stacking_groups: BTreeSet<String>,
 }
 
 impl Placement {
@@ -356,16 +379,75 @@ fn box_shape_of(box_: Aabb) -> HullShape {
 }
 
 impl Item {
+    /// An item with no rule beyond its size, weight and count: every other field holds the
+    /// value a JSON request gets when it leaves that field out.
+    ///
+    /// Set the rest with struct update syntax, which keeps compiling when a release adds a
+    /// field: `Item { stackable: false, ..Item::new("crate", size, weight, 2) }`.
+    pub fn new(
+        id: impl Into<String>,
+        dimensions: Dimensions,
+        weight: Weight,
+        quantity: usize,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            dimensions,
+            weight,
+            quantity,
+            allowed_rotations: Rotation::ALL.to_vec(),
+            stackable: true,
+            must_be_on_floor: false,
+            max_top_load: None,
+            minimum_support_ratio: 0.0,
+            group: None,
+            tags: BTreeSet::new(),
+            incompatible_tags: BTreeSet::new(),
+            priority: 0,
+            metadata: BTreeMap::new(),
+            nesting_height: None,
+            max_stacked_items: None,
+            ground_contact_rule: None,
+            stop_index: None,
+            eligible_container_tags: BTreeSet::new(),
+            value: None,
+            shape_type: ShapeType::RigidCuboid,
+            hull_vertices: None,
+            compression_ratio_ppm: None,
+            max_compression_pressure_kpa: None,
+            stacking_group: None,
+            accepts_stacking_groups: BTreeSet::new(),
+        }
+    }
+
     /// Whether what rests on this item can change a verdict.
     ///
     /// The three original reasons are about the item refusing load. The fourth is about the
     /// item *yielding* to it: a compressible item needs the cumulative mass above it before
     /// its occupied height -- or its crush limit -- means anything.
+    ///
+    /// A stacking group alone does not count: such an item is refused only by a constrained
+    /// item beneath it, which already switched the graph on.
     pub fn is_stack_sensitive(&self) -> bool {
         !self.stackable
+            || !self.accepts_stacking_groups.is_empty()
             || self.max_top_load.is_some()
             || self.max_stacked_items.is_some()
             || self.max_compression_pressure_kpa.is_some()
+    }
+
+    /// The code refusing an item of `upper_group` resting directly on this one, or `None`.
+    ///
+    /// `non_stackable` is tested first, so a scene invalid before keeps its code.
+    /// `O(log a)` for a list of `a` names.
+    pub(crate) fn stacking_refusal(&self, upper_group: Option<&str>) -> Option<&'static str> {
+        stacking_refusal(self.stackable, &self.accepts_stacking_groups, upper_group)
+    }
+
+    /// Whether a column of this one item type passes every stacking edge: the lattice test.
+    pub(crate) fn carries_itself(&self) -> bool {
+        self.stacking_refusal(self.stacking_group.as_deref())
+            .is_none()
     }
 
     /// Whether this item's collisions may be decided by its hull rather than by its box.
@@ -496,6 +578,89 @@ pub struct Container {
     /// moves them into its placements, so a packed container never carries them twice
     /// (docs/PLAN-REVISIONS.md).
     pub preloaded: Vec<Placement>,
+    /// A container whose boundary conforms to its contents; `None` is rigid.
+    pub deformable_boundary: Option<DeformableBoundary>,
+    /// Cut to measure by an on-demand box machine whose largest box is `inner_dimensions`
+    ///. A packed result carries the fabricated box instead.
+    pub made_to_measure: Option<MadeToMeasure>,
+}
+
+/// How a deformable container conforms to its contents.
+///
+/// `FlatBag` is two sheets of usable flat size `L x W` (`inner_dimensions.length`, `.width`)
+/// filled to at most thickness `H`. With `a`, `b`, `c` the largest envelope `x2`, `y2`, `z2`
+/// over its placements from the container origin, a packing is admitted only when the
+/// ordinary boundary holds and `a + c <= L` and `b + c <= W`: a loop of film round the
+/// package's cross-section is at least as long as that section's perimeter. The extents only
+/// grow as boxes are added, so a verdict never flips and any subset of an admitted set is
+/// admitted (docs/DEFORMABLE-CONTAINERS.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeformableBoundary {
+    FlatBag,
+}
+
+impl Container {
+    /// A rigid container with no rule beyond its inner size: every other field holds the
+    /// value a JSON request gets when it leaves that field out -- no tare, no payload limit,
+    /// no cost, unlimited quantity.
+    ///
+    /// Set the rest with struct update syntax, which keeps compiling when a release adds a
+    /// field: `Container { cost_minor: 120, ..Container::new("carton", size) }`.
+    pub fn new(id: impl Into<String>, inner_dimensions: Dimensions) -> Self {
+        Self {
+            id: id.into(),
+            inner_dimensions,
+            outer_dimensions: None,
+            tare_weight: Weight(0),
+            max_payload: None,
+            cost_minor: 0,
+            quantity: None,
+            obstacles: Vec::new(),
+            tags: BTreeSet::new(),
+            max_items: None,
+            metadata: BTreeMap::new(),
+            axles: None,
+            void_fill_reserve_ppm: 0,
+            tag_limits: BTreeMap::new(),
+            max_stack_density: None,
+            rate_table: None,
+            access_directions: Vec::new(),
+            preloaded: Vec::new(),
+            deformable_boundary: None,
+            made_to_measure: None,
+        }
+    }
+
+    pub fn is_flat_bag(&self) -> bool {
+        self.deformable_boundary == Some(DeformableBoundary::FlatBag)
+    }
+
+    /// Whether a package of these extents passes both girth sums; the frame is the caller's.
+    /// Always true for a rigid container. Coordinates are `i64`, so the sums need no wider type.
+    pub fn girth_admits(&self, extent: [i64; 3]) -> bool {
+        let [a, b, c] = extent;
+        !self.is_flat_bag()
+            || (a.saturating_add(c) <= self.inner_dimensions.length.0
+                && b.saturating_add(c) <= self.inner_dimensions.width.0)
+    }
+
+    /// Whether one box of these dimensions, alone at the origin, fits this container empty.
+    pub fn fits_alone(&self, dimensions: Dimensions) -> bool {
+        dimensions.fits_inside(self.inner_dimensions)
+            && self.girth_admits([dimensions.length.0, dimensions.width.0, dimensions.height.0])
+    }
+}
+
+/// `[max x2, max y2, max z2]` over the envelopes, `[0, 0, 0]` for none. `O(p)`.
+pub(crate) fn envelope_extent(placements: &[Placement]) -> [i64; 3] {
+    placements.iter().fold([0, 0, 0], |[a, b, c], placement| {
+        let envelope = placement.envelope_box();
+        [
+            a.max(envelope.x2()),
+            b.max(envelope.y2()),
+            c.max(envelope.z2()),
+        ]
+    })
 }
 
 /// An item already in a known place before the solve: loaded, or locked there.
@@ -898,14 +1063,38 @@ impl PackedContainer {
         axle_reactions(&self.container, &self.placements, None)
     }
 
+    /// The largest envelope `x2`, `y2` and `z2` of its placements: a flat bag's conformed
+    /// package, or a made-to-measure box's extent before it is rounded onto the
+    /// machine grid; `None` for any other container. `O(p)`.
+    pub fn achieved_dimensions(&self) -> Option<Dimensions> {
+        (self.container.is_flat_bag() || self.container.made_to_measure.is_some()).then(|| {
+            let [a, b, c] = envelope_extent(&self.placements);
+            Dimensions {
+                length: Length(a),
+                width: Length(b),
+                height: Length(c),
+            }
+        })
+    }
+
+    /// What a carrier measures: a bag's achieved package, else the declared outer size.
+    pub fn billed_dimensions(&self) -> Dimensions {
+        let achieved = self
+            .container
+            .is_flat_bag()
+            .then(|| self.achieved_dimensions());
+        achieved.flatten().unwrap_or_else(|| {
+            self.container
+                .outer_dimensions
+                .unwrap_or(self.container.inner_dimensions)
+        })
+    }
+
     /// Turns an already-packed container into an item for multi-level nesting.
     pub fn as_item(&self) -> Item {
         Item {
             id: self.id(),
-            dimensions: self
-                .container
-                .outer_dimensions
-                .unwrap_or(self.container.inner_dimensions),
+            dimensions: self.billed_dimensions(),
             weight: self.gross_weight(),
             quantity: 1,
             allowed_rotations: Rotation::ALL.to_vec(),
@@ -931,6 +1120,8 @@ impl PackedContainer {
             hull_vertices: None,
             compression_ratio_ppm: None,
             max_compression_pressure_kpa: None,
+            stacking_group: None,
+            accepts_stacking_groups: Default::default(),
         }
     }
 }
@@ -1069,6 +1260,33 @@ pub fn axle_balanced_origins(
         origins.push((doubled_centre - item_length as i128).div_euclid(2) as i64); // stay on the safe side
     }
     origins
+}
+
+/// Whether one item, alone in this empty container, has an x-origin that overloads
+/// neither axle.
+///
+/// Each limit is linear in the item's doubled centre, so the feasible origins form one
+/// interval whose two ends [`axle_balanced_origins`] gives exactly. `O(1)`. A statement
+/// about an empty container, not a proof: a counterweight behind the rear axle can
+/// relieve the front one.
+pub fn axle_admits_alone(container: &Container, item_weight: Weight, envelope_length: i64) -> bool {
+    let last_origin = container.inner_dimensions.length.0 - envelope_length;
+    if last_origin < 0 {
+        return false;
+    }
+    let Some([front, rear]) = container.axles else {
+        return true;
+    };
+    if item_weight.0 <= 0 {
+        return !axle_overloaded(container, &[], None);
+    }
+    let origins = axle_balanced_origins(container, &[], item_weight, envelope_length);
+    let lowest = front.max_load.map(|_| origins[0]).unwrap_or(0);
+    let highest = rear
+        .max_load
+        .map(|_| origins[origins.len() - 1])
+        .unwrap_or(last_origin);
+    lowest.max(0) <= highest.min(last_origin)
 }
 
 fn ceil_div(a: i128, b: i128) -> i128 {
@@ -1438,12 +1656,52 @@ impl PackingResult {
             .sum()
     }
 
+    /// The result as JSON. `include_alternatives` writes each alternative, without its
+    /// own alternatives, under `alternatives`; otherwise that list is empty.
     pub fn to_json(
         &self,
         length_unit: &str,
         weight_unit: &str,
         include_alternatives: bool,
     ) -> Value {
+        let mut document = self.document();
+        document["containers"] = Value::Array(
+            self.containers
+                .iter()
+                .map(|packed| container_json(packed, length_unit, weight_unit))
+                .collect(),
+        );
+        document["alternatives"] = Value::Array(if include_alternatives {
+            self.alternatives
+                .iter()
+                .map(|alternative| alternative.to_json(length_unit, weight_unit, false))
+                .collect()
+        } else {
+            Vec::new()
+        });
+        document
+    }
+
+    /// [`Self::to_json`] written as compact JSON text, byte for byte, without holding the
+    /// whole tree: each container and each alternative is built, written and dropped in
+    /// turn, so the peak is one container's tree rather than every container of every
+    /// alternative. The text is the output buffer itself.
+    pub fn to_json_string(
+        &self,
+        length_unit: &str,
+        weight_unit: &str,
+        include_alternatives: bool,
+    ) -> serde_json::Result<String> {
+        serde_json::to_string(&StreamedResult {
+            result: self,
+            length_unit,
+            weight_unit,
+            include_alternatives,
+        })
+    }
+
+    /// Every key of the result, with `containers` and `alternatives` left as placeholders.
+    fn document(&self) -> Value {
         let derived = derive_result_facts(
             self.status,
             self.complete(),
@@ -1475,85 +1733,6 @@ impl PackingResult {
             termination.code = "effort_limit".into();
         }
         let optimality = self.optimality.as_ref().unwrap_or(&derived.2);
-        let containers = self
-            .containers
-            .iter()
-            .map(|packed| {
-                let placements = packed
-                    .placements
-                    .iter()
-                    .map(|placement| {
-                        let mut serialized = serde_json::json!({
-                            "item_id": placement.instance.id(),
-                            "item_type": placement.instance.item.id.clone(),
-                            "position": placement.position.to_json(length_unit),
-                            "dimensions": placement.dimensions.to_json(length_unit),
-                            "orientation": placement.rotation.as_str(),
-                            "support_ratio": format!("{:.6}", placement.support_ratio),
-                            "top_load": placement.top_load.to_json(weight_unit),
-                        });
-                        // Absent unless true, so a request without fixed placements keeps
-                        // its bytes.
-                        if placement.fixed {
-                            serialized["fixed"] = Value::Bool(true);
-                        }
-                        serialized
-                    })
-                    .collect::<Vec<_>>();
-
-                let mut serialized = serde_json::json!({
-                    "id": packed.id(),
-                    "container_type": packed.container.id.clone(),
-                    "inner_dimensions": packed.container.inner_dimensions.to_json(length_unit),
-                    "outer_dimensions": packed
-                        .container
-                        .outer_dimensions
-                        .unwrap_or(packed.container.inner_dimensions)
-                        .to_json(length_unit),
-                    "payload_weight": packed.payload_weight().to_json(weight_unit),
-                    "gross_weight": packed.gross_weight().to_json(weight_unit),
-                    "used_volume_ticks3": packed.used_volume().to_string(),
-                    "volume_utilization": format!("{:.6}", packed.utilization()),
-                    "centre_of_mass_offset_ppm": packed.centre_of_mass_offset_ppm(),
-                    "void_fill_reserve_ticks3":
-                        (packed.container.inner_dimensions.volume()
-                            * packed.container.void_fill_reserve_ppm / 1_000_000).to_string(),
-                    "placements": placements,
-                });
-                if let Some((denominator, front, rear)) = packed.axle_reactions() {
-                    serialized["axle_reactions"] = serde_json::json!({
-                        "basis": "gross",
-                        "denominator": denominator.to_string(),
-                        "front_numerator": front.to_string(),
-                        "rear_numerator": rear.to_string(),
-                    });
-                }
-                if let Some(summary) = &packed.lattice_summary {
-                    serialized["lattice_summary"] = serde_json::json!({
-                        "item_type": summary.item_type,
-                        "orientation": summary.rotation.as_str(),
-                        "physical_dimensions": summary.physical.to_json(length_unit),
-                        "envelope_dimensions": summary.envelope.to_json(length_unit),
-                        "nx": summary.nx,
-                        "ny": summary.ny,
-                        "layers_used": summary.layers_used() as i64,
-                        "layer_step": Length(summary.layer_step).to_json(length_unit),
-                        "count": summary.count,
-                    });
-                }
-                serialized
-            })
-            .collect::<Vec<_>>();
-
-        let alternatives = if include_alternatives {
-            self.alternatives
-                .iter()
-                .map(|alternative| alternative.to_json(length_unit, weight_unit, false))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-
         // Every key of the canonical objective vector is bounded by the number of
         // containers times the parts-per-million scale, so all of them fit a JSON
         // number exactly -- with one exception the unchecked cast used to get wrong.
@@ -1574,7 +1753,7 @@ impl PackingResult {
             })
             .collect::<Vec<_>>();
 
-        serde_json::json!({
+        let mut document = serde_json::json!({
             "status": self.status.as_str(),
             "feasibility": feasibility.to_json(),
             "termination": termination.to_json(),
@@ -1598,22 +1777,181 @@ impl PackingResult {
                 "unpacked_item_count": self.unpacked.len(),
             },
             "score": score,
-            "containers": containers,
-            "unpacked_items": self
-                .unpacked
-                .iter()
-                .map(|unpacked| serde_json::json!({
-                    "item_id": unpacked.instance.id(),
-                    "item_type": unpacked.instance.item.id.clone(),
-                    "reason": unpacked.reason.clone(),
-                    "details": unpacked.details.clone(),
-                    "proof": unpacked.proof.to_json(),
-                }))
-                .collect::<Vec<_>>(),
+            // Placeholders: `to_json` moves the lists in, `to_json_string` writes them.
+            "containers": Value::Null,
+            "unpacked_items": Value::Null,
             "catalog_versions_used": self.catalog_versions_used.clone(),
             "warnings": self.warnings.clone(),
-            "alternatives": alternatives,
+            "alternatives": Value::Null,
+        });
+        document["unpacked_items"] = Value::Array(
+            self.unpacked
+                .iter()
+                .map(|unpacked| {
+                    serde_json::json!({
+                        "item_id": unpacked.instance.id(),
+                        "item_type": unpacked.instance.item.id.clone(),
+                        "reason": unpacked.reason.clone(),
+                        "details": unpacked.details.clone(),
+                        "proof": unpacked.proof.to_json(),
+                    })
+                })
+                .collect(),
+        );
+        document
+    }
+}
+
+/// One packed container as JSON.
+fn container_json(packed: &PackedContainer, length_unit: &str, weight_unit: &str) -> Value {
+    let placements = packed
+        .placements
+        .iter()
+        .map(|placement| {
+            let mut serialized = serde_json::json!({
+                "item_id": placement.instance.id(),
+                "item_type": placement.instance.item.id.clone(),
+                "position": placement.position.to_json(length_unit),
+                "dimensions": placement.dimensions.to_json(length_unit),
+                "orientation": placement.rotation.as_str(),
+                "support_ratio": format!("{:.6}", placement.support_ratio),
+                "top_load": placement.top_load.to_json(weight_unit),
+            });
+            // Absent unless true, so a request without fixed placements keeps
+            // its bytes.
+            if placement.fixed {
+                serialized["fixed"] = Value::Bool(true);
+            }
+            serialized
         })
+        .collect::<Vec<_>>();
+
+    let mut serialized = serde_json::json!({
+        "id": packed.id(),
+        "container_type": packed.container.id.clone(),
+        "inner_dimensions": packed.container.inner_dimensions.to_json(length_unit),
+        "outer_dimensions": packed
+            .container
+            .outer_dimensions
+            .unwrap_or(packed.container.inner_dimensions)
+            .to_json(length_unit),
+        "payload_weight": packed.payload_weight().to_json(weight_unit),
+        "gross_weight": packed.gross_weight().to_json(weight_unit),
+        "used_volume_ticks3": packed.used_volume().to_string(),
+        "volume_utilization": format!("{:.6}", packed.utilization()),
+        "centre_of_mass_offset_ppm": packed.centre_of_mass_offset_ppm(),
+        "void_fill_reserve_ticks3":
+            (packed.container.inner_dimensions.volume()
+                * packed.container.void_fill_reserve_ppm / 1_000_000).to_string(),
+    });
+    // Moved in, not written into `json!`, which would copy the whole list.
+    serialized["placements"] = Value::Array(placements);
+    // Present exactly when the container conforms to its contents, so
+    // a rigid container's bytes are unchanged.
+    if let Some(achieved) = packed.achieved_dimensions() {
+        serialized["achieved_dimensions"] = achieved.to_json(length_unit);
+    }
+    // A packed made-to-measure container is the fabricated box, so its own price
+    // and tare are the box's; absent for every other container.
+    if packed.container.made_to_measure.is_some() {
+        serialized["made_to_measure"] = serde_json::json!({
+            "cost_minor": packed.container.cost_minor,
+            "tare_weight": packed.container.tare_weight.to_json(weight_unit),
+        });
+    }
+    if let Some((denominator, front, rear)) = packed.axle_reactions() {
+        serialized["axle_reactions"] = serde_json::json!({
+            "basis": "gross",
+            "denominator": denominator.to_string(),
+            "front_numerator": front.to_string(),
+            "rear_numerator": rear.to_string(),
+        });
+    }
+    if let Some(summary) = &packed.lattice_summary {
+        serialized["lattice_summary"] = serde_json::json!({
+            "item_type": summary.item_type,
+            "orientation": summary.rotation.as_str(),
+            "physical_dimensions": summary.physical.to_json(length_unit),
+            "envelope_dimensions": summary.envelope.to_json(length_unit),
+            "nx": summary.nx,
+            "ny": summary.ny,
+            "layers_used": summary.layers_used() as i64,
+            "layer_step": Length(summary.layer_step).to_json(length_unit),
+            "count": summary.count,
+        });
+    }
+    serialized
+}
+
+/// A result written as [`PackingResult::to_json`] would serialize, one list entry at a time.
+///
+/// Object keys are emitted in the order the document's map iterates them, which is the
+/// order `serde_json` writes a `Value` object in, and every entry other than the two lists
+/// is the document's own value; so the bytes are the tree's bytes.
+struct StreamedResult<'a> {
+    result: &'a PackingResult,
+    length_unit: &'a str,
+    weight_unit: &'a str,
+    include_alternatives: bool,
+}
+
+impl Serialize for StreamedResult<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let Value::Object(document) = self.result.document() else {
+            unreachable!("a result document is an object");
+        };
+        let mut map = serializer.serialize_map(Some(document.len()))?;
+        for (key, value) in &document {
+            match key.as_str() {
+                "containers" => map.serialize_entry(key, &StreamedContainers(self))?,
+                "alternatives" => map.serialize_entry(key, &StreamedAlternatives(self))?,
+                _ => map.serialize_entry(key, value)?,
+            }
+        }
+        map.end()
+    }
+}
+
+struct StreamedContainers<'a, 'b>(&'b StreamedResult<'a>);
+
+impl Serialize for StreamedContainers<'_, '_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let streamed = self.0;
+        let mut sequence = serializer.serialize_seq(Some(streamed.result.containers.len()))?;
+        for packed in &streamed.result.containers {
+            sequence.serialize_element(&container_json(
+                packed,
+                streamed.length_unit,
+                streamed.weight_unit,
+            ))?;
+        }
+        sequence.end()
+    }
+}
+
+struct StreamedAlternatives<'a, 'b>(&'b StreamedResult<'a>);
+
+impl Serialize for StreamedAlternatives<'_, '_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let streamed = self.0;
+        let alternatives: &[PackingResult] = if streamed.include_alternatives {
+            &streamed.result.alternatives
+        } else {
+            &[]
+        };
+        let mut sequence = serializer.serialize_seq(Some(alternatives.len()))?;
+        for alternative in alternatives {
+            sequence.serialize_element(&StreamedResult {
+                result: alternative,
+                length_unit: streamed.length_unit,
+                weight_unit: streamed.weight_unit,
+                include_alternatives: false,
+            })?;
+        }
+        sequence.end()
     }
 }
 
@@ -1678,6 +2016,8 @@ mod tests {
             hull_vertices: vertices,
             compression_ratio_ppm: None,
             max_compression_pressure_kpa: None,
+            stacking_group: None,
+            accepts_stacking_groups: Default::default(),
             eligible_container_tags: BTreeSet::new(),
         }
     }

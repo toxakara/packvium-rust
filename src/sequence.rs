@@ -534,7 +534,7 @@ pub fn replay_loading_order(
 /// broke a limit is strictly more useful than "the finished scene is invalid" alone,
 /// and is the reason this walks the prefix sequence instead of checking only the
 /// last step. `reason` values match `ValidationIssue::code` from the reused
-/// functions ("top_load", "non_stackable", "stack_density_exceeded",
+/// functions ("top_load", "non_stackable", "stacking_group_incompatible", "stack_density_exceeded",
 /// "max_stacked_items_exceeded", "ground_contact_violation") rather than inventing a
 /// parallel vocabulary for the same finding.
 pub fn verify_loading_prefix_business_rules(
@@ -574,6 +574,7 @@ pub fn verify_loading_prefix_business_rules(
             let reason: &'static str = match problem.code.as_str() {
                 "top_load" => "top_load",
                 "non_stackable" => "non_stackable",
+                "stacking_group_incompatible" => "stacking_group_incompatible",
                 "stack_density_exceeded" => "stack_density_exceeded",
                 "max_stacked_items_exceeded" => "max_stacked_items_exceeded",
                 "ground_contact_violation" => "ground_contact_violation",
@@ -945,6 +946,8 @@ mod tests {
             hull_vertices: None,
             compression_ratio_ppm: None,
             max_compression_pressure_kpa: None,
+            stacking_group: None,
+            accepts_stacking_groups: Default::default(),
             eligible_container_tags: Default::default(),
         }
     }
@@ -975,6 +978,8 @@ mod tests {
             rate_table: None,
             access_directions: Vec::new(),
             preloaded: Vec::new(),
+            deformable_boundary: None,
+            made_to_measure: None,
         }
     }
 
@@ -1079,6 +1084,37 @@ mod tests {
                 reason: "non_stackable"
             }
         );
+    }
+
+    #[test]
+    fn a_loading_prefix_that_breaks_the_stacking_group_rule_is_caught() {
+        let mut base = business_rule_item("base", 5, 1_000, None, None, true, None);
+        base.accepts_stacking_groups = BTreeSet::from(["A".to_owned()]);
+        let mut rider = business_rule_item("rider", 5, 1_000, None, None, true, None);
+        rider.stacking_group = Some("C".into());
+        let placements = vec![
+            stacked_placement(base.clone(), 0, 0, 0),
+            stacked_placement(rider.clone(), 0, 0, 5),
+        ];
+        let container = business_rule_container(10, 20, None);
+        for (order, index) in [([0, 1], 1), ([1, 0], 0)] {
+            let error =
+                verify_loading_prefix_business_rules(&placements, &order, &container).unwrap_err();
+            assert_eq!(
+                error,
+                SequenceError::Replay {
+                    index,
+                    step: 1,
+                    reason: "stacking_group_incompatible"
+                }
+            );
+        }
+        rider.stacking_group = Some("A".into());
+        let accepted = vec![
+            stacked_placement(base, 0, 0, 0),
+            stacked_placement(rider, 0, 0, 5),
+        ];
+        assert!(verify_loading_prefix_business_rules(&accepted, &[0, 1], &container).is_ok());
     }
 
     #[test]

@@ -1,7 +1,7 @@
-use super::extreme::{explain_unfit, score_solution};
+use super::extreme::{explain_unfit, ranks_by_volume, score_solution};
 use super::{
-    pack_exact_one, pack_homogeneous_blocks, pack_layer_order, pack_maximal_order, pack_order,
-    try_grid, unpriceable_container,
+    pack_block_start, pack_exact_one, pack_homogeneous_blocks, pack_layer_order,
+    pack_maximal_order, pack_order, supports_block_start, try_grid, unpriceable_container,
 };
 use crate::deadline::Deadline;
 use crate::error::PackResult;
@@ -101,51 +101,73 @@ pub(crate) fn solve_portfolio_with_deadline(
         return Ok(finalize_single_start(result, deadline.expired()));
     }
 
-    let mut orders = Vec::new();
-    if request.config.profile == SolverProfile::Quality {
-        orders.push((
-            "small_edge".to_owned(),
-            sort_small_edge(instances.clone(), &request.config.objective),
-        ));
-        orders.push((
-            "small_volume".to_owned(),
-            sort_small_volume(instances.clone(), &request.config.objective),
-        ));
-    }
-    orders.extend([
-        (
-            "volume".to_owned(),
-            sort_volume(instances.clone(), &request.config.objective),
-        ),
-        (
-            "base_area".to_owned(),
-            sort_base(instances.clone(), &request.config.objective),
-        ),
-        (
-            "longest_edge".to_owned(),
-            sort_edge(instances.clone(), &request.config.objective),
-        ),
-        (
-            "weight".to_owned(),
-            sort_weight(instances.clone(), &request.config.objective),
-        ),
-        (
-            "constrained".to_owned(),
-            sort_constrained(instances.clone(), &request.config.objective),
-        ),
-    ]);
-    for custom in custom_orders {
-        let mut values = instances.clone();
-        custom.order(&mut values);
-        orders.push((custom.name().to_owned(), values));
-    }
     let target = match request.config.profile {
         SolverProfile::Fast => 1,
         SolverProfile::Balanced => request.config.multi_start_orders.min(6),
         SolverProfile::Quality => request.config.multi_start_orders.max(12),
         SolverProfile::ExactSmall => request.config.multi_start_orders.min(4),
     };
-    while orders.len() < target {
+    let restart_limit = request
+        .config
+        .effort_budget
+        .and_then(|budget| budget.max_restarts)
+        .unwrap_or(usize::MAX);
+    let needed = target.min(restart_limit);
+
+    // Small items first places the most pieces; large items first fills the most space.
+    // The objective decides which family gets the early, fully funded starts.
+    let built_in_generators: &[OrderGenerator] = if request.config.profile == SolverProfile::Quality
+    {
+        if ranks_by_volume(&request.config) {
+            &[
+                ("volume", sort_volume),
+                ("base_area", sort_base),
+                ("longest_edge", sort_edge),
+                ("weight", sort_weight),
+                ("constrained", sort_constrained),
+                ("small_edge", sort_small_edge),
+                ("small_volume", sort_small_volume),
+            ]
+        } else {
+            &[
+                ("small_edge", sort_small_edge),
+                ("small_volume", sort_small_volume),
+                ("volume", sort_volume),
+                ("base_area", sort_base),
+                ("longest_edge", sort_edge),
+                ("weight", sort_weight),
+                ("constrained", sort_constrained),
+            ]
+        }
+    } else {
+        &[
+            ("volume", sort_volume),
+            ("base_area", sort_base),
+            ("longest_edge", sort_edge),
+            ("weight", sort_weight),
+            ("constrained", sort_constrained),
+        ]
+    };
+
+    let mut orders = Vec::new();
+    for &(name, sort_fn) in built_in_generators {
+        if orders.len() >= needed {
+            break;
+        }
+        orders.push((
+            name.to_owned(),
+            sort_fn(instances.clone(), &request.config.objective),
+        ));
+    }
+    for custom in custom_orders {
+        if orders.len() >= needed {
+            break;
+        }
+        let mut values = instances.clone();
+        custom.order(&mut values);
+        orders.push((custom.name().to_owned(), values));
+    }
+    while orders.len() < needed {
         let index = orders.len() as u64;
         orders.push((
             format!("shuffle-{index}"),
@@ -155,12 +177,6 @@ pub(crate) fn solve_portfolio_with_deadline(
             ),
         ));
     }
-    let restart_limit = request
-        .config
-        .effort_budget
-        .and_then(|budget| budget.max_restarts)
-        .unwrap_or(usize::MAX);
-    orders.truncate(target.min(restart_limit));
     let per_order = if request.config.profile == SolverProfile::Quality
         && instances.iter().all(|item| item.item.group.is_none())
     {
@@ -170,8 +186,10 @@ pub(crate) fn solve_portfolio_with_deadline(
     };
     let staged_plan_search = request.config.profile == SolverProfile::Quality
         && request.config.container_plan_beam_width > 1;
+    let block_start = adds_block_start(request, &instances, constraints);
     let planned_start_count = orders.len() * per_order
         + if staged_plan_search { 2 } else { 0 }
+        + usize::from(block_start)
         + usize::from(
             enabled("homogeneous_blocks")
                 && (explicit_selection || request.config.profile == SolverProfile::Quality),
@@ -188,9 +206,13 @@ pub(crate) fn solve_portfolio_with_deadline(
                 && request.config.solvers.len() == 1
                 && request.config.solvers[0] == "homogeneous_blocks")
                 .then(|| {
+                    // The profile's first start order, the one Python's order-insensitive
+                    // block solver falls back on: request order would let the caller's
+                    // listing decide the answer.
+                    let first_order = orders.first().map_or(&instances, |(_, order)| order);
                     pack_order(
                         request,
-                        &instances,
+                        first_order,
                         constraints,
                         scorers,
                         "homogeneous_blocks:fallback",
@@ -282,6 +304,16 @@ pub(crate) fn solve_portfolio_with_deadline(
             ));
         }
     }
+    // Last, so a restart budget drops it first and the profile's own starts keep theirs.
+    let mut tied_block_start = None;
+    if block_start && !deadline.expired() && results.len() < restart_limit {
+        let result = pack_block_start(request, &instances, deadline);
+        if strictly_beats_all(&result, &results) {
+            results.push(result);
+        } else {
+            tied_block_start = Some(result);
+        }
+    }
 
     if explicit_selection {
         results.sort_by_key(|result| {
@@ -354,8 +386,10 @@ pub(crate) fn solve_portfolio_with_deadline(
     }
     let global_deadline_reached = deadline.expired();
     let actual_signatures = results.iter().map(signature).collect::<Vec<_>>();
+    // A block start that only tied still ran: it keeps its record and loses its answer.
     let mut start_records = results
         .iter()
+        .chain(tied_block_start.iter())
         .enumerate()
         .map(|(index, result)| StartRecord {
             id: format!("{}#{}", result.algorithm.solver, index + 1),
@@ -406,6 +440,49 @@ pub(crate) fn solve_portfolio_with_deadline(
         .take(request.config.top_k.saturating_sub(1))
         .collect();
     Ok(best)
+}
+
+/// Whether `fast` or `balanced` adds the block solver to its own starts.
+///
+/// Single-type blocks fill a carton load in milliseconds where a per-item search spends
+/// its whole budget, so the low-latency profiles run them as one more start and let the
+/// score decide. Only where the lattice can express the whole request; one item type is
+/// the grid solver's case, and it is exact there. O(n) time, O(1) space.
+fn adds_block_start(
+    request: &PackingRequest,
+    instances: &[ItemInstance],
+    constraints: &[Arc<dyn PlacementConstraint>],
+) -> bool {
+    matches!(
+        request.config.profile,
+        SolverProfile::Fast | SolverProfile::Balanced
+    ) && request.config.solvers.is_empty()
+        && spans_item_types(instances)
+        && shares_one_ordering_lead(instances, &request.config.objective)
+        && supports_block_start(request, constraints)
+}
+
+fn spans_item_types(instances: &[ItemInstance]) -> bool {
+    instances
+        .split_first()
+        .is_some_and(|(first, rest)| rest.iter().any(|item| item.item.id != first.item.id))
+}
+
+/// A lattice takes whichever type fills best; it cannot honour a caller's say over which
+/// item goes first, so it stays out unless every item leads alike.
+fn shares_one_ordering_lead(instances: &[ItemInstance], objective: &str) -> bool {
+    instances.split_first().is_none_or(|(first, rest)| {
+        let lead = ordering_lead(first, objective);
+        rest.iter()
+            .all(|item| ordering_lead(item, objective) == lead)
+    })
+}
+
+/// The added block start is there to improve an answer, not to replace an equal one: on a
+/// tie the ranking falls to the solver name, which would hand the result to a lattice that
+/// knows nothing of the orderings the profile's own starts honour.
+fn strictly_beats_all(candidate: &PackingResult, own: &[PackingResult]) -> bool {
+    own.iter().all(|result| candidate.score < result.score)
 }
 
 fn finalize_single_start(
@@ -593,8 +670,14 @@ pub(crate) fn ordering_lead(
     (Reverse(item.item.priority), Reverse(value))
 }
 
+/// A named start order: the portfolio builds only as many as the profile runs.
+type OrderGenerator = (
+    &'static str,
+    fn(Vec<ItemInstance>, &str) -> Vec<ItemInstance>,
+);
+
 fn sort_volume(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemInstance> {
-    values.sort_by_key(|item| {
+    values.sort_by_cached_key(|item| {
         (
             ordering_lead(item, objective),
             Reverse(item.item.dimensions.volume()),
@@ -605,7 +688,7 @@ fn sort_volume(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemInstan
 }
 
 fn sort_small_edge(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemInstance> {
-    values.sort_by_key(|item| {
+    values.sort_by_cached_key(|item| {
         (
             ordering_lead(item, objective),
             item.item.dimensions.longest_edge(),
@@ -617,7 +700,7 @@ fn sort_small_edge(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemIn
 }
 
 fn sort_small_volume(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemInstance> {
-    values.sort_by_key(|item| {
+    values.sort_by_cached_key(|item| {
         (
             ordering_lead(item, objective),
             item.item.dimensions.volume(),
@@ -629,7 +712,7 @@ fn sort_small_volume(mut values: Vec<ItemInstance>, objective: &str) -> Vec<Item
 }
 
 fn sort_base(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemInstance> {
-    values.sort_by_key(|item| {
+    values.sort_by_cached_key(|item| {
         (
             ordering_lead(item, objective),
             Reverse(item.item.dimensions.base_area()),
@@ -641,7 +724,7 @@ fn sort_base(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemInstance
 }
 
 fn sort_edge(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemInstance> {
-    values.sort_by_key(|item| {
+    values.sort_by_cached_key(|item| {
         (
             ordering_lead(item, objective),
             Reverse(item.item.dimensions.longest_edge()),
@@ -653,7 +736,7 @@ fn sort_edge(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemInstance
 }
 
 fn sort_weight(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemInstance> {
-    values.sort_by_key(|item| {
+    values.sort_by_cached_key(|item| {
         (
             ordering_lead(item, objective),
             Reverse(item.item.weight.0),
@@ -665,7 +748,7 @@ fn sort_weight(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemInstan
 }
 
 fn sort_constrained(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemInstance> {
-    values.sort_by_key(|item| {
+    values.sort_by_cached_key(|item| {
         (
             ordering_lead(item, objective),
             item.item.allowed_rotations.len(),
@@ -729,6 +812,254 @@ fn signature(result: &PackingResult) -> String {
 mod tests {
     use super::swap_index;
     use crate::api::pack_json;
+    use serde_json::{Value, json};
+
+    /// Counted work is the stopping contract; the time limit is only a fuse, so no
+    /// start is ever skipped for the clock and every run reports the same starts.
+    fn solve(configuration: Value, items: Value, containers: Value) -> Value {
+        let mut configuration = configuration;
+        configuration["time_limit_ms"] = json!(300_000);
+        let max_restarts = configuration
+            .get("effort_budget")
+            .and_then(|b| b.get("max_restarts").cloned());
+        let mut budget = json!({
+            "max_candidates_evaluated": 1_000_000,
+            "max_placement_attempts": 1_000_000,
+            "max_search_nodes": 1_000_000
+        });
+        if let Some(restarts) = max_restarts {
+            budget["max_restarts"] = restarts;
+        }
+        configuration["effort_budget"] = budget;
+        let request = json!({
+            "units": {"length": "mm"},
+            "configuration": configuration,
+            "items": items,
+            "containers": containers
+        });
+        let output = pack_json(&request.to_string()).expect("block start scene");
+        serde_json::from_str(&output).expect("result JSON")
+    }
+
+    fn carton(id: &str, width: u32, height: u32) -> Value {
+        json!({"id": id, "dimensions": {
+            "length": "350", "width": width.to_string(), "height": height.to_string()
+        }})
+    }
+
+    fn four_similar_cartons() -> Value {
+        json!([
+            carton("b1", 250, 140),
+            carton("b2", 250, 140),
+            carton("b3", 230, 130),
+            carton("b4", 250, 140)
+        ])
+    }
+
+    fn carton_box() -> Value {
+        json!([{"id": "box", "inner_dimensions": {"length": "600", "width": "400", "height": "250"}}])
+    }
+
+    fn weighted_cube(id: &str, grams: u32) -> Value {
+        json!({"id": id, "weight": {"value": grams.to_string(), "unit": "g"},
+               "dimensions": {"length": "100", "width": "100", "height": "100"}})
+    }
+
+    /// The solver behind each recorded start, in the order the starts ran.
+    fn start_solvers(result: &Value) -> Vec<String> {
+        result["termination"]["starts"]
+            .as_array()
+            .expect("start records")
+            .iter()
+            .map(|start| {
+                let id = start["id"].as_str().expect("start id");
+                id.split([':', '#']).next().unwrap_or_default().to_owned()
+            })
+            .collect()
+    }
+
+    fn block_starts(result: &Value) -> usize {
+        start_solvers(result)
+            .iter()
+            .filter(|solver| *solver == "homogeneous_blocks")
+            .count()
+    }
+
+    fn score(result: &Value) -> Vec<i64> {
+        result["score"]
+            .as_array()
+            .expect("score vector")
+            .iter()
+            .map(|part| part.as_i64().expect("integer score part"))
+            .collect()
+    }
+
+    fn without_durations(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .filter(|(key, _)| *key != "duration_ms")
+                    .map(|(key, inner)| (key.clone(), without_durations(inner)))
+                    .collect(),
+            ),
+            Value::Array(values) => Value::Array(values.iter().map(without_durations).collect()),
+            other => other.clone(),
+        }
+    }
+
+    #[test]
+    fn fast_and_balanced_end_with_one_block_start_where_the_lattice_can_express_the_request() {
+        for profile in ["fast", "balanced"] {
+            let result = solve(
+                json!({"solver_profile": profile}),
+                four_similar_cartons(),
+                carton_box(),
+            );
+            let solvers = start_solvers(&result);
+            assert_eq!(block_starts(&result), 1, "{profile}: {solvers:?}");
+            assert_eq!(
+                solvers.last().map(String::as_str),
+                Some("homogeneous_blocks")
+            );
+        }
+    }
+
+    #[test]
+    fn the_block_start_brings_four_similar_cartons_into_one_box() {
+        // With the exhaustive search switched off, the per-item starts need a second box
+        // for these four cartons; the lattice does not.
+        let own = solve(
+            json!({"solver_profile": "balanced", "exact_item_limit": 1, "solvers": ["extreme_points", "layer"]}),
+            four_similar_cartons(),
+            carton_box(),
+        );
+        let improved = solve(
+            json!({"solver_profile": "balanced", "exact_item_limit": 1}),
+            four_similar_cartons(),
+            carton_box(),
+        );
+        assert_eq!(own["summary"]["container_count"], 2, "{own}");
+        assert!(score(&improved) < score(&own));
+        assert_eq!(improved["summary"]["container_count"], 1);
+        assert_eq!(improved["summary"]["unpacked_item_count"], 0);
+        assert_eq!(improved["algorithm"]["solver"], "homogeneous_blocks");
+        for alternative in improved["alternatives"].as_array().unwrap() {
+            assert!(score(&improved) < score(alternative));
+        }
+    }
+
+    #[test]
+    fn the_block_start_never_makes_a_balanced_answer_worse() {
+        // Here the profile's own exhaustive start already finds the one-box answer.
+        let result = solve(
+            json!({"solver_profile": "balanced"}),
+            four_similar_cartons(),
+            carton_box(),
+        );
+        assert_eq!(result["summary"]["container_count"], 1);
+        assert_eq!(result["summary"]["unpacked_item_count"], 0);
+        assert_ne!(result["algorithm"]["solver"], "homogeneous_blocks");
+    }
+
+    #[test]
+    fn a_block_start_that_only_ties_keeps_its_record_and_loses_its_answer() {
+        let cubes = json!([weighted_cube("light", 1), weighted_cube("heavy", 3)]);
+        let tower = json!([{"id": "box", "inner_dimensions": {"length": "100", "width": "100", "height": "200"}}]);
+        let tied = solve(json!({"solver_profile": "fast"}), cubes, tower.clone());
+        // A priority keeps the block start out, and the two cubes in the same order.
+        let mut heavy_first = weighted_cube("heavy", 3);
+        heavy_first["priority"] = json!(1);
+        let own = solve(
+            json!({"solver_profile": "fast"}),
+            json!([weighted_cube("light", 1), heavy_first]),
+            tower,
+        );
+
+        assert_eq!(block_starts(&own), 0);
+        assert_eq!(
+            start_solvers(&tied).last().map(String::as_str),
+            Some("homogeneous_blocks")
+        );
+        assert_eq!(tied["algorithm"]["solver"], own["algorithm"]["solver"]);
+        assert_eq!(score(&tied), score(&own));
+        assert_eq!(
+            tied["containers"][0]["placements"],
+            own["containers"][0]["placements"]
+        );
+        assert!(
+            tied["alternatives"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|alternative| alternative["algorithm"]["solver"] != "homogeneous_blocks")
+        );
+    }
+
+    #[test]
+    fn the_block_start_stays_out_where_the_lattice_cannot_honour_the_request() {
+        let mut prioritised = carton("first", 250, 140);
+        prioritised["priority"] = json!(5);
+        let mut rest = carton("rest", 230, 130);
+        rest["quantity"] = json!(3);
+        let mut floor_only = carton("floor", 250, 140);
+        floor_only["must_be_on_floor"] = json!(true);
+        let mut one_type = carton("only", 250, 140);
+        one_type["quantity"] = json!(4);
+        let scenes = [
+            (
+                json!({"solver_profile": "balanced", "solvers": ["extreme_points"]}),
+                four_similar_cartons(),
+            ),
+            (json!({"solver_profile": "balanced"}), json!([one_type])),
+            (
+                json!({"solver_profile": "balanced"}),
+                json!([prioritised, rest]),
+            ),
+            (
+                json!({"solver_profile": "balanced"}),
+                json!([floor_only, carton("free", 230, 130)]),
+            ),
+            (
+                json!({"solver_profile": "balanced", "minimum_support_ratio": 0.5}),
+                four_similar_cartons(),
+            ),
+        ];
+        for (configuration, items) in scenes {
+            let result = solve(configuration.clone(), items, carton_box());
+            assert_eq!(block_starts(&result), 0, "{configuration}");
+        }
+    }
+
+    #[test]
+    fn quality_keeps_its_own_single_block_start() {
+        let result = solve(
+            json!({"solver_profile": "quality"}),
+            four_similar_cartons(),
+            carton_box(),
+        );
+        let solvers = start_solvers(&result);
+        assert_eq!(block_starts(&result), 1, "{solvers:?}");
+        assert_ne!(
+            solvers.last().map(String::as_str),
+            Some("homogeneous_blocks")
+        );
+    }
+
+    #[test]
+    fn the_block_start_answers_the_same_request_the_same_way() {
+        for profile in ["fast", "balanced"] {
+            let run = || {
+                without_durations(&solve(
+                    json!({"solver_profile": profile, "exact_item_limit": 1}),
+                    four_similar_cartons(),
+                    carton_box(),
+                ))
+            };
+            let first = run();
+            assert_eq!(first["algorithm"]["solver"], "homogeneous_blocks");
+            assert_eq!(first, run());
+        }
+    }
 
     /// Regression,: the shuffle partner is a property of the seed alone, never of
     /// the pointer width of the target the core happens to be compiled for. The second
@@ -793,5 +1124,95 @@ mod tests {
                         && container["placements"][0]["top_load"]["ticks"] == 0
                 })
         );
+    }
+
+    #[test]
+    fn the_block_solver_fallback_packs_the_same_whichever_way_the_items_are_listed() {
+        // A stacking group sends the block solver to its fallback. Packed in request order,
+        // the slab listed first was left out and only the four cubes were placed.
+        let slab = json!({"id": "a", "dimensions": {"length": "100", "width": "100", "height": "50"},
+                          "allowed_rotations": ["LWH"], "stacking_group": "A",
+                          "accepts_stacking_groups": ["A"]});
+        let cubes = json!({"id": "b", "quantity": 4, "stacking_group": "B",
+                           "dimensions": {"length": "50", "width": "50", "height": "50"}});
+        let crate_box = json!([{"id": "crate", "quantity": 1, "inner_dimensions":
+                                {"length": "100", "width": "100", "height": "100"}}]);
+        let configuration = json!({"solver_profile": "quality", "solvers": ["homogeneous_blocks"],
+                                   "multi_start_orders": 1});
+        for items in [json!([slab, cubes]), json!([cubes, slab])] {
+            let result = solve(configuration.clone(), items, crate_box.clone());
+            assert_eq!(result["algorithm"]["solver"], "homogeneous_blocks:fallback");
+            assert_eq!(result["summary"]["packed_item_count"], 5);
+            assert_eq!(result["summary"]["container_count"], 1);
+        }
+    }
+
+    #[test]
+    fn fast_profile_limits_starts_to_one() {
+        let result = solve(
+            json!({"solver_profile": "fast", "solvers": ["extreme_points"]}),
+            four_similar_cartons(),
+            carton_box(),
+        );
+        let starts = result["termination"]["starts"].as_array().expect("starts");
+        assert_eq!(starts.len(), 1);
+        let id = starts[0]["id"].as_str().expect("start id");
+        assert!(
+            id.contains("volume"),
+            "fast profile start must use volume order: {id}"
+        );
+    }
+
+    #[test]
+    fn effort_budget_max_restarts_limits_start_orders() {
+        let result = solve(
+            json!({
+                "solver_profile": "balanced",
+                "multi_start_orders": 6,
+                "solvers": ["extreme_points"],
+                "effort_budget": {"max_restarts": 2}
+            }),
+            four_similar_cartons(),
+            carton_box(),
+        );
+        let starts = result["termination"]["starts"].as_array().expect("starts");
+        assert!(
+            starts.len() <= 2,
+            "max_restarts must cap starts: {starts:?}"
+        );
+    }
+
+    #[test]
+    fn portfolio_order_strategies_tie_break_deterministically_by_id() {
+        use super::{
+            sort_base, sort_constrained, sort_edge, sort_small_edge, sort_small_volume,
+            sort_volume, sort_weight,
+        };
+        use crate::api::request_from_json;
+
+        let req = request_from_json(&json!({
+            "units": {"length": "mm"},
+            "items": [
+                {"id": "item_b", "dimensions": {"length": "100", "width": "100", "height": "100"}},
+                {"id": "item_a", "dimensions": {"length": "100", "width": "100", "height": "100"}}
+            ],
+            "containers": [{"id": "c", "inner_dimensions": {"length": "200", "width": "200", "height": "200"}}]
+        }))
+        .expect("valid request");
+
+        let items = req.instances();
+        for sort_fn in [
+            sort_volume,
+            sort_small_edge,
+            sort_small_volume,
+            sort_base,
+            sort_edge,
+            sort_weight,
+            sort_constrained,
+        ] {
+            let sorted = sort_fn(items.clone(), "default");
+            assert_eq!(sorted[0].item.id, "item_a");
+            assert_eq!(sorted[1].item.id, "item_b");
+        }
     }
 }
