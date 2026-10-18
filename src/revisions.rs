@@ -477,7 +477,10 @@ fn validate_placement(event: &Map<String, Value>) -> RevisionResult<()> {
     {
         return refuse(
             RevisionErrorCode::InvalidEvent,
-            "placement.orientation is one of the six codes",
+            format!(
+                "placement.orientation must be one of {}",
+                spell_names(&ORIENTATIONS)
+            ),
         );
     }
     let instance = placement.get("container_instance").map_or(Some(1), integer);

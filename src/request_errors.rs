@@ -3,11 +3,11 @@
 //! A caller who sends a malformed request needs to know which value is wrong and why, in a
 //! form a program can branch on, and the four engines must say it identically. So the first
 //! violation is refused as a [`RequestError`] naming a reason from a closed set and the JSON
-//! Pointer of the value, in the order every engine walks: units, configuration, items,
-//! containers. The Python reference (`packvium/request_errors.py`) is the source of truth for
+//! Pointer of the value, in the order every engine walks: units, output, configuration,
+//! items, containers. The Python reference (`packvium/request_errors.py`) is the source of truth for
 //! every rule, pointer and text here; a cross-engine suite holds this engine to it.
 
-use crate::canonical_json::{MAX_EXACT_MAGNITUDE, json_integer, json_spelling};
+use crate::canonical_json::{MAX_EXACT_MAGNITUDE, json_integer, json_spelling, spell_names};
 use crate::error::RequestError;
 use crate::fixed::unknown_keys;
 use crate::made_to_measure::MadeToMeasure;
@@ -28,6 +28,20 @@ const OBJECTIVES: [&str; 7] = [
     "maximum_volume",
 ];
 const ACCESS_DIRECTIONS: [&str; 6] = ["+x", "-x", "+y", "-y", "+z", "-z"];
+// The schema's closed vocabularies, each refused as `not_allowed` like the two above.
+const SOLVERS: [&str; 6] = [
+    "grid",
+    "extreme_points",
+    "homogeneous_blocks",
+    "layer",
+    "maximal_spaces",
+    "exact_small",
+];
+const ROTATIONS: [&str; 6] = ["LWH", "LHW", "WLH", "WHL", "HLW", "HWL"];
+const LENGTH_UNITS: [&str; 5] = ["mm", "cm", "m", "in", "ft"];
+const WEIGHT_UNITS: [&str; 5] = ["mg", "g", "kg", "oz", "lb"];
+const GROUND_CONTACT_RULES: [&str; 4] = ["free", "covered", "single", "multiple"];
+const SHAPE_TYPES: [&str; 3] = ["rigid_cuboid", "convex_hull", "compressible"];
 const CONFIGURATION_INTEGERS: [(&str, i64); 10] = [
     ("time_limit_ms", 1),
     ("alternatives", 1),
@@ -78,6 +92,7 @@ const AXES: [&str; 3] = ["x", "y", "z"];
 pub(crate) fn check_request(data: &Value) -> Checked<&str> {
     let request = object(data, "")?;
     let unit = check_units(request.get("units"))?;
+    check_output(request.get("output"))?;
     check_configuration(request.get("configuration"), unit)?;
     let items = required_list(request, "items", "")?;
     for (index, raw) in items.iter().enumerate() {
@@ -112,6 +127,19 @@ fn check_units(raw: Option<&Value>) -> Checked<&str> {
     }
 }
 
+fn check_output(raw: Option<&Value>) -> Checked {
+    let Some(raw) = present(raw) else {
+        return Ok(());
+    };
+    let output = object(raw, "/output")?;
+    optional(output, "length_unit", "/output", |value, field| {
+        one_of(value, field, &LENGTH_UNITS)
+    })?;
+    optional(output, "weight_unit", "/output", |value, field| {
+        one_of(value, field, &WEIGHT_UNITS)
+    })
+}
+
 fn check_configuration(raw: Option<&Value>, unit: &str) -> Checked {
     let Some(raw) = present(raw) else {
         return Ok(());
@@ -125,6 +153,21 @@ fn check_configuration(raw: Option<&Value>, unit: &str) -> Checked {
     optional(configuration, "objective", at, |value, field| {
         one_of(value, field, &OBJECTIVES)
     })?;
+    optional(configuration, "solvers", at, |value, field| {
+        each_one_of(value, field, &SOLVERS)
+    })?;
+    optional(
+        configuration,
+        "dimensional_weight_length_unit",
+        at,
+        |value, field| one_of(value, field, &LENGTH_UNITS),
+    )?;
+    optional(
+        configuration,
+        "dimensional_weight_weight_unit",
+        at,
+        |value, field| one_of(value, field, &WEIGHT_UNITS),
+    )?;
     for (name, minimum) in CONFIGURATION_INTEGERS {
         optional(configuration, name, at, |value, field| {
             integer(value, field, minimum)
@@ -168,7 +211,8 @@ fn check_item(raw: &Value, at: &str, unit: &str) -> Checked {
         })?;
     }
     optional(item, "nesting_height", at, |value, field| {
-        measure(value, field, MeasureKind::Length, unit)
+        measure(value, field, MeasureKind::Length, unit)?;
+        nesting_below_height(value, field, item, unit)
     })?;
     for (name, minimum) in [
         ("max_stacked_items", 1),
@@ -192,7 +236,39 @@ fn check_item(raw: &Value, at: &str, unit: &str) -> Checked {
             stacking_group_name(name, &join(field, &index.to_string()))?;
         }
         Ok(())
+    })?;
+    optional(item, "allowed_rotations", at, |value, field| {
+        each_one_of(value, field, &ROTATIONS)
+    })?;
+    optional(item, "ground_contact_rule", at, |value, field| {
+        one_of(value, field, &GROUND_CONTACT_RULES)
+    })?;
+    optional(item, "shape_type", at, |value, field| {
+        one_of(value, field, &SHAPE_TYPES)
     })
+}
+
+/// A nested copy sinks by less than its own height, or it would vanish into the one below
+///. Both measures have passed their own rules already. O(1).
+fn nesting_below_height(
+    value: &Value,
+    field: &str,
+    item: &Map<String, Value>,
+    unit: &str,
+) -> Checked {
+    let ticks = |value: &Value| measure_ticks(value, unit, MeasureKind::Length).ok();
+    let height = item
+        .get("dimensions")
+        .and_then(|sides| sides.get("height"))
+        .and_then(ticks);
+    match (ticks(value), height) {
+        (Some(nesting), Some(height)) if nesting >= height => Err(RequestError::new(
+            "invalid_value",
+            field,
+            "must be less than the item's height",
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn stacking_group_name(value: &Value, field: &str) -> Checked {
@@ -546,26 +622,22 @@ fn one_of(value: &Value, field: &str, allowed: &[&str]) -> Checked {
     if value.as_str().is_some_and(|item| allowed.contains(&item)) {
         return Ok(());
     }
-    let allowed_values = allowed
-        .iter()
-        .map(|item| Value::String((*item).to_owned()))
-        .collect();
     Err(RequestError::new(
         "not_allowed",
         field,
-        format!(
-            "must be one of {}",
-            json_spelling(&Value::Array(allowed_values))
-        ),
+        format!("must be one of {}", spell_names(allowed)),
     ))
 }
 
-fn access_directions(raw: &Value, at: &str) -> Checked {
-    let directions = list(raw, at)?;
-    for (index, direction) in directions.iter().enumerate() {
-        one_of(direction, &join(at, &index.to_string()), &ACCESS_DIRECTIONS)?;
+fn each_one_of(raw: &Value, at: &str, allowed: &[&str]) -> Checked {
+    for (index, value) in list(raw, at)?.iter().enumerate() {
+        one_of(value, &join(at, &index.to_string()), allowed)?;
     }
     Ok(())
+}
+
+fn access_directions(raw: &Value, at: &str) -> Checked {
+    each_one_of(raw, at, &ACCESS_DIRECTIONS)
 }
 
 /// A measure is an integer, a string or `{value, unit}`, in a known unit, and never negative.

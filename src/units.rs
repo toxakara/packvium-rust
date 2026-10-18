@@ -100,6 +100,17 @@ impl MeasureKind {
     }
 }
 
+/// The output unit a request without `output.length_unit` is written in: the
+/// request's own `units.length`, spelt as the schema's output code, so `Inches` is `in`. A
+/// unit no output code names -- the internal `tick` -- gives `mm`, the default of both blocks.
+pub(crate) fn output_length_unit(request_unit: &str) -> &'static str {
+    let multiplier = MeasureKind::Length.multiplier(request_unit);
+    ["mm", "cm", "m", "in", "ft"]
+        .into_iter()
+        .find(|code| MeasureKind::Length.multiplier(code) == multiplier)
+        .unwrap_or("mm")
+}
+
 /// A measure's ticks before any range check, so a caller can tell a negative measure from
 /// one that does not parse at all. The text of the scalar comes back for error messages.
 fn unbounded_ticks(

@@ -21,17 +21,28 @@ pub struct Candidate {
     pub dimensions: Dimensions,
     pub envelope_dimensions: Dimensions,
     pub support_ratio: f64,
+    /// Sum of the registered `CandidateScorer`s, `0` when none is registered. It leads the
+    /// ranking; the built-in far-corner key only breaks its ties.
     pub score: i128,
 }
 
-type CandidateOrderKey = (i128, i64, i64, i64, &'static str);
+type CandidateOrderKey = (i128, i64, i64, i64, i64, i64, i64, &'static str);
 
+/// Lower ranks first: scorer sum, then the envelope's far corner `z2`, `y2`, `x2`, then
+/// its origin `z`, `y`, `x` and the rotation name. Compared as a tuple, never folded into
+/// one weighted integer: in ticks a long container's `x2` outweighs a 1 mm step in `y2`
+/// under any fixed weights.
 fn candidate_order_key(candidate: &Candidate) -> CandidateOrderKey {
+    let origin = candidate.envelope_origin;
+    let envelope = candidate.envelope_dimensions;
     (
         candidate.score,
-        candidate.envelope_origin.z,
-        candidate.envelope_origin.y,
-        candidate.envelope_origin.x,
+        origin.z + envelope.height.0,
+        origin.y + envelope.width.0,
+        origin.x + envelope.length.0,
+        origin.z,
+        origin.y,
+        origin.x,
         candidate.rotation.as_str(),
     )
 }
@@ -194,15 +205,27 @@ impl ContainerState {
     }
 }
 
-pub fn candidate_points(state: &ContainerState, limit: usize) -> Vec<Point> {
+/// Which candidate points a search scans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointSet {
+    /// The exposed corners and their projections, as Python and PHP keep them: every point
+    /// has a geometric reason to exist. The extreme-point family searches these. Offering
+    /// it the Cartesian set left 3658 items out over the 67 BR1-BR7 instances under `fast`,
+    /// against 2711 here and 3004 in Python; a denser set lets the greedy rule take a locally
+    /// tighter corner that a later item then cannot use.
+    Sparse,
+    /// Under a limit above `SPARSE_POINT_LIMIT`, every combination of placed faces: the
+    /// discrete model the exact search claims to be exact within.
+    Cartesian,
+}
+
+/// At or below this `max_candidate_points` every search scans the sparse set: the Cartesian
+/// product would spend most of a tight allowance on arbitrary coordinate combinations.
+const SPARSE_POINT_LIMIT: usize = 64;
+
+pub fn candidate_points(state: &ContainerState, limit: usize, set: PointSet) -> Vec<Point> {
     let limit = limit.max(1);
-    // Under a tight point budget the Cartesian product spends most of the allowance
-    // on arbitrary coordinate combinations. The sparse corner/projection set matches
-    // Python/PHP and gives every retained point a geometric reason to exist. With a
-    // generous budget, retain the Cartesian set's useful mixed-face origins: removing
-    // those globally regresses dense heterogeneous scenes even though it is faster.
-    const SPARSE_POINT_LIMIT: usize = 64;
-    if limit <= SPARSE_POINT_LIMIT {
+    if set == PointSet::Sparse || limit <= SPARSE_POINT_LIMIT {
         return state
             .points
             .iter()
@@ -262,10 +285,11 @@ pub fn find_candidates(
     constraints: &[Arc<dyn PlacementConstraint>],
     scorers: &[Arc<dyn CandidateScorer>],
     limit: usize,
+    point_set: PointSet,
     deadline: &Deadline,
     metrics: &mut SolverMetrics,
 ) -> Vec<Candidate> {
-    let mut points = candidate_points(state, request.config.max_candidate_points);
+    let mut points = candidate_points(state, request.config.max_candidate_points, point_set);
     if item.item.nesting_height.is_some() {
         let nested = nesting_points(state, item);
         let merged = points
@@ -284,7 +308,8 @@ pub fn find_candidates(
             .collect();
     }
     if state.packed.container.axles.is_some() {
-        points.extend(axle_balanced_points(state, item));
+        let axle_points = axle_balanced_points(state, item, request.config.clearance);
+        append_unseen(&mut points, axle_points);
     }
     find_candidates_at_points(
         state,
@@ -330,7 +355,15 @@ fn nesting_points(state: &ContainerState, item: &ItemInstance) -> Vec<Point> {
 /// open floor space, away from every wall and every other box, purely to keep that
 /// item's own moment off one axle's limit (see `axle_balanced_origins`). Floor
 /// level only (z=0), since that is the one place support needs no lateral contact.
-fn axle_balanced_points(state: &ContainerState, item: &ItemInstance) -> Vec<Point> {
+///
+/// The origins are envelope origins: `axle_balanced_origins` is given the envelope's length,
+/// whose centre is the physical centre, so with a clearance the point still seats the item
+/// on the limit (S10). The orientations are the sweep's own, hulls included.
+fn axle_balanced_points(
+    state: &ContainerState,
+    item: &ItemInstance,
+    clearance: Length,
+) -> Vec<Point> {
     let limit_x = state.packed.container.inner_dimensions.length.0;
     let floor_ys: BTreeSet<i64> = {
         let ys: BTreeSet<i64> = state
@@ -345,12 +378,8 @@ fn axle_balanced_points(state: &ContainerState, item: &ItemInstance) -> Vec<Poin
         }
     };
     let mut points = Vec::new();
-    for (_, physical) in item
-        .item
-        .dimensions
-        .unique_rotations(&item.item.allowed_rotations)
-    {
-        let dx = physical.length.0;
+    for (_, physical) in rotation_forms(&item.item) {
+        let dx = envelope_of(physical, clearance).length.0;
         for x in axle_balanced_origins(
             &state.packed.container,
             &state.packed.placements,
@@ -366,6 +395,43 @@ fn axle_balanced_points(state: &ContainerState, item: &ItemInstance) -> Vec<Poin
         }
     }
     points
+}
+
+/// Appends the `extra` points not already offered, keeping their order (S20).
+///
+/// A repeated point is the same candidate scanned twice: it can change nothing but the
+/// counted effort. O(k log a + a log a) for `k` offered and `a` extra points.
+fn append_unseen(points: &mut Vec<Point>, extra: Vec<Point>) {
+    let key = |point: &Point| (point.x, point.y, point.z);
+    let mut fresh: BTreeSet<(i64, i64, i64)> = extra.iter().map(key).collect();
+    for point in points.iter() {
+        fresh.remove(&key(point));
+    }
+    points.extend(extra.into_iter().filter(|point| fresh.remove(&key(point))));
+}
+
+/// The orientations a candidate sweep tries.
+///
+/// A hull is not the same solid under two rotations that happen to give the same box, so
+/// `unique_rotations` -- which keys on the box -- would silently drop orientations that
+/// differ. Cuboids keep the deduplication they have always had.
+fn rotation_forms(item: &Item) -> Vec<(Rotation, Dimensions)> {
+    if item.shape_type == ShapeType::ConvexHull {
+        item.allowed_rotations
+            .iter()
+            .map(|rotation| (*rotation, item.dimensions.rotated(*rotation)))
+            .collect()
+    } else {
+        item.dimensions.unique_rotations(&item.allowed_rotations)
+    }
+}
+
+fn envelope_of(physical: Dimensions, clearance: Length) -> Dimensions {
+    if clearance.0 > 0 {
+        physical.expand(clearance)
+    } else {
+        physical
+    }
 }
 
 // Same shape and same reasoning as `find_candidates` above -- `points` is simply
@@ -419,32 +485,13 @@ pub fn find_candidates_at_points(
         origin: Point::ZERO,
         dimensions: state.packed.container.inner_dimensions,
     };
-    // A hull is not the same solid under two rotations that happen to give the same box, so
-    // `unique_rotations` -- which keys on the box -- would silently drop orientations that
-    // differ. Cuboids keep the deduplication they have always had.
-    let is_hull = item.item.shape_type == ShapeType::ConvexHull;
     let exact_hull = item
         .item
         .hull_collision_is_exact(request.config.clearance.0 == 0);
-    let rotation_forms: Vec<(Rotation, Dimensions)> = if is_hull {
-        item.item
-            .allowed_rotations
-            .iter()
-            .map(|rotation| (*rotation, item.item.dimensions.rotated(*rotation)))
-            .collect()
-    } else {
-        item.item
-            .dimensions
-            .unique_rotations(&item.item.allowed_rotations)
-    };
-    let rotations = rotation_forms
+    let rotations = rotation_forms(&item.item)
         .into_iter()
         .map(|(rotation, physical)| {
-            let envelope = if request.config.clearance.0 > 0 {
-                physical.expand(request.config.clearance)
-            } else {
-                physical
-            };
+            let envelope = envelope_of(physical, request.config.clearance);
             let shape = exact_hull
                 .then_some(item.item.hull_vertices.as_ref())
                 .flatten()
@@ -573,38 +620,32 @@ pub fn find_candidates_at_points(
                 top_load: Weight(0),
                 fixed: false,
             });
-            let placement_collision =
-                state
-                    .spatial_index
-                    .query(envelope_box)
-                    .iter()
-                    .copied()
-                    .any(|index| {
-                        metrics.collision_checks = metrics.collision_checks.saturating_add(1);
-                        let existing = &state.packed.placements[index];
-                        if !envelope_box.intersects(existing.envelope_box()) {
-                            return false;
-                        }
-                        if tentative
-                            .as_ref()
-                            .is_some_and(|placement| valid_nesting(existing, placement))
-                        {
-                            return false;
-                        }
-                        let blocker = placed_hulls[index].as_deref();
-                        // The axis-aligned test is the broad phase and stays mandatory. Only
-                        // when a hull is one of the two solids does the exact test get to
-                        // overrule it, so a request of ordinary boxes never reaches here.
-                        if shape.is_none() && blocker.is_none() {
-                            return true;
-                        }
-                        solids_collide(
-                            shape.as_deref(),
-                            envelope_box,
-                            blocker,
-                            existing.envelope_box(),
-                        )
-                    });
+            let placement_collision = state.spatial_index.any_hit(envelope_box, |index| {
+                metrics.collision_checks = metrics.collision_checks.saturating_add(1);
+                let existing = &state.packed.placements[index];
+                if !envelope_box.intersects(existing.envelope_box()) {
+                    return false;
+                }
+                if tentative
+                    .as_ref()
+                    .is_some_and(|placement| valid_nesting(existing, placement))
+                {
+                    return false;
+                }
+                let blocker = placed_hulls[index].as_deref();
+                // The axis-aligned test is the broad phase and stays mandatory. Only
+                // when a hull is one of the two solids does the exact test get to
+                // overrule it, so a request of ordinary boxes never reaches here.
+                if shape.is_none() && blocker.is_none() {
+                    return true;
+                }
+                solids_collide(
+                    shape.as_deref(),
+                    envelope_box,
+                    blocker,
+                    existing.envelope_box(),
+                )
+            });
             if placement_collision {
                 continue;
             }
@@ -740,12 +781,9 @@ pub fn find_candidates_at_points(
             }
 
             metrics.feasible_candidates = metrics.feasible_candidates.saturating_add(1);
-            let mut score = (point.z + envelope.height.0) as i128 * 1_000_000_000
-                + (point.y + envelope.width.0) as i128 * 10_000
-                + (point.x + envelope.length.0) as i128;
-            for scorer in scorers {
-                score = score.saturating_add(scorer.score(&context, item, &candidate));
-            }
+            let score = scorers.iter().fold(0_i128, |sum, scorer| {
+                sum.saturating_add(scorer.score(&context, item, &candidate))
+            });
             candidates.push(Candidate { score, ..candidate });
         }
     }
@@ -1566,23 +1604,20 @@ fn placement_support_view(existing: &[Placement], candidate: &Placement) -> Cand
     }
 }
 
+/// Item against item only, as docs/POLICY-RULES.md states it: a container's own tags
+/// restrict nothing through `incompatible_tags`.
 fn incompatible(state: &ContainerState, item: &ItemInstance) -> bool {
-    !state
-        .packed
-        .container
-        .tags
-        .is_disjoint(&item.item.incompatible_tags)
-        || state.packed.placements.iter().any(|placement| {
-            !placement
-                .instance
+    state.packed.placements.iter().any(|placement| {
+        !placement
+            .instance
+            .item
+            .tags
+            .is_disjoint(&item.item.incompatible_tags)
+            || !item
                 .item
                 .tags
-                .is_disjoint(&item.item.incompatible_tags)
-                || !item
-                    .item
-                    .tags
-                    .is_disjoint(&placement.instance.item.incompatible_tags)
-        })
+                .is_disjoint(&placement.instance.item.incompatible_tags)
+    })
 }
 
 fn candidate_respects_loads(
@@ -2640,6 +2675,7 @@ fn try_pack_into_greedy(
                 constraints,
                 scorers,
                 request.config.max_candidates_per_item,
+                PointSet::Sparse,
                 deadline,
                 metrics,
             );
@@ -3019,15 +3055,16 @@ fn try_pack_into_beam(
                     constraints,
                     scorers,
                     request.config.max_candidates_per_item,
+                    PointSet::Sparse,
                     deadline,
                     metrics,
                 ) {
-                    let mut state = node.state.clone();
+                    let mut state = branch(&node.state, 1);
                     apply_candidate(&mut state, batch[0].clone(), &candidate);
                     children.push(state);
                 }
             } else {
-                let mut state = node.state.clone();
+                let mut state = branch(&node.state, batch.len());
                 let mut accepted = true;
                 for item in batch {
                     let candidates = find_candidates(
@@ -3037,6 +3074,7 @@ fn try_pack_into_beam(
                         constraints,
                         scorers,
                         1,
+                        PointSet::Sparse,
                         deadline,
                         metrics,
                     );
@@ -3119,6 +3157,18 @@ fn try_pack_into_beam(
         incumbent = completed;
     }
     (incumbent.state, incumbent.unplaced)
+}
+
+/// A copy of `state` with room for `placements` more placements.
+///
+/// A clone's placement vector is exactly full, so the first placement a beam child adds
+/// doubled it: every live expansion then held twice the placements it needed, and the
+/// expansions are the beam's peak. Reserving the exact room keeps a child at `p + k`
+/// placements instead of `2p`, for one copy of the vector the doubling made anyway.
+fn branch(state: &ContainerState, placements: usize) -> ContainerState {
+    let mut child = state.clone();
+    child.packed.placements.reserve_exact(placements);
+    child
 }
 
 /// The `width` best expansions in beam order, best first -- what a stable sort followed by a
@@ -3555,6 +3605,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn axle_points_already_offered_are_not_offered_again() {
+        let point = |x, y| Point { x, y, z: 0 };
+        let mut points = vec![point(0, 0), point(5, 0), point(0, 5)];
+        append_unseen(
+            &mut points,
+            vec![
+                point(7, 0),
+                point(5, 0),
+                point(7, 5),
+                point(7, 0),
+                point(0, 5),
+            ],
+        );
+        assert_eq!(
+            points,
+            [
+                point(0, 0),
+                point(5, 0),
+                point(0, 5),
+                point(7, 0),
+                point(7, 5)
+            ]
+        );
+    }
+
+    #[test]
     fn the_running_flat_bag_extent_equals_the_extent_from_scratch() {
         // A fixed-seed linear congruential sequence: the property is checked over many
         // random scenes without making the suite depend on a random source.
@@ -3659,6 +3735,38 @@ mod tests {
     }
 
     #[test]
+    fn a_beam_child_holds_only_the_placements_it_adds() {
+        // A clone's vector is exactly full, and the child's first push used to
+        // double it, so each live expansion carried twice the placements it needed.
+        let mut parent = ContainerState::new(container(), 1);
+        for index in 0..5 {
+            let origin = Point {
+                x: index * 10,
+                y: 0,
+                z: 0,
+            };
+            let instance = ItemInstance {
+                item: item("box"),
+                sequence: index as usize,
+            };
+            apply_candidate(
+                &mut parent,
+                instance,
+                &candidate(0, origin, Rotation::Lwh, 1.0),
+            );
+        }
+        let mut child = branch(&parent, 1);
+        let next = ItemInstance {
+            item: item("box"),
+            sequence: 5,
+        };
+        let origin = Point { x: 50, y: 0, z: 0 };
+        apply_candidate(&mut child, next, &candidate(0, origin, Rotation::Lwh, 1.0));
+        assert_eq!(child.packed.placements.len(), 6);
+        assert_eq!(child.packed.placements.capacity(), 6);
+    }
+
+    #[test]
     fn the_container_plan_bound_counts_a_wedge_pair_as_one_crate() {
         // Two wedges that fill one crate between them have boxes worth two crates.
         // Counted by box, the plan bound said a second crate was unavoidable.
@@ -3760,6 +3868,67 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "limit={limit}");
         }
+    }
+
+    #[test]
+    fn far_corner_y_outranks_any_x_on_a_long_container() {
+        // 12.5 m along x against 1 mm along y: a weighted `y2 * 1e4 + x2` ranks the
+        // deeper candidate first, the lexicographic key does not.
+        let long_way = candidate(
+            0,
+            Point {
+                x: 200_000_000,
+                y: 0,
+                z: 0,
+            },
+            Rotation::Lwh,
+            1.0,
+        );
+        let one_mm_deeper = candidate(
+            0,
+            Point {
+                x: 0,
+                y: 16_000,
+                z: 0,
+            },
+            Rotation::Lwh,
+            1.0,
+        );
+        let higher = candidate(0, Point { x: 0, y: 0, z: 1 }, Rotation::Lwh, 1.0);
+        let favoured = candidate(
+            -1,
+            Point {
+                x: 0,
+                y: 0,
+                z: 16_000,
+            },
+            Rotation::Lwh,
+            1.0,
+        );
+        let mut ranked = [higher, one_mm_deeper, long_way, favoured];
+        ranked.sort_by_key(candidate_order_key);
+        let origins: Vec<Point> = ranked.iter().map(|c| c.envelope_origin).collect();
+        assert_eq!(
+            origins,
+            vec![
+                Point {
+                    x: 0,
+                    y: 0,
+                    z: 16_000
+                },
+                Point {
+                    x: 200_000_000,
+                    y: 0,
+                    z: 0
+                },
+                Point {
+                    x: 0,
+                    y: 16_000,
+                    z: 0
+                },
+                Point { x: 0, y: 0, z: 1 },
+            ]
+        );
     }
 
     fn item(id: &str) -> Item {

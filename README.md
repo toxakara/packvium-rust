@@ -11,15 +11,21 @@ coordinates and rotations for each item, with a reason for anything that did not
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.6.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.7.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-rust/blob/main/docs/GUARANTEES.md)
 > before relying on a result.
 
+```sh
+cargo add packvium
+```
+
+or, in `Cargo.toml`:
+
 ```toml
 [dependencies]
-packvium = "1.5"
+packvium = "1.7"
 ```
 
 ## Quick start
@@ -75,7 +81,7 @@ cargo run --example basic
 | --- | --- |
 | [`basic.rs`](https://github.com/toxakara/packvium-rust/blob/main/examples/basic.rs) | An order into a carton, read back into typed structs; an item that cannot fit, and why. |
 | [`constraints.rs`](https://github.com/toxakara/packvium-rust/blob/main/examples/constraints.rs) | Rotations and keep-upright, stacking limits and top load, support ratio and incompatible tags — each shown with and without the rule. |
-| [`objectives.rs`](https://github.com/toxakara/packvium-rust/blob/main/examples/objectives.rs) | The six objectives, and the scenes where two of them pick different containers. |
+| [`objectives.rs`](https://github.com/toxakara/packvium-rust/blob/main/examples/objectives.rs) | Six of the seven objectives (all but `maximum_volume`), and the scenes where two of them pick different containers. |
 | [`units.rs`](https://github.com/toxakara/packvium-rust/blob/main/examples/units.rs) | What you can type (fractions, inches, pounds), why nothing is a float, and exact fits. |
 | [`errors.rs`](https://github.com/toxakara/packvium-rust/blob/main/examples/errors.rs) | Branching on a refused request with `code()`, `reason()` and `field()`, and why an item that does not fit is not an error. |
 | [`trucking.rs`](https://github.com/toxakara/packvium-rust/blob/main/examples/trucking.rs) | A delivery van: stops unloaded in route order through a named door, and axle loads kept inside their ratings. |
@@ -128,6 +134,25 @@ A request that is valid but does not fit completely is not an error. The result 
 left out, and why, in `unpacked_items`, and `packvium_core::explain_reason` turns each reason
 code into a sentence.
 
+## Checking a result
+
+*New in 1.7.0.*
+
+`validate_json` checks a result against the request it answers, from the JSON alone: geometry,
+support and load, accounting, the result's facts and its score. It is the same reference
+validator every Packvium package exports, so it returns the same issues, code and detail:
+
+```rust
+let result = packvium_core::pack_json(request)?;
+let issues = packvium_core::validate_json(request, &result)?; // empty: valid
+for issue in &issues {
+    println!("{}: {}", issue.code, issue.detail); // e.g. collision: cube#1 with cube#2 in box#1
+}
+```
+
+It shares no code with the solvers, so it judges any engine's result, not only this crate's. A
+result without the documented shape is `Err(MalformedResult { kind, message })`.
+
 ## Determinism
 
 The same request gives the same placements: the only randomness is seeded from the request's
@@ -150,8 +175,9 @@ of the request, so a different seed is a different, equally reproducible request
   floor-only, non-stackable, stack-count and top-load limits, minimum support ratio, tag
   incompatibility, clearance and rectangular obstacles; and for vehicles, route order by
   `stop_index`, unloading doors by `access_directions`, and two-axle load limits.
-- **Six objectives.** Fewest containers, packaging cost, carrier-billable weight, carrier
-  rate cards, open-dimension height and value kept — each a vector of exact integers.
+- **Seven objectives.** Fewest containers, packaging cost, carrier-billable weight, carrier
+  rate cards, open-dimension height, value kept and volume loaded — each a vector of exact
+  integers.
 - **A solver portfolio, not one algorithm.** Regular-grid, layer, extreme-point,
   maximal-space and bounded exact search, selected by problem shape and profile.
 - **Answers you can check.** Every solution is re-validated by logic independent of the
@@ -205,7 +231,7 @@ Documentation, the constraint reference and the benchmarks are at
 | --- | --- | --- |
 | Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
 | PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
-| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.5"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.7"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
 | Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
 | Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
 | PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |
@@ -228,7 +254,7 @@ CodeMeta form.
 @software{packvium_rust,
   author  = {{Packvium contributors}},
   title   = {Packvium for Rust},
-  version = {1.6.0},
+  version = {1.7.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

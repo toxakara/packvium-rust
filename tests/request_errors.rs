@@ -228,13 +228,15 @@ fn a_fixed_placement_refusal_keeps_its_message_and_gains_reason_and_field() {
 #[test]
 fn a_parse_failure_the_rules_do_not_name_is_an_invalid_value_without_a_field() {
     let mut request = base();
-    request["items"][0]["shape_type"] = json!("sphere");
+    // A model rule the schema does not state: an item needs at least one rotation. (An
+    // unknown shape type was this case until made it a `not_allowed` rule.)
+    request["items"][0]["allowed_rotations"] = json!([]);
     let error = refused(&request);
     assert_eq!(
         (error.code(), error.reason(), error.field()),
         ("invalid_request", "invalid_value", "")
     );
-    assert!(error.detail().contains("item.shape_type"), "{error}");
+    assert!(error.detail().contains("no allowed rotations"), "{error}");
 }
 
 #[test]
@@ -449,6 +451,109 @@ fn malformed_stacking_groups_are_refused_by_name() {
         assert_eq!(
             reason_and_field(edit),
             (reason.to_owned(), field.to_owned(), detail.to_owned())
+        );
+    }
+}
+
+/// (audit D3): an output unit outside the schema's enum is refused, never copied into
+/// the result as the label of a value converted to millimetres.
+#[test]
+fn an_unknown_output_unit_is_refused_rather_than_copied_through() {
+    for (name, unit, allowed) in [
+        ("length_unit", "furlong", r#"["mm","cm","m","in","ft"]"#),
+        ("weight_unit", "stone", r#"["mg","g","kg","oz","lb"]"#),
+    ] {
+        let mut request = base();
+        request["output"] = json!({ name: unit });
+        let error = refused(&request);
+        let field = format!("/output/{name}");
+        assert_eq!(
+            outcome(&error),
+            (
+                "invalid_request",
+                "not_allowed",
+                field.as_str(),
+                format!("invalid_request: {field}: must be one of {allowed}")
+            )
+        );
+    }
+}
+
+#[test]
+fn a_nesting_height_not_below_the_height_is_refused_at_its_pointer() {
+    for nesting in [json!("100"), json!({ "value": "11", "unit": "cm" })] {
+        let mut request = base();
+        request["items"][0]["nesting_height"] = nesting;
+        let error = refused(&request);
+        assert_eq!(
+            (error.reason(), error.field(), error.detail()),
+            (
+                "invalid_value",
+                "/items/0/nesting_height",
+                "must be less than the item's height"
+            )
+        );
+    }
+}
+
+/// With no output block, the result is in the request unit spelt as its code.
+#[test]
+fn without_an_output_block_the_result_is_in_the_request_unit_spelt_as_its_code() {
+    for (unit, code) in [
+        ("cm", "cm"),
+        ("MM", "mm"),
+        ("IN", "in"),
+        ("Inches", "in"),
+        ("millimeter", "mm"),
+        ("tick", "mm"),
+    ] {
+        let mut request = base();
+        request["units"] = json!({ "length": unit });
+        let result: Value =
+            serde_json::from_str(&pack_json(&request.to_string()).unwrap()).unwrap();
+        assert_eq!(
+            result["containers"][0]["inner_dimensions"]["length"]["unit"], code,
+            "{unit}"
+        );
+    }
+}
+
+/// The reference's refusals for the configuration's billing units and a cut box's price.
+#[test]
+fn billing_units_and_a_negative_board_price_are_refused_as_the_reference_refuses_them() {
+    let cases: Vec<(Edit, &str, &str, &str)> = vec![
+        (
+            |r| r["configuration"]["dimensional_weight_length_unit"] = json!("furlong"),
+            "not_allowed",
+            "/configuration/dimensional_weight_length_unit",
+            r#"invalid_request: /configuration/dimensional_weight_length_unit: must be one of ["mm","cm","m","in","ft"]"#,
+        ),
+        (
+            |r| r["configuration"]["dimensional_weight_weight_unit"] = json!("stone"),
+            "not_allowed",
+            "/configuration/dimensional_weight_weight_unit",
+            r#"invalid_request: /configuration/dimensional_weight_weight_unit: must be one of ["mg","g","kg","oz","lb"]"#,
+        ),
+        (
+            |r| {
+                r["containers"][0]["made_to_measure"] = json!({
+                    "minimum": { "length": "100", "width": "100", "height": "100" },
+                    "increment": { "length": "50", "width": "50", "height": "50" },
+                    "cost_per_square_metre_minor": -1
+                })
+            },
+            "below_minimum",
+            "/containers/0/made_to_measure/cost_per_square_metre_minor",
+            "invalid_request: /containers/0/made_to_measure/cost_per_square_metre_minor: must be at least 0",
+        ),
+    ];
+    for (edit, reason, field, message) in cases {
+        let mut request = base();
+        edit(&mut request);
+        let error = refused(&request);
+        assert_eq!(
+            outcome(&error),
+            ("invalid_request", reason, field, message.to_owned())
         );
     }
 }

@@ -22,6 +22,7 @@ mod nested;
 mod policy;
 mod rebalance;
 mod request_errors;
+pub mod result_validation;
 pub mod revisions;
 mod sequence;
 mod solver;
@@ -49,6 +50,9 @@ pub use model::{
 pub use nested::{NestedLevel, NestedPackingRequest, NestedPackingResult, pack_nested};
 pub use policy::{PolicyConstraint, PolicyRule, PolicyRuleSet, RuleForm, ShipmentContext};
 pub use rebalance::{RebalanceResult, WeightMove, rebalance_weight};
+pub use result_validation::{
+    MalformedResult, RefusalKind, ResultIssue, validate_json, validate_json_outcome,
+};
 pub use sequence::{
     ALL_DIRECTIONS, LoadingDependencyGraph, Reachability, SequenceError, SequenceStep,
     SequenceWarning, UnloadingDependencyGraph, placement_reachability, replay_loading_order,

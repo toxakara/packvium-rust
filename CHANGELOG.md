@@ -4,6 +4,65 @@ What changed in `packvium` on crates.io, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0]
+
+The reference validator ships in the crate, `quality` looks ahead in its block solver and
+finishes inside its time limit, and extreme points scan the candidate set they were meant to.
+No request or result field changes.
+
+### Added
+
+- **`validate_json(request, result)` and `validate_json_outcome`**, with `ResultIssue`,
+  `MalformedResult { kind, message }` and `RefusalKind`: the reference validator over the JSON
+  text, returning the same issues, code and detail, in the same order, as every other package.
+  It shares no code with the solvers or `IndependentValidator`, which is unchanged.
+- **`PlacementConstraint::distinguishes_instances`**, a defaulted trait method, `true` unless
+  overridden, so existing implementations compile and keep their behaviour. A constraint that
+  reads only item attributes may return `false` to let the portfolio drop a start order that
+  repeats another's item-type sequence.
+
+### Changed
+
+- **A `CandidateScorer` leads the extreme-point rank.** The rank is the tuple (sum of
+  scorer scores, far corner z, y, x, origin, rotation); before, a scorer's `score` was added to
+  one weighted sum of the far-corner ticks at the weight of one x tick. A scorer that returned
+  small nudges meant as tie-breaks now decides the rank; return 0 where it has no preference.
+  The trait's signature is unchanged, and no request without a custom scorer answers
+  differently on the measured corpora.
+- **Every schema enum value is refused as `not_allowed`.** A value outside its list in
+  `allowed_rotations`, the output and dimensional-weight units, `shape_type`,
+  `ground_contact_rule` or `configuration.solvers` is `invalid_request` with reason `not_allowed`
+  at its JSON Pointer. An unknown output unit was copied through; **`ticks` as an output unit is
+  now refused**, as the schema always said.
+- **`quality` looks ahead in the block solver**, completing its leading blocks greedily
+  and committing the best, so the answer is never worse than the greedy pass. On our benchmark
+  85 of 89 answers improved and none got worse. Under a tight effort budget the block start can
+  now report `truncated` / `effort_limit`.
+- **`quality` finishes inside its limit.** The staged beam refines the best greedy
+  order instead of the first two, and the spatial index stops at the first hit without
+  allocating. On the 22 pinned benchmark runs 1.6.0 needed more than 20 s of CPU on 10; this
+  release needs at most 8.1 s.
+- **Extreme points scan the exposed corners and their projections**, not every
+  combination of placed faces. With `solvers: ["extreme_points"]` alone, over 67 benchmark
+  instances, `fast`/`balanced`/`quality` leave 2711/1477/1297 items out instead of
+  3658/3048/2643. The full portfolio's answers did not change on the 89 benchmark requests, and
+  its `quality` CPU fell to 42%.
+- **Portfolio starts go to distinct item orders.** A start that repeats another's
+  item-type sequence runs a neighbouring order instead, kept only on a strict win. A stacking
+  scene that took two containers now takes one.
+- **`no_eligible_container` is reported `proven`, and `insufficient_support` is reported**
+  (`observed`) where the support rule is the only blocker.
+- **A `nesting_height` not below the item's height is refused as `invalid_value`** at its
+  pointer, and with no `output` block the result is written in `units.length`'s schema code.
+
+### Fixed
+
+- **`incompatible_tags` is applied item against item**, not against container tags, as the
+  validator and every other engine apply it.
+- **A panicking start fails a parallel portfolio** as it fails a sequential one; it was dropped.
+- **Axle-balanced candidate points use the envelope length under clearance** and are not offered
+  twice.
+
 ## [1.6.0]
 
 Boxes cut to measure, flat bags, stacking groups and a volume-first objective, and a fix for

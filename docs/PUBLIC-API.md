@@ -15,8 +15,7 @@
   false` dominates. The engines expose the same two fields on their item type: Python
   `Item.stacking_group` / `Item.accepts_stacking_groups`, PHP trailing constructor parameters
   `$stackingGroup` / `$acceptsStackingGroups`, Rust `Item::stacking_group` /
-  `Item::accepts_stacking_groups`, and the TypeScript request type. See
-  STACKING-GROUPS.md.
+  `Item::accepts_stacking_groups`, and the TypeScript request type.
 - **Item geometry beyond the box.** `shape_type` is an enum —
   `rigid_cuboid` (the default), `convex_hull`, `compressible` — accompanied by
   `hull_vertices`, `compression_ratio` and `max_compression_pressure_kpa`. **A request that
@@ -26,11 +25,12 @@
 
   The two other values are rolling out one engine at a time, which is what the fields were
   reserved before the freeze for, and the rollout is finished: **all four engines implement
-  both**, and are held to byte-identical results on the shared fixtures. The one
-  recorded difference is the JavaScript fallback on a scene whose answer depends on item
-  ordering -- it makes a single ordering pass where the other three run a portfolio, so it can
-  pack validly but less densely; that is pinned in `conformance/native-quality-budget.json`
-  rather than left to drift.
+  both**. On the shared fixtures Python and PHP are held to byte-identical results,
+  Rust and JavaScript to valid results no worse than the native quality budget. The
+  JavaScript fallback runs its own, smaller portfolio (eight item orderings, one under `fast`,
+  and four solvers under `quality`), so on a scene whose answer depends on item ordering it can
+  pack validly but less densely; any such difference is pinned in
+  `conformance/native-quality-budget.json` rather than left to drift.
 
   Where they are implemented: a `convex_hull` item's collisions are decided by an exact
   integer separating-axis test rather than by its box, and its occupied volume is the hull's
@@ -42,7 +42,6 @@
   fast path. Hull coordinates are non-negative offsets from the corner of the item's own
   bounding box and are capped at 10^8 length ticks -- 6.25 m, beyond ordinary parcel sizes, and the
   bound that keeps the exact geometry inside a 64-bit integer everywhere it can be.
-  IRREGULAR-ITEMS.md is the model and states why.
 - `Container`: id, inner/outer dimensions, tare/payload, cost, inventory quantity,
   obstacles (each a union of one or more exact boxes — `additional_boxes`
   approximates a non-rectangular zone such as a wheel arch or tapered roof without
@@ -75,7 +74,7 @@
   parameter `$deformableBoundary` with `PackedContainer::achievedDimensions()` /
   `billedDimensions()`, Rust `Container::deformable_boundary: Option<DeformableBoundary>` with
   `PackedContainer::achieved_dimensions()` / `billed_dimensions()`, and the TypeScript request
-  type. See DEFORMABLE-CONTAINERS.md.
+  type.
 - **Made-to-measure containers.** `made_to_measure` (absent or `null`: a stock
   container) makes the container an on-demand box machine whose largest box is
   `inner_dimensions`: `minimum` and `increment` per axis (required; `minimum` equal to
@@ -93,8 +92,7 @@
   `invalid_value`. The engines expose it as Python `Container.made_to_measure` (a
   `packvium.MadeToMeasure`, last field), PHP the trailing constructor parameter
   `?MadeToMeasure $madeToMeasure` (`Packvium\Domain\MadeToMeasure`), Rust
-  `Container::made_to_measure: Option<MadeToMeasure>`, and the TypeScript request type. See
-  MADE-TO-MEASURE-CONTAINERS.md.
+  `Container::made_to_measure: Option<MadeToMeasure>`, and the TypeScript request type.
 - `PackingConfig`: solver profile, deadline, alternatives, deterministic seed, clearance,
   support threshold (`minimum_support_ratio`, default 0: support is not required, and an
   item may rest on nothing above the floor; set it above 0 to require that share of the
@@ -104,7 +102,7 @@
   that bounds all four stable implementations by counted work instead of wall-clock
   time. In code it is Python `packvium.EffortBudget`, PHP `Packvium\Config\EffortBudget` and
   Rust `packvium_core::EffortBudget`. `solvers` is an ordered list: every named strategy is run, stable ties prefer
-  the earlier name, and an unknown name is a structured error. The optional
+  the earlier name, and an unknown name is a structured error.
   The stable solver names are `grid`, `extreme_points`, `homogeneous_blocks`, `layer`,
   `maximal_spaces` and `exact_small`. `homogeneous_blocks` is the unrestricted
   solid-lattice quality strategy and safely delegates to `extreme_points` when a scene
@@ -114,8 +112,7 @@
   example, for multiple declared item types or a custom hard constraint); it does not
   silently return an empty lattice result. The optional `shipping_cost` objective accepts exact dimensional-weight divisor/unit inputs and
   ranks billable weight from the shipped container's outer dimensions. These fields
-  have identical semantics in all four implementations — see
-  ALGORITHMS-AND-COMPLEXITY.md.
+  have identical semantics in all four implementations.
   `require_placement_coordinates` (Python/PHP/Rust/JavaScript, default `true`) lets a caller
   trade per-item coordinates for speed and memory on a bulk single-item-type order:
   when `false` and `GridSolver`'s regular-lattice preconditions already hold (see the
@@ -138,18 +135,18 @@
   search with `invalid_fixed_placement`. Python `Packer.pack(items, containers,
   fixed_placements)` and PHP `Packer::pack($items, $containers, $fixedPlacements)` take
   `FixedPlacement` values; Rust takes them in `PackingRequest.fixed_placements`, and every
-  JSON entry point reads the field. PLAN-REVISIONS.md is the contract;
-  all four engines implement it.
+  JSON entry point reads the field; all four engines implement it.
 - `catalog_versions_used`: optional immutable catalog references resolved before
   packing. Each reference has exactly `catalog_id`, positive `version`,
   non-negative `published_at_epoch_ms`, and `content_digest`; catalog IDs are unique.
 
 Production packing uses a monotonic system clock. Test harnesses and deterministic
 simulations may inject a monotonic clock into Python `Packer(..., clock=...)`, PHP
-`Packer(..., clock: ...)`, Rust `Deadline::with_clock(...)` with
-`SolverRegistry::solve_with_deadline(...)`, or the JavaScript fallback's optional clock
-argument. The callable returns an implementation-native monotonic value; it must never
-move backwards. This is a testing seam, not a serialized request field.
+`Packer(..., clock: ...)`, or Rust `Deadline::with_clock(...)` with
+`SolverRegistry::solve_with_deadline(...)`. `@packvium/engine` exposes no clock: its
+`pack(request)` takes the request alone. The callable returns an implementation-native
+monotonic value; it must never move backwards. This is a testing seam, not a serialized
+request field.
 
 ## Core output
 
@@ -161,8 +158,7 @@ move backwards. This is a testing seam, not a serialized request field.
     alongside it. The pre-1.1.0 extension point remains open: closing the object would
     make a previously valid producer fail a 1.1.0 validator, which is a breaking change
     and therefore not legal in this minor release. No engine emits the reserved fields
-    yet, so `code` is still the only key any Packvium result carries. See
-    OPTIMALITY-CERTIFICATES.md;
+    yet, so `code` is still the only key any Packvium result carries;
 - legacy `status`: `optimal`, `feasible`, `best_found`, `time_limit`, `infeasible`, or `invalid_result`;
 - packed containers with exact coordinates, dimensions, rotations, and a
   `centre_of_mass_offset_ppm` — the weighted centre of mass's exact-integer Chebyshev
@@ -174,7 +170,7 @@ move backwards. This is a testing seam, not a serialized request field.
   share the positive `denominator`; signed numerators intentionally expose a centre
   of mass outside the axle span instead of clipping it;
 - unpacked instances with reason codes, proof levels and rejection observations;
-- objective score — a five-key lexicographic vector of exact integers, identical across every implementation (OBJECTIVE.md) — and solver statistics;
+- objective score — a five-key lexicographic vector of exact integers, lower is better, computed by the same formula in every implementation — and solver statistics. Under the default objective the keys are `unpacked_count`, `container_count`, `total_cost_minor`, `unused_volume_ppm` (per container `floor((V - used) x 10^6 / V)` of inner volume `V`) and `stack_height_ppm` (per container `floor(top x 10^6 / H)` of inner height `H`); `configuration.objective` selects one of seven orderings (`default`, `lowest_cost`, `shipping_cost`, `lowest_landed_cost`, `open_dimension_height`, `maximum_value`, `maximum_volume`), and the result echoes it in `objective`;
 - the exact `catalog_versions_used` lineage from the request (an empty array when no
   catalog was involved), preserved by Python, PHP, Rust and JavaScript;
 - warnings and top-K alternatives. With `minimum_support_ratio` at its default 0, a result
@@ -285,8 +281,7 @@ own `code` property):
 {"code": "invalid_direction", "direction": "sideways"}
 ```
 
-`conformance/scene/sequence-fixtures.json` pins this shape across all four languages;
-see `docs/SERIALIZATION.md`.
+A shared fixture pins this shape across all four languages.
 
 Sequence diagnostics use a separate canonical `SequenceWarning` DTO instead of
 putting caller-facing prose into an untyped string. Its four fields are stable in
@@ -409,6 +404,12 @@ without turning a minor release into a parsing break. `status` remains for one
 compatibility cycle and is checked against the three facts. The alpha release emits no
 `proven_optimal` claim without a future proof/certificate.
 
+`status: infeasible`, with `feasibility: infeasible` and `optimality: proven_infeasible`, is
+emitted only when the portfolio ranks no result at all. A request whose every item is proven
+unpackable is not that case: every engine answers `status: best_found`, `feasibility:
+unknown` and `optimality: best_found`, with each item and its `proven` reason in
+`unpacked_items`. Read `unpacked_items`, not `status`, to learn that nothing fits.
+
 ## Portfolio termination
 
 `termination` describes the whole solver portfolio instead of copying one ambiguous
@@ -457,8 +458,9 @@ The aggregate fields are derived only from `starts`. Exactly one record is selec
 clock, and `effort_limit` when the selected start stopped at a counted-work boundary.
 A truncated loser alone leaves the selected answer's code `complete`, while still
 making `all_required_starts_completed` false. The two algorithm limit flags preserve
-the exact cause.
-`winning_start_truncated || global_deadline_reached`.
+the exact cause: one of `algorithm.time_limit_reached` and `algorithm.effort_limit_reached`
+is true exactly when `winning_start_truncated || global_deadline_reached`, and
+`global_deadline_reached` requires `time_limit_reached`.
 
 ## Rejection proof
 
@@ -489,7 +491,7 @@ The four levels have deliberately different meanings:
 | Level | Meaning |
 | --- | --- |
 | `proven` | A request-level bound proves rejection without relying on search completeness. Currently `no_compatible_container_dimensions`, `payload_exceeded`, `rotation_restricted` and `no_eligible_container` — each a pure geometry or tag check across every container, none dependent on how far the search got. |
-| `observed` | The engine exhausted or rejected the candidates it actually examined; this is not a global impossibility proof. |
+| `observed` | The engine exhausted or rejected the candidates it actually examined; this is not a global impossibility proof. Currently `no_feasible_placement`, `search_exhausted`, `exact_search_incomplete` and `insufficient_support` — the last when replaying the finished layout finds a place the item fits once the support rules are set aside, and none with them, in every engine. |
 | `inferred` | The reason follows from solver state or a compound rule but has no complete certificate. |
 | `unknown_due_to_limit` | A deadline stopped the search, so no negative conclusion is claimed. |
 
@@ -509,6 +511,28 @@ load can only refuse an item a fresh container would take, so they all end there
 `inferred` -- neither is a certificate, since a counterweight behind the rear axle can
 relieve the front one -- and both rank after the structural proofs, the deadline, the
 effort budget and `group_cannot_fit_together`.
+
+## Result validation
+
+Every package can check a result against the request it answers with the same reference
+validator, and gets the same issue list back: geometry, support and load, accounting, the
+result's facts and its score, each issue a `code` and a `detail`, an empty list meaning
+valid. A result without the documented shape is refused as `MalformedResult`, whose `kind` is
+`contract` or `shape`.
+
+- Python: `packvium.validate(request, result)`, `packvium.MalformedResult`.
+- Rust: `packvium_core::validate_json(request, result)` over JSON text, returning
+  `Vec<ResultIssue>` or `MalformedResult { kind, message }`; `validate_json_outcome` returns the
+  same as one JSON document for a binding.
+- PyO3 (`packvium_native_rust`): `validate_json(request, result)` over JSON text, a list of
+  `{"code", "detail"}` dicts, `MalformedResult` (a `ValueError`) with `kind`.
+- `@packvium/engine`: `validate(request, result)`, `MalformedResult`, and
+  `ValidatorUnavailableError` (`code: 'validator_unavailable'`) when the compiled addon is
+  absent, until the JavaScript fallback's port.
+- `@packvium/browser`: `validate(request, result)`, a promise, `MalformedResult`.
+
+- PHP: `Packvium\Validation\validate(array $request, array $result)`, a `list<ResultIssue>`
+  (`code`, `detail`), `MalformedResult` with `kind`.
 
 ## Commercial and control-plane API
 
@@ -546,8 +570,7 @@ request returns a result with a status rather than raising.
 
 A document derived from an already validated packing result: what to do first, why this
 carton, and what was not packed. It is a view, not a decision — it calls no solver and no
-validator, and a test in each language asserts that. The contract is
-EXECUTION-PLAN.md.
+validator, and a test in each language asserts that.
 
 | Language | Entry point |
 | --- | --- |
@@ -609,8 +632,7 @@ One portable document built from a validated result. It carries:
   of the solver record, and an honest replay level.
 
 It is exported as JSON, RFC 4180 CSV, or a self-contained printable HTML work order. Like the
-plan it is a view, not a decision: no solver, validator, renderer or clock is called. The
-contract is OPERATIONAL-ARTIFACTS.md.
+plan it is a view, not a decision: no solver, validator, renderer or clock is called.
 
 | Language | Builder | Exports |
 | --- | --- | --- |
@@ -645,8 +667,7 @@ An append-only, hash-chained record of what differed from an approved plan: a mi
 a substituted carton, an operator lock or a verified placement. Each revision derives the
 request the next plan solves; a replan is an ordinary solve of it, with locks and verified
 placements carried as `fixed_placements`. A revision is a pure function of its parent, the
-approved operational artifact and its events, and calls no solver or clock. The contract is
-PLAN-REVISIONS.md.
+approved operational artifact and its events, and calls no solver or clock.
 
 | Language | Surface |
 | --- | --- |
@@ -663,9 +684,8 @@ stopping at the first. Refusals use `invalid_revision`, `invalid_event`, `event_
 ## Scenario and recommendation API
 
 Scenario what-if comparison and catalog/rule recommendation publication, exported as
-`packvium.simulation` and `packvium.recommendations`. The full contract is
-INTELLIGENCE-API.md; what belongs here is the surface and its two
-limits, both of which are part of the API rather than notes about it.
+`packvium.simulation` and `packvium.recommendations`. This section is the surface and its
+two limits, both of which are part of the API rather than notes about it.
 
 | Language | Entry point |
 | --- | --- |
@@ -677,7 +697,7 @@ document is proved by driving four engines as subprocesses over JSON. `run_scena
 an `OrderEvaluator` *callback* as its central argument, and a callback does not cross a
 pipe -- so the harness that proves the packing and commerce contracts cannot express a
 scenario at all. Whether the data-in/data-out half ever crosses runtimes is an open
-question, not an omission; INTELLIGENCE-API.md scopes it.
+question, not an omission.
 
 **Historical replay ships with the ledger it reads.** `evaluate_on_history` scores a
 recommendation against decisions held out by an explicit `split_at`, and could not be
@@ -700,10 +720,10 @@ importing the submodule, which puts them outside the frozen API snapshot the pac
 commerce surfaces are held to. They work, they are tested, and they will not be withdrawn
 inside 1.x — but a parameter may be renamed or a returned value gain a field in a minor
 release, announced in the changelog rather than blocked by a gate. Pin the version if you
-depend on the exact shape. COMPATIBILITY.md states why this one surface
-is held that way and what would change it.
+depend on the exact shape.
 
 ## JSON API
 
 Python, PHP, Rust and the JavaScript fallback accept the same top-level keys: `units`,
-`configuration`, `items`, `containers`, `catalog_versions_used`, and `output`.
+`configuration`, `items`, `containers`, `catalog_versions_used`, `policy`, `output` and
+`fixed_placements`.

@@ -20,7 +20,7 @@ Conversion supports floor, ceiling and ties-to-even nearest rounding. Applicatio
 
 ## Geometry versus scores
 
-Feasibility checks are integer-only, including the support ratio: the requested fraction is converted once to parts per million and compared as `supported_area >= floor(base_area x ratio_ppm / 10^6)`, never as a float division against an epsilon. The independent validator rechecks boundaries and intersections using exact integers.
+Feasibility checks are integer-only, including the support ratio: the requested fraction is converted once to parts per million, `ratio_ppm = floor(ratio x 10^6 + 0.5)` on the IEEE double the request carries (each step correctly rounded, so every language gets the same integer; on about one in a hundred seven-decimal halves it differs from rounding the exact decimal, `0.0001245` giving 124), and compared as `supported_area >= floor(base_area x ratio_ppm / 10^6)`, never as a float division against an epsilon. Every result validator applies this same rule rather than the exact rational. `void_fill_reserve_ratio` goes through the same conversion and reserves `floor(inner_volume x ratio_ppm / 10^6)` cubic ticks, which the validators recompute the same way. The independent validator rechecks boundaries and intersections using exact integers.
 
 The Rust solver and validator were the exception until 2026-09-02: both compared `area / base_area + 1e-12 < ratio` in `f64`. On a real-sized base (a square centimetre is `2.56 x 10^10` square ticks) an area one square tick short of the requirement sits well inside that epsilon, so Rust admitted a placement the shared validator refused. Both now go through `support_area_sufficient`, the rule above; the `f64` ratio survives only as the reported `support_ratio` on the placement record.
 
@@ -33,7 +33,7 @@ Coordinates remain 64-bit integers. Values that exceed that range are handled wi
 | Quantity | Why it overflows | How it is handled |
 | --- | --- | --- |
 | Volume, for output and ordering | A one-metre cube is `4.096 x 10^21` cubic ticks | `BigInt::multiply`/`add`, compared as decimal integers; this includes exact-small's equal-count physical-volume tie-break |
-| Objective keys 3 and 4 | Ratio of two volumes | `BigInt::subtract` / `BigInt::divide`, see OBJECTIVE.md |
+| Objective keys 3 and 4 | `unused_volume_ppm`, per container `floor((V - used) x 10^6 / V)`, scales a volume by 10^6; `stack_height_ppm` is `floor(top x 10^6 / H)` | `BigInt::subtract` / `BigInt::divide` |
 | Load shares, `weight x area / total_area` | Eighth-microgram counts times squared ticks | `Arithmetic::mulDiv`, exact and overflow-free |
 | Serialized decimals | Ticks beyond `2^53` do not survive a `double` | long division on digits, rounded ties-to-even |
 
@@ -46,7 +46,7 @@ converted back to a number only at the existing JSON boundary.
 
 ## The bound path's declared ceiling
 
-`docs/OPTIMALITY-CERTIFICATES.md` defines lower bounds on the objective. Their arithmetic is
+The engines compute lower bounds on the objective during search. Their arithmetic is
 integer-only, and the limit at which they refuse is **declared rather than inherited from the
 language**: every sum in that path must stay below `10^30`, and exceeding it is a structured
 refusal in all four engines rather than a number.

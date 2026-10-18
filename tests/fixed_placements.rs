@@ -520,7 +520,7 @@ fn a_fixed_placement_that_is_not_the_schema_shape_is_refused_by_name() {
         ),
         (
             json!([with("orientation", json!("XYZ"))]),
-            "fixed_placements[0].orientation is one of the six codes",
+            r#"fixed_placements[0].orientation must be one of ["LWH","LHW","WLH","WHL","HLW","HWL"]"#,
         ),
         (
             json!([with("position", json!(["100", "0", "0"]))]),

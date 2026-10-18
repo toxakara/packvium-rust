@@ -106,7 +106,10 @@ fn entry_shape_fault(entry: &Value, place: &str, field: &str, unit: &str) -> Opt
         .is_some_and(|orientation| ORIENTATIONS.contains(&orientation))
     {
         return fault(
-            format!("{place}.orientation is one of the six codes"),
+            format!(
+                "{place}.orientation must be one of {}",
+                spell_names(&ORIENTATIONS)
+            ),
             &format!("{field}/orientation"),
         );
     }
