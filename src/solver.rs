@@ -43,6 +43,15 @@ pub trait PlacementConstraint: Send + Sync {
         rotation: Rotation,
         dimensions: Dimensions,
     ) -> ConstraintDecision;
+
+    /// Whether `evaluate` can answer differently for two instances of one item, as one that
+    /// reads `ItemInstance::sequence` can. Only while every registered constraint answers
+    /// `false` does the portfolio treat two start orders that place the same items in the
+    /// same sequence as one start; the default keeps every order that differs in an instance,
+    /// which is always correct.
+    fn distinguishes_instances(&self) -> bool {
+        true
+    }
 }
 
 pub trait CandidateScorer: Send + Sync {

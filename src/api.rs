@@ -8,8 +8,9 @@ use crate::model::*;
 use crate::policy::{PolicyConstraint, PolicyRuleSet};
 use crate::rebalance::rebalance_weight;
 use crate::request_errors;
-use crate::solver::SolverRegistry;
-use crate::units::{Length, Weight};
+use crate::solver::{PlacementConstraint, SolverRegistry};
+use crate::solvers::{SupportReplay, support_can_refuse};
+use crate::units::{Length, Weight, output_length_unit};
 use crate::validation::IndependentValidator;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -423,6 +424,7 @@ pub fn pack_request_with_policy(
     };
     let mut result = registry.solve(request)?;
     cite_policy_rejections(&mut result, request, policy);
+    cite_support_rejections(&mut result, request, &registry.constraints);
     cite_limit_rejections(&mut result, request);
     result.catalog_versions_used = request.catalog_versions_used.clone();
     // Independent validation re-derives every guarantee from per-item placements.
@@ -545,6 +547,49 @@ fn cite_policy_rejections(
     // though the two disagreed about why.
     for alternative in &mut result.alternatives {
         cite_policy_rejections(alternative, request, policy);
+    }
+}
+
+/// Names the support rules behind a `search_exhausted` or `exact_search_incomplete` item
+/// when they alone refuse it a place in the finished layout, as Python and PHP do
+/// before the limit diagnosis. Group members keep their reason, as for the limits. The
+/// scenes are rebuilt only when an item a support rule can refuse is left out, and each item
+/// type is replayed once: `O(P + T * S * K)` for P placements, T such types, S containers
+/// and K one candidate scan. Alternatives too, for the reason `cite_policy_rejections` gives.
+fn cite_support_rejections(
+    result: &mut PackingResult,
+    request: &PackingRequest,
+    constraints: &[Arc<dyn PlacementConstraint>],
+) {
+    for alternative in &mut result.alternatives {
+        cite_support_rejections(alternative, request, constraints);
+    }
+    let asked: Vec<usize> = (0..result.unpacked.len())
+        .filter(|&index| {
+            let unpacked = &result.unpacked[index];
+            unpacked.instance.item.group.is_none()
+                && matches!(
+                    unpacked.reason.as_str(),
+                    "search_exhausted" | "exact_search_incomplete"
+                )
+                && support_can_refuse(&unpacked.instance.item, &request.config)
+        })
+        .collect();
+    if asked.is_empty() {
+        return;
+    }
+    let replay = SupportReplay::new(&result.containers, request, constraints);
+    let mut verdicts: BTreeMap<String, bool> = BTreeMap::new();
+    for index in asked {
+        let instance = &result.unpacked[index].instance;
+        let blocked = *verdicts
+            .entry(instance.item.id.clone())
+            .or_insert_with(|| replay.support_is_the_blocker(instance));
+        if blocked {
+            let instance = instance.clone();
+            result.unpacked[index] =
+                UnpackedItem::new(instance, "insufficient_support".into(), Vec::new());
+        }
     }
 }
 
@@ -945,7 +990,7 @@ fn parse_request(object: &Map<String, Value>) -> PackResult<PackingRequest> {
         .and_then(Value::as_object)
         .and_then(|output| output.get("length_unit"))
         .and_then(Value::as_str)
-        .unwrap_or(length_unit)
+        .unwrap_or_else(|| output_length_unit(length_unit))
         .to_owned();
     let output_weight_unit = object
         .get("output")
@@ -1139,7 +1184,7 @@ fn parse_config(value: Option<&Value>, length_unit: &str) -> PackResult<PackingC
         time_limit_ms: floored_integer(map, "time_limit_ms", "configuration", 1)?
             .map_or(1_000, |value| value.unsigned_abs()),
         top_k: floored_usize(map, "alternatives", "configuration", 1, 3)?,
-        seed: u64_field(map, "seed", 42),
+        seed: seed_field(map),
         max_containers: floored_integer(map, "max_containers", "configuration", 1)?.map(to_usize),
         clearance: parse_optional_length(map.get("clearance"), length_unit)?,
         minimum_support_ratio: map
@@ -2100,8 +2145,20 @@ fn to_usize(value: i64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
-fn u64_field(map: &Map<String, Value>, key: &str, default: u64) -> u64 {
-    map.get(key).and_then(Value::as_u64).unwrap_or(default)
+/// The request's `seed`, negative ones included; 42 only when none is given.
+///
+/// A seed past `i64::MAX` is kept as its residue modulo `SEED_MODULUS`, the only part of
+/// it any engine's shuffle reads, so it still draws the orders Python and PHP draw.
+fn seed_field(map: &Map<String, Value>) -> i64 {
+    let Some(seed) = map.get("seed") else {
+        return 42;
+    };
+    seed.as_i64()
+        .or_else(|| {
+            seed.as_u64()
+                .map(|seed| (seed % SEED_MODULUS.unsigned_abs()) as i64)
+        })
+        .unwrap_or(42)
 }
 
 fn string_set(value: Option<&Value>) -> BTreeSet<String> {

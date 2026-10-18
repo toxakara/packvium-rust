@@ -421,6 +421,11 @@ impl PlacementConstraint for PolicyConstraint {
         }
         ConstraintDecision::allow()
     }
+
+    /// Every rule reads the item's tags and the container's contents, never the instance.
+    fn distinguishes_instances(&self) -> bool {
+        false
+    }
 }
 
 fn tag_counts<'a>(context: &SolverContext<'a>) -> BTreeMap<&'a str, usize> {

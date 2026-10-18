@@ -17,6 +17,12 @@ type Cell = (i64, i64, i64);
 /// Cells per axis inside the container; `cell_size` makes it at most 8.
 const CELLS_PER_AXIS: i64 = 8;
 
+/// The most cells `any_hit` merges lazily before it falls back to `query`'s sort. Measured
+/// on orlib-thpack-5#0 `quality`, with byte-identical answers: 8 cells saved 2% of the time
+/// (most candidates there span more), 32 saved 19%, 64 saved 26%, 128 saved 22%, and 512
+/// saved nothing, because each visited index scans every head.
+const MERGE_CELL_LIMIT: usize = 64;
+
 #[derive(Clone, Debug)]
 pub(crate) struct SpatialIndex {
     cell_x: i64,
@@ -96,6 +102,58 @@ impl SpatialIndex {
         Cow::Owned(result)
     }
 
+    /// Visit the indices `query` would return, in the same ascending order without
+    /// duplicates, until `hit` answers true; returns whether one did.
+    ///
+    /// Each bucket is already ascending, because `add` is only ever given the next placement
+    /// index. So a box spanning at most `MERGE_CELL_LIMIT` cells is merged lazily from its
+    /// buckets: no allocation, no sort, and a collision found early stops the walk. Each
+    /// visited index costs O(c) for c cells. A larger box falls back to `query`, where the
+    /// sort's O(q log q) is cheaper than O(q c).
+    pub(crate) fn any_hit(&self, box_: Aabb, mut hit: impl FnMut(usize) -> bool) -> bool {
+        let ((x1, x2), (y1, y2), (z1, z2)) = self.cell_ranges(box_);
+        let cells = (x2 - x1).saturating_mul(y2 - y1).saturating_mul(z2 - z1);
+        if cells > MERGE_CELL_LIMIT as i64 {
+            return self.query(box_).iter().copied().any(hit);
+        }
+        let mut heads: [&[usize]; MERGE_CELL_LIMIT] = [&[]; MERGE_CELL_LIMIT];
+        let mut open = 0;
+        for x in x1..x2 {
+            for y in y1..y2 {
+                for z in z1..z2 {
+                    let bucket = self.bucket((x, y, z));
+                    if !bucket.is_empty() {
+                        heads[open] = bucket;
+                        open += 1;
+                    }
+                }
+            }
+        }
+        let heads = &mut heads[..open];
+        let mut previous = None;
+        loop {
+            let mut lowest: Option<(usize, usize)> = None;
+            for (position, head) in heads.iter().enumerate() {
+                if let Some(&value) = head.first()
+                    && lowest.is_none_or(|(_, smallest)| value < smallest)
+                {
+                    lowest = Some((position, value));
+                }
+            }
+            let Some((position, value)) = lowest else {
+                return false;
+            };
+            heads[position] = &heads[position][1..];
+            if previous == Some(value) {
+                continue;
+            }
+            previous = Some(value);
+            if hit(value) {
+                return true;
+            }
+        }
+    }
+
     pub(crate) fn bucket_at(&self, point: Point) -> &[usize] {
         self.bucket((
             point.x.div_euclid(self.cell_x),
@@ -155,6 +213,48 @@ mod tests {
                 width: Length(width),
                 height: Length(height),
             },
+        }
+    }
+
+    #[test]
+    fn any_hit_visits_exactly_what_query_returns_in_the_same_order() {
+        let container = box_at(0, 0, 0, 800, 800, 800).dimensions;
+        let mut index = SpatialIndex::new(container);
+        for position in 0..150 {
+            let (x, y, z) = (
+                (position * 67) % 720,
+                (position * 101) % 720,
+                (position * 149) % 720,
+            );
+            index.add(
+                position as usize,
+                box_at(x, y, z, 30 + (position % 5) * 40, 80, 60),
+            );
+        }
+        for query_number in 0..200 {
+            let size = 20 + (query_number % 7) * 90;
+            let probe = box_at(
+                (query_number * 83) % 740,
+                (query_number * 127) % 740,
+                (query_number * 173) % 740,
+                size,
+                size / 2 + 10,
+                size,
+            );
+            let mut visited = Vec::new();
+            assert!(!index.any_hit(probe, |found| {
+                visited.push(found);
+                false
+            }));
+            assert_eq!(visited, index.query(probe).to_vec(), "query {query_number}");
+            if let Some(&stop) = visited.get(visited.len() / 2) {
+                let mut seen = Vec::new();
+                assert!(index.any_hit(probe, |found| {
+                    seen.push(found);
+                    found == stop
+                }));
+                assert_eq!(seen, visited[..=visited.len() / 2].to_vec());
+            }
         }
     }
 

@@ -660,3 +660,188 @@ fn a_typed_landed_cost_request_without_a_tariff_is_refused_rather_than_priced() 
     let error = pack_request(&scene).expect_err("an untabled container cannot be priced");
     assert!(error.to_string().contains("no published price"), "{error}");
 }
+
+// ------------------------------------------------------------ panicking starts
+
+/// Panics on the first placement of any start that opens with `item_id`, so one start of
+/// the portfolio fails while every other runs to an answer.
+#[derive(Debug)]
+struct PanicOnOpeningItem {
+    item_id: &'static str,
+}
+
+impl PlacementConstraint for PanicOnOpeningItem {
+    fn evaluate(
+        &self,
+        context: &SolverContext<'_>,
+        item: &ItemInstance,
+        _point: packvium_core::Point,
+        _rotation: Rotation,
+        _dimensions: Dimensions,
+    ) -> ConstraintDecision {
+        assert!(
+            !(context.placements.is_empty() && item.item.id == self.item_id),
+            "injected start failure"
+        );
+        ConstraintDecision::allow()
+    }
+}
+
+fn one_start_panics(parallel: bool) -> bool {
+    let mut request = request(
+        vec![item("small", 10), item("medium", 20), item("large", 30)],
+        vec![container("box", 100)],
+    );
+    // Only the order starts: the layer and exact starts run on the calling thread.
+    request.config.solvers = vec!["extreme_points".into()];
+    request.config.parallel = parallel;
+    let registry = SolverRegistry::default()
+        .with_constraint(Arc::new(PanicOnOpeningItem { item_id: "large" }));
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| registry.solve(&request))).is_err()
+}
+
+#[test]
+fn a_panicking_start_fails_the_parallel_portfolio_as_it_fails_the_sequential_one() {
+    assert!(
+        one_start_panics(false),
+        "the sequential portfolio raises the start's panic"
+    );
+    assert!(
+        one_start_panics(true),
+        "the parallel portfolio must not drop it"
+    );
+}
+
+/// Admits an instance only at `x = (sequence - 1)` mm: two instances of one item are not
+/// interchangeable to it.
+struct OneSpotPerInstance;
+
+impl PlacementConstraint for OneSpotPerInstance {
+    fn evaluate(
+        &self,
+        _context: &SolverContext<'_>,
+        item: &ItemInstance,
+        point: packvium_core::Point,
+        _rotation: Rotation,
+        _dimensions: Dimensions,
+    ) -> ConstraintDecision {
+        if point.x == (item.sequence as i64 - 1) * Length::TICKS_PER_MM {
+            ConstraintDecision::allow()
+        } else {
+            ConstraintDecision::reject("spot")
+        }
+    }
+}
+
+/// Admits everything and says so, as `PolicyConstraint` does.
+struct AdmitsEveryInstance;
+
+impl PlacementConstraint for AdmitsEveryInstance {
+    fn evaluate(
+        &self,
+        _context: &SolverContext<'_>,
+        _item: &ItemInstance,
+        _point: packvium_core::Point,
+        _rotation: Rotation,
+        _dimensions: Dimensions,
+    ) -> ConstraintDecision {
+        ConstraintDecision::allow()
+    }
+
+    fn distinguishes_instances(&self) -> bool {
+        false
+    }
+}
+
+/// Sorts before every built-in order name and reverses the instances.
+struct ReversedInstances;
+
+impl ItemOrderStrategy for ReversedInstances {
+    fn name(&self) -> &str {
+        "aaa"
+    }
+
+    fn order(&self, items: &mut [ItemInstance]) {
+        items.reverse();
+    }
+}
+
+fn cubes_in_a_row(quantity: usize, row_mm: i64) -> PackingRequest {
+    let mut cube = item("cube", 1);
+    cube.quantity = quantity;
+    let mut row = container("row", 1);
+    row.inner_dimensions.length = Length(row_mm * Length::TICKS_PER_MM);
+    row.quantity = Some(1);
+    let mut request = request(vec![cube], vec![row]);
+    request.config.solvers = vec!["extreme_points".into()];
+    request.config.multi_start_orders = 6;
+    request.config.max_containers = Some(1);
+    request.config.parallel = false;
+    request
+}
+
+fn placed(result: &PackingResult) -> usize {
+    result
+        .containers
+        .iter()
+        .map(|container| container.placements.len())
+        .sum()
+}
+
+fn order_starts(result: &PackingResult) -> usize {
+    let json: serde_json::Value = serde_json::from_str(
+        &result
+            .to_json_string("mm", "g", false)
+            .expect("result JSON"),
+    )
+    .expect("result parses");
+    json["termination"]["starts"]
+        .as_array()
+        .expect("start records")
+        .iter()
+        .filter(|start| {
+            start["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("extreme_points:"))
+        })
+        .count()
+}
+
+/// The second review's reproducer for: the reversed order places the item types in
+/// the base-area order's sequence, and dropping the base-area start as its repeat lost the
+/// only order the constraint admits in full.
+#[test]
+fn an_instance_sensitive_constraint_keeps_every_order_that_relabels_instances() {
+    let request = cubes_in_a_row(2, 2);
+    let constrained = SolverRegistry::default().with_constraint(Arc::new(OneSpotPerInstance));
+    let with_custom_order = SolverRegistry::default()
+        .with_constraint(Arc::new(OneSpotPerInstance))
+        .with_order(Arc::new(ReversedInstances));
+
+    let built_in = constrained.solve(&request).expect("solves");
+    let custom = with_custom_order.solve(&request).expect("solves");
+
+    assert_eq!(placed(&built_in), 2);
+    assert_eq!(
+        placed(&custom),
+        2,
+        "the custom order must not displace the built-in one"
+    );
+    assert!(custom.unpacked.is_empty());
+}
+
+/// One item type gives every order one type sequence. A rule blind to instances lets the
+/// profile run it once; an instance-sensitive one runs each relabelling the shuffles make.
+#[test]
+fn only_a_rule_blind_to_instances_lets_a_relabelled_order_count_as_a_repeat() {
+    let request = cubes_in_a_row(4, 4);
+    let blind = SolverRegistry::default().with_constraint(Arc::new(AdmitsEveryInstance));
+    let sensitive = SolverRegistry::default().with_constraint(Arc::new(OneSpotPerInstance));
+
+    let blind_result = blind.solve(&request).expect("solves");
+    let sensitive_result = sensitive.solve(&request).expect("solves");
+
+    assert_eq!(order_starts(&blind_result), 1);
+    assert!(order_starts(&sensitive_result) > 1);
+    assert_eq!(placed(&sensitive_result), 4);
+}

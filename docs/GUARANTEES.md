@@ -52,7 +52,7 @@ silently — if you need them, they belong in your own layer above this library.
 
 ## Status of this release
 
-Version `1.6.0` freezes the public API. Field names, status codes, the objective
+Version `1.7.0` freezes the public API. Field names, status codes, the objective
 vector, the numeric policy and the validation rules do not change without a major
 version, so any `1.x` is a safe upgrade from any earlier `1.x`. A caret or tilde
 constraint on `1.0` is enough; an exact pin is no longer required.
@@ -61,7 +61,7 @@ What the freeze does not cover: which of several equally valid packings a solver
 returns. That is bounded by the objective vector, not by the placement list, and a minor
 release may return a different arrangement with the same or a better score.
 
-The algorithm complexities documented in `ALGORITHMS-AND-COMPLEXITY.md` are asymptotic
+The algorithm complexities Packvium states, in these docs and in the source, are asymptotic
 design bounds held by review, not per-release measurements. They are not a wall-clock
 performance contract either: constants, input shape and host all move the real number.
 Use them to choose a solver profile, not to predict a duration.

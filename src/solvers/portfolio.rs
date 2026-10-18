@@ -8,6 +8,8 @@ use crate::error::PackResult;
 use crate::model::*;
 use crate::solver::{CandidateScorer, ItemOrderStrategy, PlacementConstraint};
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::sync::Arc;
 
 pub fn solve_portfolio(
@@ -149,34 +151,16 @@ pub(crate) fn solve_portfolio_with_deadline(
         ]
     };
 
-    let mut orders = Vec::new();
-    for &(name, sort_fn) in built_in_generators {
-        if orders.len() >= needed {
-            break;
-        }
-        orders.push((
-            name.to_owned(),
-            sort_fn(instances.clone(), &request.config.objective),
-        ));
-    }
-    for custom in custom_orders {
-        if orders.len() >= needed {
-            break;
-        }
-        let mut values = instances.clone();
-        custom.order(&mut values);
-        orders.push((custom.name().to_owned(), values));
-    }
-    while orders.len() < needed {
-        let index = orders.len() as u64;
-        orders.push((
-            format!("shuffle-{index}"),
-            deterministic_shuffle(
-                instances.clone(),
-                request.config.seed ^ index.wrapping_mul(0x9E37_79B9_7F4A_7C15),
-            ),
-        ));
-    }
+    let staged_plan_search = request.config.profile == SolverProfile::Quality
+        && request.config.container_plan_beam_width > 1;
+    let orders = distinct_start_orders(
+        &instances,
+        built_in_generators,
+        custom_orders,
+        needed,
+        &request.config,
+        OrderIdentity::of(request, constraints, scorers, staged_plan_search),
+    );
     let per_order = if request.config.profile == SolverProfile::Quality
         && instances.iter().all(|item| item.item.group.is_none())
     {
@@ -184,8 +168,6 @@ pub(crate) fn solve_portfolio_with_deadline(
     } else {
         1
     };
-    let staged_plan_search = request.config.profile == SolverProfile::Quality
-        && request.config.container_plan_beam_width > 1;
     let block_start = adds_block_start(request, &instances, constraints);
     let planned_start_count = orders.len() * per_order
         + if staged_plan_search { 2 } else { 0 }
@@ -209,7 +191,7 @@ pub(crate) fn solve_portfolio_with_deadline(
                     // The profile's first start order, the one Python's order-insensitive
                     // block solver falls back on: request order would let the caller's
                     // listing decide the answer.
-                    let first_order = orders.first().map_or(&instances, |(_, order)| order);
+                    let first_order = orders.own.first().map_or(&instances, |(_, order)| order);
                     pack_order(
                         request,
                         first_order,
@@ -223,24 +205,33 @@ pub(crate) fn solve_portfolio_with_deadline(
     } else {
         None
     };
-    let mut results = if enabled("extreme_points") || enabled("maximal_spaces") {
+    let (mut results, replacement_results) = if enabled("extreme_points")
+        || enabled("maximal_spaces")
+    {
         if staged_plan_search {
             let mut greedy_request = request.clone();
             greedy_request.config.max_candidates_per_item = 1;
             greedy_request.config.container_plan_beam_width = 1;
             greedy_request.config.container_plan_node_limit = 1;
             let greedy_orders = orders
-                .iter()
-                .map(|(name, order)| (format!("{name}:greedy"), order.clone()))
+                .all()
+                .into_iter()
+                .map(|(name, order)| (format!("{name}:greedy"), order))
                 .collect();
-            let mut staged = run_orders(
-                &greedy_request,
-                constraints,
-                scorers,
-                greedy_orders,
-                deadline,
+            let (mut staged, replacement_greedy) = split_own(
+                run_orders(
+                    &greedy_request,
+                    constraints,
+                    scorers,
+                    greedy_orders,
+                    deadline,
+                ),
+                orders.own.len(),
             );
-            for (name, order) in orders.iter().take(2) {
+            // The beam refines the best of the profile's own orders, so a replacement can add
+            // its greedy answer but never take the refinement away from the order that had it.
+            for (name, order) in best_greedy_orders(&staged, &orders.own, QUALITY_BEAM_REFINEMENTS)
+            {
                 if deadline.expired() {
                     break;
                 }
@@ -253,12 +244,15 @@ pub(crate) fn solve_portfolio_with_deadline(
                     deadline,
                 ));
             }
-            staged
+            (staged, replacement_greedy)
         } else {
-            run_orders(request, constraints, scorers, orders, deadline)
+            split_own(
+                run_orders(request, constraints, scorers, orders.all(), deadline),
+                orders.own.len(),
+            )
         }
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     if let Some(result) = block_result
         && results.len() < restart_limit
@@ -314,6 +308,9 @@ pub(crate) fn solve_portfolio_with_deadline(
             tied_block_start = Some(result);
         }
     }
+    let (replacement_winners, outranked_replacements) =
+        outright_winners(replacement_results, &results);
+    results.extend(replacement_winners);
 
     if explicit_selection {
         results.sort_by_key(|result| {
@@ -386,9 +383,11 @@ pub(crate) fn solve_portfolio_with_deadline(
     }
     let global_deadline_reached = deadline.expired();
     let actual_signatures = results.iter().map(signature).collect::<Vec<_>>();
-    // A block start that only tied still ran: it keeps its record and loses its answer.
+    // A replacement or block start that only tied still ran: it keeps its record and loses
+    // its answer.
     let mut start_records = results
         .iter()
+        .chain(&outranked_replacements)
         .chain(tied_block_start.iter())
         .enumerate()
         .map(|(index, result)| StartRecord {
@@ -510,6 +509,63 @@ fn finalize_single_start(
     result
 }
 
+/// How many greedy orders the `quality` staged search refines with the full beam.
+/// One, as in Python: against 1.6.0's two fixed-order beams it lost no answer on the 22 pinned
+/// `quality` runs and the 67 BR1-BR7 instances, at 56% of the CPU; two refinements cost 77%.
+const QUALITY_BEAM_REFINEMENTS: usize = 1;
+
+/// The `count` orders whose greedy extreme-point answer ranked best, best first, ranked as the
+/// portfolio ranks its own results (score, then start name). Python refines the best greedy
+/// ordering found (`best:beam`). Rust refined the first two orders whatever they scored, so on a
+/// mixed order the two full-width beams could start from the weakest orderings in the profile.
+/// Orders that produced no greedy answer follow in profile order, so the count is unchanged.
+fn best_greedy_orders<'a>(
+    greedy: &[PackingResult],
+    orders: &'a [(String, Vec<ItemInstance>)],
+    count: usize,
+) -> Vec<&'a (String, Vec<ItemInstance>)> {
+    let mut ranked: Vec<&PackingResult> = greedy
+        .iter()
+        .filter(|result| result.algorithm.solver.starts_with("extreme_points:"))
+        .collect();
+    ranked.sort_by(|left, right| {
+        left.score
+            .cmp(&right.score)
+            .then_with(|| left.algorithm.solver.cmp(&right.algorithm.solver))
+    });
+    let mut chosen: Vec<&(String, Vec<ItemInstance>)> = Vec::with_capacity(count);
+    for result in ranked {
+        let Some(name) = result
+            .algorithm
+            .solver
+            .strip_prefix("extreme_points:")
+            .and_then(|rest| rest.strip_suffix(":greedy"))
+        else {
+            continue;
+        };
+        if let Some(order) = orders.iter().find(|(order_name, _)| order_name == name)
+            && !chosen.iter().any(|(chosen_name, _)| chosen_name == name)
+        {
+            chosen.push(order);
+        }
+        if chosen.len() == count {
+            return chosen;
+        }
+    }
+    for order in orders {
+        if chosen.len() == count {
+            break;
+        }
+        if !chosen
+            .iter()
+            .any(|(chosen_name, _)| chosen_name == &order.0)
+        {
+            chosen.push(order);
+        }
+    }
+    chosen
+}
+
 fn apply_portfolio_termination(
     results: &mut [PackingResult],
     records: &[StartRecord],
@@ -548,13 +604,14 @@ fn apply_portfolio_termination(
     }
 }
 
+/// Each order's answers, in order; a start the deadline skipped ends the list early.
 fn run_orders(
     request: &PackingRequest,
     constraints: &[Arc<dyn PlacementConstraint>],
     scorers: &[Arc<dyn CandidateScorer>],
     orders: Vec<(String, Vec<ItemInstance>)>,
     deadline: &Deadline,
-) -> Vec<PackingResult> {
+) -> Vec<Vec<PackingResult>> {
     #[cfg(not(target_arch = "wasm32"))]
     if request.config.parallel && orders.len() > 1 {
         return std::thread::scope(|scope| {
@@ -566,10 +623,16 @@ fn run_orders(
                     })
                 })
                 .collect::<Vec<_>>();
+            // A panicking start is re-raised, the first in start order, exactly as the
+            // sequential loop below would raise it: dropping it would let the others
+            // answer for a search that did not run.
             handles
                 .into_iter()
-                .filter_map(|handle| handle.join().ok())
-                .flatten()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
                 .collect()
         });
     }
@@ -577,10 +640,20 @@ fn run_orders(
     orders
         .into_iter()
         .take_while(|_| !deadline.expired())
-        .flat_map(|(name, order)| {
-            run_one_order(request, constraints, scorers, name, order, deadline)
-        })
+        .map(|(name, order)| run_one_order(request, constraints, scorers, name, order, deadline))
         .collect()
+}
+
+/// The answers of the profile's own `own` orders, then those of the replacements after them.
+fn split_own(
+    mut per_order: Vec<Vec<PackingResult>>,
+    own: usize,
+) -> (Vec<PackingResult>, Vec<PackingResult>) {
+    let replacements = per_order.split_off(own.min(per_order.len()));
+    (
+        per_order.into_iter().flatten().collect(),
+        replacements.into_iter().flatten().collect(),
+    )
 }
 
 fn run_one_order(
@@ -760,6 +833,197 @@ fn sort_constrained(mut values: Vec<ItemInstance>, objective: &str) -> Vec<ItemI
     values
 }
 
+/// A named start order, as the extreme-point and maximal-space starts consume it.
+type StartOrder = (String, Vec<ItemInstance>);
+
+/// The profile's start orders, no two of which are one start (see `OrderIdentity`).
+struct StartOrders {
+    /// The distinct orders among those the profile always ran.
+    own: Vec<StartOrder>,
+    /// Neighbours of those orders, run in the starts a repeat freed. Their answers count only
+    /// where they win outright.
+    replacements: Vec<StartOrder>,
+}
+
+impl StartOrders {
+    fn len(&self) -> usize {
+        self.own.len() + self.replacements.len()
+    }
+
+    fn all(&self) -> Vec<StartOrder> {
+        self.own.iter().chain(&self.replacements).cloned().collect()
+    }
+}
+
+/// What makes two start orders one start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderIdentity {
+    /// The item behind each position. No rule the search consults tells two instances of one
+    /// item apart, so relabelling them relabels the answer and changes nothing else.
+    ItemTypes,
+    /// Each instance. Some rule can tell instances apart, so only an exact repeat is one start.
+    Instances,
+}
+
+impl OrderIdentity {
+    /// `ItemTypes` only where it is provably sound (second review). A registered
+    /// scorer, or a constraint that does not declare itself blind to instances, receives the
+    /// `ItemInstance` and may read its `sequence`: an order that only relabels instances can
+    /// then pack differently. So can a per-start beam: its ties fall to placement signatures
+    /// that carry the sequence. The `quality` staged search is exempt, because its starts are
+    /// greedy and its beam refines only the best of the own orders, which this choice keeps.
+    /// A custom order strategy only proposes an order and never sees the search, so it changes
+    /// nothing here. O(c) time for `c` registered constraints, O(1) space.
+    fn of(
+        request: &PackingRequest,
+        constraints: &[Arc<dyn PlacementConstraint>],
+        scorers: &[Arc<dyn CandidateScorer>],
+        staged_plan_search: bool,
+    ) -> Self {
+        let per_start_beam = request.config.container_plan_beam_width > 1 && !staged_plan_search;
+        if per_start_beam
+            || !scorers.is_empty()
+            || constraints
+                .iter()
+                .any(|constraint| constraint.distinguishes_instances())
+        {
+            Self::Instances
+        } else {
+            Self::ItemTypes
+        }
+    }
+
+    /// The item behind each position, and its instance where that can decide how it packs.
+    /// O(n) time and space.
+    fn key(self, order: &[ItemInstance]) -> Vec<(String, Option<usize>)> {
+        order
+            .iter()
+            .map(|instance| {
+                let sequence = (self == Self::Instances).then_some(instance.sequence);
+                (instance.item.id.clone(), sequence)
+            })
+            .collect()
+    }
+}
+
+/// The profile's start orders, no two of which are one start under `identity`.
+///
+/// Under `OrderIdentity::ItemTypes` instances of one item are interchangeable, so two orders
+/// with one item-type sequence pack alike and the second only repeats the first. Under
+/// `OrderIdentity::Instances` only an exact repeat is dropped. On a small mixed request the
+/// built-in sorts often agree (the largest volume, base and edge are one item) and a short
+/// shuffle repeats them too, so a profile could spend most of its starts on one order; Python
+/// already skips a repeat. The profile's own orders are the first `needed` candidates it always
+/// drew -- built-in sorts, custom orders, then seeded shuffles named by their position. A
+/// repeat among them keeps the smaller name, the one whose answer won the tie when the repeat
+/// still ran, so the own starts answer exactly as before.
+///
+/// Each repeat frees a start for a neighbour of an own order: one instance swapped with the
+/// next where their item types differ, the smallest change that gives a new type sequence,
+/// taken order by order and position by position. A neighbour keeps the order nearly sorted,
+/// so it costs about what the start it replaces did, where a fresh shuffle of a large request
+/// costs several times more. At most `max(32, 16 * needed)` neighbours are examined, and the
+/// start count never grows.
+///
+/// O((needed + c) * n log k) time for `c <= max(32, 16 * needed)` neighbours and `k <= needed`
+/// kept orders (one key comparison is O(n)), on top of the O(g * n log n) built-in and custom
+/// orders and O(n) per shuffle; O(k * n) space for the kept orders and their keys.
+fn distinct_start_orders(
+    instances: &[ItemInstance],
+    built_in_generators: &[OrderGenerator],
+    custom_orders: &[Arc<dyn ItemOrderStrategy>],
+    needed: usize,
+    config: &PackingConfig,
+    identity: OrderIdentity,
+) -> StartOrders {
+    let sorted = built_in_generators.iter().map(|&(name, sort_fn)| {
+        (
+            name.to_owned(),
+            sort_fn(instances.to_vec(), &config.objective),
+        )
+    });
+    let custom = custom_orders.iter().map(|custom| {
+        let mut values = instances.to_vec();
+        custom.order(&mut values);
+        (custom.name().to_owned(), values)
+    });
+    let first_shuffle = built_in_generators.len() + custom_orders.len();
+    let shuffles = (first_shuffle..).map(|index| {
+        let index = index as u64;
+        (
+            format!("shuffle-{index}"),
+            deterministic_shuffle(
+                instances.to_vec(),
+                shuffle_seed(config.seed) ^ index.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            ),
+        )
+    });
+    let mut seen: BTreeMap<Vec<(String, Option<usize>)>, usize> = BTreeMap::new();
+    let mut own: Vec<StartOrder> = Vec::with_capacity(needed);
+    for (name, order) in sorted.chain(custom).chain(shuffles).take(needed) {
+        match seen.entry(identity.key(&order)) {
+            Entry::Occupied(kept) => {
+                let kept = &mut own[*kept.get()];
+                if name < kept.0 {
+                    *kept = (name, order);
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(own.len());
+                own.push((name, order));
+            }
+        }
+    }
+    let swaps = own.iter().flat_map(|(name, order)| {
+        type_boundaries(order).map(move |index| {
+            let mut swapped = order.clone();
+            swapped.swap(index, index + 1);
+            (format!("{name}+swap-{index}"), swapped)
+        })
+    });
+    let mut replacements = Vec::new();
+    for (name, order) in swaps.take(32.max(needed.saturating_mul(16))) {
+        if own.len() + replacements.len() >= needed {
+            break;
+        }
+        if seen.insert(identity.key(&order), usize::MAX).is_none() {
+            replacements.push((name, order));
+        }
+    }
+    StartOrders { own, replacements }
+}
+
+/// Every position whose item type differs from the next one's, in order.
+fn type_boundaries(order: &[ItemInstance]) -> impl Iterator<Item = usize> + '_ {
+    order
+        .windows(2)
+        .enumerate()
+        .filter(|(_, pair)| pair[0].item.id != pair[1].item.id)
+        .map(|(index, _)| index)
+}
+
+/// A replacement start's answers that win outright, and those that do not.
+///
+/// A replacement exists only because a repeat freed its start, so it may improve the answer
+/// but never replace an equal one: on a tie the ranking falls to the solver name, which would
+/// hand the result to a neighbour over the order the profile's own start honoured. The same rule
+/// as the added block start. O(a * s) score comparisons for `a` replacement answers and `s`
+/// own answers.
+fn outright_winners(
+    replacement_results: Vec<PackingResult>,
+    own: &[PackingResult],
+) -> (Vec<PackingResult>, Vec<PackingResult>) {
+    replacement_results
+        .into_iter()
+        .partition(|result| strictly_beats_all(result, own))
+}
+
+/// The seed's residue modulo `SEED_MODULUS`, never negative: what Python's `%` and PHP's
+/// corrected remainder keep, so a seed and its residue draw the same orders.
+fn shuffle_seed(seed: i64) -> u64 {
+    seed.rem_euclid(SEED_MODULUS).unsigned_abs()
+}
+
 fn deterministic_shuffle(mut values: Vec<ItemInstance>, mut state: u64) -> Vec<ItemInstance> {
     for index in (1..values.len()).rev() {
         state ^= state << 13;
@@ -810,9 +1074,20 @@ fn signature(result: &PackingResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::swap_index;
+    use super::{shuffle_seed, swap_index};
     use crate::api::pack_json;
     use serde_json::{Value, json};
+
+    /// Python's `seed % 2**31` and PHP's corrected remainder: a seed and its residue are
+    /// one seed, and a negative one is never replaced by a default.
+    #[test]
+    fn a_seed_steers_the_shuffle_by_its_residue_as_python_reduces_it() {
+        assert_eq!(shuffle_seed(-7), 2_147_483_641);
+        assert_eq!(shuffle_seed(2_147_483_641), 2_147_483_641);
+        assert_eq!(shuffle_seed(-7 - (1 << 31)), 2_147_483_641);
+        assert_eq!(shuffle_seed(42 + (1 << 31)), shuffle_seed(42));
+        assert_eq!(shuffle_seed(i64::MIN), 0);
+    }
 
     /// Counted work is the stopping contract; the time limit is only a fuse, so no
     /// start is ever skipped for the clock and every run reports the same starts.
@@ -1180,6 +1455,57 @@ mod tests {
             starts.len() <= 2,
             "max_restarts must cap starts: {starts:?}"
         );
+    }
+
+    /// Regression (conformance `regression-stacking-under`): volume, base area and longest
+    /// edge all put `wide, wide, tall, tall, small`, and so did the one shuffle, so `balanced`
+    /// spent four of its six starts on one order and shipped two boxes. Only an order that
+    /// leads with one `wide` then a `tall` fits all five in the widebox, which Python finds;
+    /// a freed start runs the base-area order with its first `wide` and `tall` swapped.
+    #[test]
+    fn balanced_never_spends_two_starts_on_one_item_type_order() {
+        let items = json!([
+            {"id": "wide", "quantity": 2, "stackable": false,
+             "dimensions": {"length": "83", "width": "75", "height": "54"},
+             "weight": {"value": "473", "unit": "g"}},
+            {"id": "tall", "quantity": 2, "group": "a",
+             "dimensions": {"length": "56", "width": "24", "height": "68"},
+             "weight": {"value": "271", "unit": "g"}},
+            {"id": "small", "stackable": false, "minimum_support_ratio": 0.75,
+             "dimensions": {"length": "45", "width": "24", "height": "33"},
+             "weight": {"value": "479", "unit": "g"}}
+        ]);
+        let containers = json!([
+            {"id": "tallbox", "quantity": 2, "cost_minor": 390,
+             "inner_dimensions": {"length": "100", "width": "136", "height": "203"}},
+            {"id": "widebox", "cost_minor": 74,
+             "inner_dimensions": {"length": "100", "width": "148", "height": "136"}}
+        ]);
+        let result = solve(
+            json!({"solver_profile": "balanced", "clearance": "2", "minimum_support_ratio": 0.5}),
+            items,
+            containers,
+        );
+
+        assert_eq!(score(&result)[..4], [0, 1, 74, 557_470]);
+        assert_eq!(
+            result["algorithm"]["solver"],
+            "extreme_points:base_area+swap-1"
+        );
+        let starts = result["termination"]["starts"]
+            .as_array()
+            .expect("start records")
+            .iter()
+            .map(|start| start["id"].as_str().expect("start id").to_owned())
+            .collect::<Vec<_>>();
+        for repeated in ["volume", "longest_edge", "shuffle-5"] {
+            assert!(
+                starts
+                    .iter()
+                    .all(|id| !id.starts_with(&format!("extreme_points:{repeated}#"))),
+                "{repeated} repeats the base-area order: {starts:?}"
+            );
+        }
     }
 
     #[test]

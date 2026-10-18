@@ -38,6 +38,11 @@ struct Block {
 /// the bound `quality` gives the same solver through `container_plan_node_limit`.
 const BLOCK_START_NODE_LIMIT: usize = 100_000;
 
+/// Leading blocks the `quality` block lookahead completes in each round.
+const LOOKAHEAD_WIDTH: usize = 4;
+/// The lookahead's lattice-node budget per mode, as a multiple of `container_plan_node_limit`.
+const LOOKAHEAD_NODE_FACTOR: usize = 64;
+
 /// The block a container commits next leads with its piece count.
 const COUNT_FIRST: bool = false;
 /// The block a container commits next leads with the volume it fills.
@@ -326,7 +331,7 @@ fn pack_one(
             reached = true;
             break;
         }
-        let (candidate, remaining, limited) = pack_mode(
+        let greedy = pack_mode(
             container,
             sequence,
             items,
@@ -335,30 +340,25 @@ fn pack_one(
             metrics,
             volume_first,
         );
-        reached |= limited;
-        let signature = candidate
-            .placements
-            .iter()
-            .map(|placement| {
-                (
-                    placement.instance.id(),
-                    placement.envelope_origin.z,
-                    placement.envelope_origin.y,
-                    placement.envelope_origin.x,
+        let (candidate, remaining, limited) =
+            if request.config.profile == SolverProfile::Quality && !deadline.expired() {
+                lookahead(
+                    container,
+                    sequence,
+                    items,
+                    request,
+                    deadline,
+                    metrics,
+                    volume_first,
+                    greedy,
                 )
-            })
-            .collect::<Vec<_>>();
-        let max_z = candidate
-            .placements
-            .iter()
-            .map(|placement| placement.envelope_box().z2())
-            .max()
-            .unwrap_or(0);
-        let key = mode_key(
+            } else {
+                greedy
+            };
+        reached |= limited;
+        let key = solution_key(
+            &candidate,
             remaining.len(),
-            candidate.used_volume(),
-            max_z,
-            signature,
             ranks_by_volume(&request.config),
         );
         if best.as_ref().is_none_or(|(best_key, _, _)| key < *best_key) {
@@ -384,6 +384,37 @@ fn pack_one(
 
 /// Placement identities in commit order, the final tie-break between two modes.
 type ModeSignature = Vec<(String, i64, i64, i64)>;
+
+/// One container's block answer: what it holds, what is left, and whether a limit stopped it.
+type Solution = (PackedContainer, Vec<ItemInstance>, bool);
+
+/// How a container's block answer ranks against another of the same container, smaller
+/// first: [`mode_key`] over its placements.
+fn solution_key(
+    packed: &PackedContainer,
+    unpacked: usize,
+    by_volume: bool,
+) -> (i128, i128, i64, ModeSignature) {
+    let signature = packed
+        .placements
+        .iter()
+        .map(|placement| {
+            (
+                placement.instance.id(),
+                placement.envelope_origin.z,
+                placement.envelope_origin.y,
+                placement.envelope_origin.x,
+            )
+        })
+        .collect::<Vec<_>>();
+    let max_z = packed
+        .placements
+        .iter()
+        .map(|placement| placement.envelope_box().z2())
+        .max()
+        .unwrap_or(0);
+    mode_key(unpacked, packed.used_volume(), max_z, signature, by_volume)
+}
 
 /// Which of the two block modes a container keeps: fewer items left, then more volume
 /// used -- or, when the objective fills volume first, the other way round.
@@ -430,6 +461,7 @@ fn group_winner(
     (maximum_x, maximum_y, maximum_z): (i64, i64, i64),
     capacity: i64,
     nodes: &mut usize,
+    node_limit: usize,
     request: &PackingRequest,
     deadline: &Deadline,
     metrics: &mut SolverMetrics,
@@ -438,10 +470,7 @@ fn group_winner(
     let mut largest = 0;
     for nx in 1..=maximum_x.min(capacity) {
         for ny in 1..=maximum_y.min(capacity / nx) {
-            if *nodes >= request.config.container_plan_node_limit
-                || deadline.expired()
-                || effort_exhausted(request, metrics)
-            {
+            if *nodes >= node_limit || deadline.expired() || effort_exhausted(request, metrics) {
                 return Group::Stopped;
             }
             *nodes += 1;
@@ -461,6 +490,49 @@ fn group_winner(
     winner
 }
 
+/// One mode's state between rounds: the free spaces and what is left of each type.
+#[derive(Clone)]
+struct Round {
+    packed: PackedContainer,
+    spaces: Vec<Space>,
+    remaining: BTreeMap<String, Vec<ItemInstance>>,
+}
+
+impl Round {
+    fn start(container: &Container, sequence: usize, items: &[ItemInstance]) -> Self {
+        let mut remaining = BTreeMap::<String, Vec<ItemInstance>>::new();
+        for item in items {
+            remaining
+                .entry(item.item.id.clone())
+                .or_default()
+                .push(item.clone());
+        }
+        Self {
+            packed: PackedContainer {
+                container: container.clone(),
+                sequence,
+                placements: Vec::new(),
+                lattice_summary: None,
+                lattice_items: Vec::new(),
+            },
+            spaces: vec![Space(Aabb {
+                origin: Point::ZERO,
+                dimensions: container.inner_dimensions,
+            })],
+            remaining,
+        }
+    }
+
+    fn open(&self) -> bool {
+        !self.spaces.is_empty() && self.remaining.values().any(|values| !values.is_empty())
+    }
+
+    fn finish(self, reached: bool) -> Solution {
+        let remaining = self.remaining.into_values().flatten().collect();
+        (self.packed, remaining, reached)
+    }
+}
+
 fn pack_mode(
     container: &Container,
     sequence: usize,
@@ -469,196 +541,330 @@ fn pack_mode(
     deadline: &Deadline,
     metrics: &mut SolverMetrics,
     volume_first: bool,
-) -> (PackedContainer, Vec<ItemInstance>, bool) {
-    let mut packed = PackedContainer {
-        container: container.clone(),
-        sequence,
-        placements: Vec::new(),
-        lattice_summary: None,
-        lattice_items: Vec::new(),
-    };
-    let mut spaces = vec![Space(Aabb {
-        origin: Point::ZERO,
-        dimensions: container.inner_dimensions,
-    })];
-    let mut remaining = BTreeMap::<String, Vec<ItemInstance>>::new();
-    for item in items {
-        remaining
-            .entry(item.item.id.clone())
-            .or_default()
-            .push(item.clone());
-    }
+) -> Solution {
     let mut nodes = 0_usize;
+    let (packed, remaining, reached) = complete(
+        Round::start(container, sequence, items),
+        request,
+        deadline,
+        metrics,
+        volume_first,
+        &mut nodes,
+        request.config.container_plan_node_limit,
+    );
+    (packed, remaining, reached || deadline.expired())
+}
+
+/// Commit each round's leading block until nothing more fits.
+fn complete(
+    mut round: Round,
+    request: &PackingRequest,
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+    volume_first: bool,
+    nodes: &mut usize,
+    node_limit: usize,
+) -> Solution {
     let mut reached = false;
-    while !spaces.is_empty() && remaining.values().any(|values| !values.is_empty()) {
-        let mut best: Option<Block> = None;
-        // A type's capacity and rotations do not depend on the space they are tried in.
-        let payload = packed
-            .placements
-            .iter()
-            .map(|p| p.instance.item.weight.0)
-            .sum::<i64>();
-        let types = remaining
-            .iter()
-            .filter_map(|(item_id, available)| {
-                let prototype = available.first()?;
-                let mut capacity = available.len();
-                if let Some(max_items) = container.max_items {
-                    capacity = capacity.min(max_items.saturating_sub(packed.placements.len()));
-                }
-                if let Some(max_payload) = container.max_payload
-                    && prototype.item.weight.0 > 0
-                {
-                    // Divide in i64: weight ticks pass u32::MAX, and `usize` is 32 bits on wasm32.
-                    let fitting =
-                        max_payload.0.saturating_sub(payload).max(0) / prototype.item.weight.0;
-                    capacity = capacity.min(usize::try_from(fitting).unwrap_or(usize::MAX));
-                }
-                (capacity > 0).then(|| {
-                    let rotations = prototype
-                        .item
-                        .dimensions
-                        .unique_rotations(&prototype.item.allowed_rotations)
-                        .into_iter()
-                        .map(|(rotation, physical)| {
-                            (
-                                rotation,
-                                physical,
-                                physical.expand(request.config.clearance),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    (item_id, capacity, rotations)
-                })
-            })
-            .collect::<Vec<_>>();
-        'spaces: for space in &spaces {
-            let space_volume = space.0.dimensions.volume();
-            for (item_id, capacity, rotations) in &types {
-                for &(rotation, physical, envelope) in rotations {
-                    let extents = (
-                        space.0.dimensions.length.0 / envelope.length.0,
-                        space.0.dimensions.width.0 / envelope.width.0,
-                        space.0.dimensions.height.0 / envelope.height.0,
-                    );
-                    let (nx, ny, nz, count) = match group_winner(
-                        extents,
-                        *capacity as i64,
-                        &mut nodes,
-                        request,
-                        deadline,
-                        metrics,
-                    ) {
-                        Group::Stopped => {
-                            reached = true;
-                            break 'spaces;
-                        }
-                        Group::Empty => continue,
-                        Group::Winner { nx, ny, nz, count } => (nx, ny, nz, count),
-                    };
-                    let used = count as i128 * physical.volume();
-                    let fill = used * 1_000_000 / space_volume;
-                    let lead = if volume_first {
-                        (-used, -fill, -(count as i128))
-                    } else {
-                        (-(count as i128), -fill, -used)
-                    };
-                    // The lead alone decides most comparisons; the identity fields, and
-                    // the strings among them, are built only for a group that can lead.
-                    if best
-                        .as_ref()
-                        .is_some_and(|current| lead > (current.key.0, current.key.1, current.key.2))
-                    {
-                        continue;
-                    }
-                    let key = (
-                        lead.0,
-                        lead.1,
-                        lead.2,
-                        space.0.origin.z,
-                        space.0.origin.y,
-                        space.0.origin.x,
-                        (*item_id).clone(),
-                        rotation.as_str(),
-                        nx,
-                        ny,
-                        nz,
-                    );
-                    if best.as_ref().is_none_or(|current| key < current.key) {
-                        best = Some(Block {
-                            space: *space,
-                            item_id: (*item_id).clone(),
-                            rotation,
-                            physical,
-                            envelope,
-                            nx,
-                            ny,
-                            nz,
-                            count,
-                            key,
-                        });
-                    }
-                }
-            }
-        }
-        let Some(block) = best else { break };
+    while round.open() {
+        let leading;
+        (leading, reached) = leading_blocks(
+            &round,
+            request,
+            deadline,
+            metrics,
+            volume_first,
+            nodes,
+            node_limit,
+            1,
+        );
+        let Some(block) = leading.first() else { break };
         if reached {
             break;
         }
-        let available = remaining
-            .get_mut(&block.item_id)
-            .expect("candidate item exists");
-        let chosen = available.drain(..block.count).collect::<Vec<_>>();
-        let clearance = request.config.clearance.0;
-        let mut index = 0;
-        for z in 0..block.nz {
-            for y in 0..block.ny {
-                for x in 0..block.nx {
-                    let origin = Point {
-                        x: block.space.0.origin.x + x * block.envelope.length.0,
-                        y: block.space.0.origin.y + y * block.envelope.width.0,
-                        z: block.space.0.origin.z + z * block.envelope.height.0,
-                    };
-                    packed.placements.push(Placement {
-                        instance: chosen[index].clone(),
-                        position: Point {
-                            x: origin.x + clearance,
-                            y: origin.y + clearance,
-                            z: origin.z + clearance,
-                        },
-                        rotation: block.rotation,
-                        dimensions: block.physical,
-                        envelope_origin: origin,
-                        envelope_dimensions: block.envelope,
-                        // Above its bottom layer a member rests on an identical
-                        // footprint; the bottom layer rests on whatever is there.
-                        support_ratio: if z == 0 {
-                            member_support(&packed.placements, origin, block.envelope)
-                        } else {
-                            1.0
-                        },
-                        top_load: Weight(0),
-                        fixed: false,
-                    });
-                    index += 1;
-                    metrics.feasible_candidates = metrics.feasible_candidates.saturating_add(1);
-                    metrics.orientations_considered =
-                        metrics.orientations_considered.saturating_add(1);
-                }
+        commit(&mut round, block, request, metrics);
+    }
+    round.finish(reached)
+}
+
+/// `greedy`, or a better answer from completing each round's leading blocks.
+///
+/// Each round ranks its `LOOKAHEAD_WIDTH` leading blocks, completes each one greedily on
+/// a copy, and commits the block whose completion ranks best. The greedy answer is the
+/// first completion, so the result is never worse than it. The round's first block is
+/// the greedy choice after the block committed last, so its completion is the one
+/// already known -- unless the greedy pass was stopped by `container_plan_node_limit`,
+/// when the first round completes it under the lookahead's larger budget of
+/// `LOOKAHEAD_NODE_FACTOR` times that limit. When the budget runs out the best completion
+/// so far stands; only the deadline or the effort budget marks it as stopped.
+/// O(K * B^2 * S * T * R * X * Y) time, bounded by that budget, and O(K * (S + n)) space.
+#[allow(clippy::too_many_arguments)]
+fn lookahead(
+    container: &Container,
+    sequence: usize,
+    items: &[ItemInstance],
+    request: &PackingRequest,
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+    volume_first: bool,
+    greedy: Solution,
+) -> Solution {
+    let by_volume = ranks_by_volume(&request.config);
+    let node_limit = request
+        .config
+        .container_plan_node_limit
+        .saturating_mul(LOOKAHEAD_NODE_FACTOR);
+    let mut round = Round::start(container, sequence, items);
+    let mut best_key = solution_key(&greedy.0, greedy.1.len(), by_volume);
+    let mut known = (!greedy.2).then(|| greedy.clone());
+    let mut best = greedy;
+    let mut nodes = 0_usize;
+    while round.open() {
+        let (leading, mut reached) = leading_blocks(
+            &round,
+            request,
+            deadline,
+            metrics,
+            volume_first,
+            &mut nodes,
+            node_limit,
+            LOOKAHEAD_WIDTH,
+        );
+        if leading.is_empty() || reached {
+            break;
+        }
+        let mut chosen = known.take().map(|solution| {
+            (
+                solution_key(&solution.0, solution.1.len(), by_volume),
+                solution,
+                0,
+            )
+        });
+        let first = usize::from(chosen.is_some());
+        for (index, block) in leading.iter().enumerate().skip(first) {
+            let mut trial = round.clone();
+            commit(&mut trial, block, request, metrics);
+            let solution = complete(
+                trial,
+                request,
+                deadline,
+                metrics,
+                volume_first,
+                &mut nodes,
+                node_limit,
+            );
+            if solution.2 {
+                reached = true;
+                break;
+            }
+            let key = solution_key(&solution.0, solution.1.len(), by_volume);
+            if chosen.as_ref().is_none_or(|(current, _, _)| key < *current) {
+                chosen = Some((key, solution, index));
             }
         }
-        let occupied = Aabb {
-            origin: block.space.0.origin,
-            dimensions: Dimensions {
-                length: Length(block.nx * block.envelope.length.0),
-                width: Length(block.ny * block.envelope.width.0),
-                height: Length(block.nz * block.envelope.height.0),
-            },
+        let Some((key, solution, index)) = chosen.filter(|_| !reached) else {
+            break;
         };
-        spaces = subtract_all(spaces, occupied, metrics);
+        if key < best_key {
+            best_key = key;
+            best = solution.clone();
+        }
+        commit(&mut round, &leading[index], request, metrics);
+        known = Some(solution);
     }
-    let remaining = remaining.into_values().flatten().collect();
-    (packed, remaining, reached || deadline.expired())
+    let stopped = best.2 || deadline.expired();
+    (best.0, best.1, stopped)
+}
+
+/// One round's `leaders` leading blocks, best first, and whether a limit stopped the round
+/// (which then commits nothing).
+#[allow(clippy::too_many_arguments)]
+fn leading_blocks(
+    round: &Round,
+    request: &PackingRequest,
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+    volume_first: bool,
+    nodes: &mut usize,
+    node_limit: usize,
+    leaders: usize,
+) -> (Vec<Block>, bool) {
+    let container = &round.packed.container;
+    let mut leading: Vec<Block> = Vec::with_capacity(leaders + 1);
+    // A type's capacity and rotations do not depend on the space they are tried in.
+    let payload = round
+        .packed
+        .placements
+        .iter()
+        .map(|p| p.instance.item.weight.0)
+        .sum::<i64>();
+    let types = round
+        .remaining
+        .iter()
+        .filter_map(|(item_id, available)| {
+            let prototype = available.first()?;
+            let mut capacity = available.len();
+            if let Some(max_items) = container.max_items {
+                capacity = capacity.min(max_items.saturating_sub(round.packed.placements.len()));
+            }
+            if let Some(max_payload) = container.max_payload
+                && prototype.item.weight.0 > 0
+            {
+                // Divide in i64: weight ticks pass u32::MAX, and `usize` is 32 bits on wasm32.
+                let fitting =
+                    max_payload.0.saturating_sub(payload).max(0) / prototype.item.weight.0;
+                capacity = capacity.min(usize::try_from(fitting).unwrap_or(usize::MAX));
+            }
+            (capacity > 0).then(|| {
+                let rotations = prototype
+                    .item
+                    .dimensions
+                    .unique_rotations(&prototype.item.allowed_rotations)
+                    .into_iter()
+                    .map(|(rotation, physical)| {
+                        (
+                            rotation,
+                            physical,
+                            physical.expand(request.config.clearance),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (item_id, capacity, rotations)
+            })
+        })
+        .collect::<Vec<_>>();
+    for space in &round.spaces {
+        let space_volume = space.0.dimensions.volume();
+        for (item_id, capacity, rotations) in &types {
+            for &(rotation, physical, envelope) in rotations {
+                let extents = (
+                    space.0.dimensions.length.0 / envelope.length.0,
+                    space.0.dimensions.width.0 / envelope.width.0,
+                    space.0.dimensions.height.0 / envelope.height.0,
+                );
+                let (nx, ny, nz, count) = match group_winner(
+                    extents,
+                    *capacity as i64,
+                    nodes,
+                    node_limit,
+                    request,
+                    deadline,
+                    metrics,
+                ) {
+                    Group::Stopped => return (leading, true),
+                    Group::Empty => continue,
+                    Group::Winner { nx, ny, nz, count } => (nx, ny, nz, count),
+                };
+                let used = count as i128 * physical.volume();
+                let fill = used * 1_000_000 / space_volume;
+                let lead = if volume_first {
+                    (-used, -fill, -(count as i128))
+                } else {
+                    (-(count as i128), -fill, -used)
+                };
+                // The lead alone decides most comparisons; the identity fields, and the
+                // strings among them, are built only for a group that can still be kept.
+                let full = leading.len() == leaders;
+                if full
+                    && leading
+                        .last()
+                        .is_some_and(|last| lead > (last.key.0, last.key.1, last.key.2))
+                {
+                    continue;
+                }
+                let key = (
+                    lead.0,
+                    lead.1,
+                    lead.2,
+                    space.0.origin.z,
+                    space.0.origin.y,
+                    space.0.origin.x,
+                    (*item_id).clone(),
+                    rotation.as_str(),
+                    nx,
+                    ny,
+                    nz,
+                );
+                if full && leading.last().is_some_and(|last| key >= last.key) {
+                    continue;
+                }
+                let at = leading.partition_point(|kept| kept.key < key);
+                leading.insert(
+                    at,
+                    Block {
+                        space: *space,
+                        item_id: (*item_id).clone(),
+                        rotation,
+                        physical,
+                        envelope,
+                        nx,
+                        ny,
+                        nz,
+                        count,
+                        key,
+                    },
+                );
+                leading.truncate(leaders);
+            }
+        }
+    }
+    (leading, false)
+}
+
+/// Place every member of `block`, bottom layer first, and carve it from the free spaces.
+fn commit(round: &mut Round, block: &Block, request: &PackingRequest, metrics: &mut SolverMetrics) {
+    let available = round
+        .remaining
+        .get_mut(&block.item_id)
+        .expect("candidate item exists");
+    let chosen = available.drain(..block.count).collect::<Vec<_>>();
+    let clearance = request.config.clearance.0;
+    let mut index = 0;
+    for z in 0..block.nz {
+        for y in 0..block.ny {
+            for x in 0..block.nx {
+                let origin = Point {
+                    x: block.space.0.origin.x + x * block.envelope.length.0,
+                    y: block.space.0.origin.y + y * block.envelope.width.0,
+                    z: block.space.0.origin.z + z * block.envelope.height.0,
+                };
+                let support_ratio = if z == 0 {
+                    member_support(&round.packed.placements, origin, block.envelope)
+                } else {
+                    1.0
+                };
+                round.packed.placements.push(Placement {
+                    instance: chosen[index].clone(),
+                    position: Point {
+                        x: origin.x + clearance,
+                        y: origin.y + clearance,
+                        z: origin.z + clearance,
+                    },
+                    rotation: block.rotation,
+                    dimensions: block.physical,
+                    envelope_origin: origin,
+                    envelope_dimensions: block.envelope,
+                    // Above its bottom layer a member rests on an identical footprint;
+                    // the bottom layer rests on whatever is there.
+                    support_ratio,
+                    top_load: Weight(0),
+                    fixed: false,
+                });
+                index += 1;
+                metrics.feasible_candidates = metrics.feasible_candidates.saturating_add(1);
+                metrics.orientations_considered = metrics.orientations_considered.saturating_add(1);
+            }
+        }
+    }
+    let occupied = Aabb {
+        origin: block.space.0.origin,
+        dimensions: Dimensions {
+            length: Length(block.nx * block.envelope.length.0),
+            width: Length(block.ny * block.envelope.width.0),
+            height: Length(block.nz * block.envelope.height.0),
+        },
+    };
+    round.spaces = subtract_all(std::mem::take(&mut round.spaces), occupied, metrics);
 }
 
 #[cfg(test)]
@@ -729,6 +935,7 @@ mod tests {
                     extents,
                     capacity,
                     &mut nodes,
+                    request.config.container_plan_node_limit,
                     &request,
                     &deadline,
                     &mut metrics,
@@ -794,14 +1001,16 @@ mod tests {
         }).to_string()
     }
 
-    /// One 60x60x40 base and three 40x60x50 tops in a 100 mm crate: the base ends on two
-    /// tops and overhangs them.
-    fn a_base_and_three_tops(minimum_support_ratio: f64) -> serde_json::Value {
+    /// One 60x60x40 base and three 40x60x50 tops in a 100 mm crate. The greedy block pass,
+    /// which `balanced` runs, ends the base on two tops so that it overhangs them;
+    /// `quality`'s lookahead finds a layout with nothing overhanging.
+    fn a_base_and_three_tops(profile: &str, minimum_support_ratio: f64) -> serde_json::Value {
         let request = serde_json::json!({
             "units": {"length": "mm"},
             "configuration": {
-                "solver_profile": "quality",
+                "solver_profile": profile,
                 "solvers": ["homogeneous_blocks"],
+                "container_plan_node_limit": 100_000,
                 "time_limit_ms": 60_000,
                 "effort_budget": {"max_search_nodes": 100_000},
                 "minimum_support_ratio": minimum_support_ratio
@@ -863,8 +1072,21 @@ mod tests {
     }
 
     #[test]
+    fn the_quality_lookahead_finds_a_layout_with_nothing_overhanging() {
+        let greedy = a_base_and_three_tops("balanced", 0.0);
+        let looked = a_base_and_three_tops("quality", 0.0);
+        assert!(looked["unpacked_items"].as_array().unwrap().is_empty());
+        assert!(
+            reported_and_resting_support(&looked)
+                .iter()
+                .all(|&(reported, resting)| reported == 1.0 && resting == 1.0)
+        );
+        assert_ne!(looked["score"], greedy["score"]);
+    }
+
+    #[test]
     fn a_block_set_on_a_smaller_one_reports_the_support_it_really_has() {
-        let result = a_base_and_three_tops(0.0);
+        let result = a_base_and_three_tops("balanced", 0.0);
         let support = reported_and_resting_support(&result);
         assert_eq!(
             support.iter().filter(|(_, resting)| *resting < 1.0).count(),
@@ -886,7 +1108,7 @@ mod tests {
 
     #[test]
     fn the_block_solver_leaves_a_request_that_asks_for_support_to_the_per_item_search() {
-        let result = a_base_and_three_tops(1.0);
+        let result = a_base_and_three_tops("balanced", 1.0);
         let support = reported_and_resting_support(&result);
         assert!(!support.is_empty());
         assert!(support.iter().all(|(_, resting)| *resting == 1.0));

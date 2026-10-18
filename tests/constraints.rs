@@ -788,3 +788,135 @@ fn stacking_groups_make_the_block_solver_delegate() {
     }));
     assert_eq!(placed_types(&result).len(), 9);
 }
+
+/// (audit S5): `incompatible_tags` is an item-against-item rule. A container's own
+/// tags never refuse an item, in every other engine, in this engine's validator and in
+/// docs/POLICY-RULES.md; the extreme-point search used to refuse one anyway.
+fn bleach_in_a_food_box(profile: &str, solvers: Value) -> Value {
+    solve(json!({
+        "units": {"length": "mm", "weight": "kg"},
+        "configuration": {"solver_profile": profile, "solvers": solvers},
+        "items": [
+            {"id": "bleach", "weight": "1", "incompatible_tags": ["food"],
+             "dimensions": {"length": "100", "width": "100", "height": "100"}},
+            {"id": "rice", "weight": "1",
+             "dimensions": {"length": "100", "width": "100", "height": "50"}},
+            {"id": "pasta", "weight": "1",
+             "dimensions": {"length": "50", "width": "100", "height": "100"}}
+        ],
+        "containers": [{"id": "pantry-box", "tags": ["food"],
+            "inner_dimensions": {"length": "300", "width": "300", "height": "300"}}]
+    }))
+}
+
+#[test]
+fn a_container_tag_never_meets_an_items_incompatible_tags() {
+    for profile in ["fast", "balanced", "quality"] {
+        for solvers in [json!([]), json!(["extreme_points"])] {
+            let result = bleach_in_a_food_box(profile, solvers.clone());
+            assert_eq!(
+                placed_types(&result).len(),
+                3,
+                "{profile} {solvers}: {result}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_lattice_and_the_extreme_point_search_agree_on_a_tagged_container() {
+    let request = |solvers: Value| {
+        json!({
+            "configuration": {"solver_profile": "fast", "solvers": solvers},
+            "items": [{"id": "bleach", "quantity": 8, "incompatible_tags": ["food"],
+                "dimensions": {"length": "50", "width": "50", "height": "50"}}],
+            "containers": [{"id": "pantry-box", "quantity": 1, "tags": ["food"],
+                "inner_dimensions": {"length": "100", "width": "100", "height": "100"}}]
+        })
+    };
+    let lattice = solve(request(json!([])));
+    let extreme = solve(request(json!(["extreme_points"])));
+    assert_eq!(lattice["algorithm"]["solver"], "grid");
+    assert!(
+        extreme["algorithm"]["solver"]
+            .as_str()
+            .is_some_and(|solver| solver.starts_with("extreme_points")),
+        "{extreme}"
+    );
+    assert_eq!(placed_types(&lattice).len(), 8, "{lattice}");
+    assert_eq!(placed_types(&extreme).len(), 8, "{extreme}");
+}
+
+fn without_seed_echo(mut result: Value) -> Value {
+    for alternative in result["alternatives"].as_array_mut().into_iter().flatten() {
+        alternative["algorithm"]
+            .as_object_mut()
+            .unwrap()
+            .remove("seed");
+    }
+    result["algorithm"].as_object_mut().unwrap().remove("seed");
+    without_wall_clock(result)
+}
+
+fn seeded_mixed_load(seed: Value) -> Value {
+    let items: Vec<Value> = (0..9)
+        .map(|index| {
+            json!({"id": format!("carton-{index}"), "quantity": 2,
+                "dimensions": {"length": (30 + 7 * index).to_string(),
+                               "width": (25 + 5 * index).to_string(),
+                               "height": (20 + 3 * index).to_string()}})
+        })
+        .collect();
+    solve(json!({
+        "units": {"length": "mm"},
+        "configuration": {"solver_profile": "quality", "seed": seed, "multi_start_orders": 16},
+        "items": items,
+        "containers": [{"id": "crate", "quantity": 1,
+            "inner_dimensions": {"length": "160", "width": "140", "height": "120"}}]
+    }))
+}
+
+/// (audit S2): a negative seed is read, echoed and reduced the way Python reduces
+/// it (`-7 % 2**31 == 2147483641`), never replaced by the default.
+#[test]
+fn a_negative_seed_is_its_python_residue_and_never_the_default() {
+    let negative = seeded_mixed_load(json!(-7));
+    assert_eq!(negative["algorithm"]["seed"], -7);
+    let residue = seeded_mixed_load(json!(2_147_483_641_i64));
+    let default = seeded_mixed_load(json!(42));
+    assert_ne!(
+        without_seed_echo(negative.clone()),
+        without_seed_echo(default)
+    );
+    assert_eq!(without_seed_echo(negative), without_seed_echo(residue));
+}
+
+/// (audit S10): with a clearance the axle-balanced origin is an envelope origin.
+/// The feasible centres here are 300..=305 mm, narrower than the 10 mm clearance, so an
+/// origin computed from the physical length misses the window on both axles.
+#[test]
+fn an_axle_balanced_point_seats_the_envelope_under_a_clearance() {
+    for profile in ["fast", "balanced", "quality"] {
+        let result = solve(json!({
+            "units": {"length": "mm"},
+            "configuration": {"solver_profile": profile, "clearance": "10"},
+            "items": [{"id": "drum", "allowed_rotations": ["LWH"],
+                "weight": {"value": "1000", "unit": "g"},
+                "dimensions": {"length": "200", "width": "100", "height": "100"}}],
+            "containers": [{"id": "trailer",
+                "inner_dimensions": {"length": "1000", "width": "200", "height": "200"},
+                "axles": [{"position": "0", "max_load": {"value": "700", "unit": "g"}},
+                          {"position": "1000", "max_load": {"value": "305", "unit": "g"}}]}]
+        }));
+        assert_eq!(placed_types(&result), ["drum"], "{profile}: {result}");
+        let x = result["containers"][0]["placements"][0]["position"]["x"]["value"]
+            .as_str()
+            .and_then(|value| value.parse::<f64>().ok())
+            .expect("x in mm");
+        assert!(
+            (200.0..=205.0).contains(&x),
+            "{profile}: centre {}",
+            x + 100.0
+        );
+    }
+}

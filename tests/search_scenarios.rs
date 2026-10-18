@@ -1,7 +1,8 @@
 //! Small scenes that steer the extreme-point search into branches the golden corpus never
 //! reaches: route stops mixed with items that ride the whole route, covered ground contact,
 //! a candidate-point budget smaller than the scene, an axle container whose floor fills up,
-//! a hull beside an obstacle, grouped items under the beam, and dimensional weight in feet.
+//! a hull beside an obstacle, grouped items under the beam, dimensional weight in feet, and a
+//! mixed order through the extreme-point solver alone.
 //!
 //! Every scene goes through `pack_json`, which refuses any result its independent validator
 //! rejects, so "it solved" already asserts the answer is valid; each test adds the property
@@ -179,4 +180,35 @@ fn dimensional_weight_can_be_measured_in_feet() {
                            "dimensional_weight_length_unit": "ft" }
     }));
     assert_eq!(result["objective"], "shipping_cost");
+}
+
+#[test]
+fn extreme_points_alone_packs_a_mixed_order_as_well_as_python() {
+    // OR-Library thpack2 instance 3 (BR2). Above 64 candidate points Rust used to scan every
+    // combination of placed faces, and the greedy rule then took locally tighter corners that
+    // later items could not use: 54 items were left out where Python leaves 49.
+    let types = [
+        (97, 81, 27, 27),
+        (102, 78, 39, 31),
+        (113, 46, 36, 35),
+        (66, 50, 42, 37),
+        (101, 30, 26, 36),
+    ];
+    let items: Vec<Value> = types
+        .iter()
+        .enumerate()
+        .map(|(index, (length, width, height, quantity))| {
+            json!({ "id": format!("type-{}", index + 1), "quantity": quantity, "weight": "1",
+                    "dimensions": { "length": length.to_string(), "width": width.to_string(),
+                                    "height": height.to_string() } })
+        })
+        .collect();
+    let result = solve(json!({
+        "configuration": { "solver_profile": "fast", "solvers": ["extreme_points"] },
+        "items": items,
+        "containers": [{ "id": "br", "max_payload": "1000000",
+                         "inner_dimensions": { "length": "587", "width": "233", "height": "220" } }]
+    }));
+    let requested: usize = types.iter().map(|(.., quantity)| quantity).sum();
+    assert!(requested - placed_count(&result) <= 49, "{result}");
 }

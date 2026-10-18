@@ -215,3 +215,29 @@ fn a_single_restart_packs_worse_than_the_full_portfolio() {
     assert_eq!(unpacked(Some(1)), Some(4));
     assert_eq!(unpacked(None), Some(3));
 }
+
+/// (audit D1): no offered container carries the tag an item requires, a statement
+/// about the request no search can change, so the reason is `proven` -- the level every
+/// validator requires of it.
+#[test]
+fn an_item_no_container_tags_admit_is_proven_unplaceable() {
+    let result = solve(
+        json!([
+            cube(
+                "cold-item",
+                1,
+                "10",
+                json!({ "eligible_container_tags": ["cold"] })
+            ),
+            cube("dry-item", 1, "10", json!({})),
+        ]),
+        json!([{ "id": "dry", "tags": ["dry"],
+                 "inner_dimensions": { "length": "20", "width": "20", "height": "20" } }]),
+        json!({}),
+    );
+    assert_eq!(
+        reasons(&result),
+        vec![("no_eligible_container".to_owned(), "proven".to_owned())]
+    );
+    assert_eq!(result["summary"]["packed_item_count"], 1);
+}

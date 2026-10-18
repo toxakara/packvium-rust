@@ -1,6 +1,6 @@
 use super::extreme::{
-    ContainerState, SCORE_SCALE, apply_candidate, billed_dimensional_weight, container_order_key,
-    find_candidates, ranks_by_volume, score_solution, volume_share_ppm,
+    ContainerState, PointSet, SCORE_SCALE, apply_candidate, billed_dimensional_weight,
+    container_order_key, find_candidates, ranks_by_volume, score_solution, volume_share_ppm,
 };
 use crate::deadline::Deadline;
 use crate::geometry::ShapeType;
@@ -721,6 +721,7 @@ fn search(
             constraints,
             scorers,
             usize::MAX,
+            PointSet::Cartesian,
             deadline,
             metrics,
         );

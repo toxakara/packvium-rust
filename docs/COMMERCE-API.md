@@ -160,9 +160,11 @@ may carry only `tariffs`. Field-level rules:
   than leaving it to be inferred from which fields the payload happens to carry.
 - An omitted optional field and an explicit JSON `null` mean the same thing: absent.
   Writing `"minimum_charge_minor": null` is exactly writing nothing.
-- Every integer is exact and, except where a model explicitly allows zero, positive.
-  The per-field bounds are the ones the models already enforce — see
-  CATALOG-VERSIONING.md and POLICY-RULES.md.
+- Every integer is exact. Dimensions, an item's `weight_g`, `max_payload_g`,
+  `max_stack_height_mm` and `dimensional_weight_divisor` must be positive; `effective_at`,
+  `published_at`, `cost_minor`, `minimum_charge_minor`, `fuel_surcharge_permille`,
+  `flat_charge_minor`, `permille_of_base` and each zone rate in
+  `cost_per_dimensional_kg_minor` may be zero but not negative.
 
 ### Input errors versus rejections
 
@@ -322,13 +324,12 @@ original paths and re-export the relocated definitions, so every workspace test,
 against the exact same objects. There is one definition of `rate_tariff` in the Python
 tree, and the installed wheel contains it. `commerce/rating/objective.py` — the solver
 adapter — is untouched and stays a workspace module: it registers in-process scorer and
-selector objects, which EXTENDING.md explains are deliberately not
-cross-language features.
+selector objects, which are deliberately not cross-language features: an in-process
+object cannot cross the JSON boundary every other engine is driven through.
 
 ## Conformance standard
 
-Held to the standard every other capability in this project is held to, per
-TESTING-AND-RELEASE.md:
+Held to the standard every other capability in this project is held to:
 
 - **Python and PHP: byte-identical.** Both are ports of one contract; canonical JSON
   (sorted keys, `,`/`:` separators, no trailing whitespace) of the result document must
@@ -364,15 +365,15 @@ TESTING-AND-RELEASE.md:
 | `catalog_version_info` | `O(h + e log e)` | `O(e)` |
 
 The `e log e` term is sorting the three id lists; every other bound is a linear scan of
-the relevant history. These match the bounds already published for the underlying
-models in ALGORITHMS-AND-COMPLEXITY.md — the wrapper
-adds parsing and serialization, both linear in the payload, and nothing else.
+the relevant history. These are the bounds of the underlying models; the wrapper adds
+parsing and serialization, both linear in the payload, and nothing else.
 
 ## Limitations
 
 - The document is supplied by the caller. Nothing here fetches, scrapes or embeds any
-  real carrier's published rates; live rate-card ingestion is still out of scope and
-  still tracked in LIMITATIONS-AND-ROADMAP.md.
+  real carrier's published rates. Live rate-card ingestion exists, but in the carrier
+  connectors, not here: CARRIER-RATE-INGESTION.md builds a
+  table from a feed, and this API is handed the result like any other document.
 - `catalog_version_info` returns metadata and id lists, not the resolved master-data
   records. Exporting the full snapshot is a larger surface with its own wire-format
   question and is not part of this epic.

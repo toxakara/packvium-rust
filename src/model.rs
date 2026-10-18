@@ -54,12 +54,17 @@ impl EffortBudget {
     }
 }
 
+/// The modulus Python's and PHP's `DeterministicRandom` reduce a seed by.
+pub const SEED_MODULUS: i64 = 1 << 31;
+
 #[derive(Clone, Debug)]
 pub struct PackingConfig {
     pub profile: SolverProfile,
     pub time_limit_ms: u64,
     pub top_k: usize,
-    pub seed: u64,
+    /// Any integer: only its residue modulo [`SEED_MODULUS`] steers a shuffle, as in Python
+    /// and PHP, so `-7` and `2_147_483_641` draw the same orders.
+    pub seed: i64,
     pub max_containers: Option<usize>,
     pub clearance: Length,
     pub minimum_support_ratio: f64,
@@ -1353,6 +1358,7 @@ impl ReasonProof {
             reason,
             "no_compatible_container_dimensions"
                 | "payload_exceeded"
+                | "no_eligible_container"
                 | "rotation_restricted"
                 | "policy_rule"
         ) {
@@ -1361,7 +1367,10 @@ impl ReasonProof {
             "unknown_due_to_limit"
         } else if matches!(
             reason,
-            "no_feasible_placement" | "search_exhausted" | "exact_search_incomplete"
+            "no_feasible_placement"
+                | "search_exhausted"
+                | "exact_search_incomplete"
+                | "insufficient_support"
         ) {
             "observed"
         } else {
@@ -1548,7 +1557,7 @@ pub struct AlgorithmReport {
     pub profile: String,
     pub solver: String,
     pub duration_ms: u64,
-    pub seed: u64,
+    pub seed: i64,
     pub time_limit_reached: bool,
     pub effort_limit_reached: bool,
     pub candidates_evaluated: u64,
