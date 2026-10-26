@@ -40,6 +40,7 @@ pub fn pack_exact_one(
         return None;
     }
 
+    let deadline = &deadline.for_start();
     let started = deadline.now_ns();
     let mut best_result: Option<PackingResult> = None;
     let mut searched_all_containers = true;
@@ -77,7 +78,7 @@ pub fn pack_exact_one(
     let mut best_position = usize::MAX;
 
     for (root_floor, position, initial, can_fit, cannot_fit) in planned {
-        if deadline.expired() || effort_exhausted(request, &metrics) {
+        if deadline.expired() {
             searched_all_containers = false;
             break;
         }
@@ -85,6 +86,11 @@ pub fn pack_exact_one(
             && (root_floor > best.score || (root_floor == best.score && position > best_position))
         {
             continue;
+        }
+        // Asked after the floor skip: a container proven unable to win is no work refused.
+        if deadline.effort_stops(request, &metrics) {
+            searched_all_containers = false;
+            break;
         }
 
         let mut best_state = initial.clone();
@@ -125,7 +131,7 @@ pub fn pack_exact_one(
             .map(|placement| placement.instance.id())
             .collect::<BTreeSet<_>>();
         let timed_out = deadline.expired();
-        let effort_limited = effort_exhausted(request, &metrics);
+        let effort_limited = deadline.effort_stopped();
         let unpacked = items
             .iter()
             .filter(|item| !placed.contains(&item.id()))
@@ -211,7 +217,7 @@ pub fn pack_exact_one(
 
     if let Some(result) = best_result.as_mut() {
         let timed_out = deadline.expired();
-        let effort_limited = effort_exhausted(request, &metrics);
+        let effort_limited = deadline.effort_stopped();
         result.algorithm.duration_ms = deadline.elapsed_ms_since(started);
         result.algorithm.time_limit_reached = timed_out;
         result.algorithm.effort_limit_reached = effort_limited;
@@ -653,7 +659,7 @@ fn search(
     metrics: &mut SolverMetrics,
     visited: &mut VisitedStates,
 ) {
-    if deadline.expired() || effort_exhausted(request, metrics) {
+    if deadline.expired() {
         return;
     }
     // In an order-insensitive scene, two item orders that seat the same boxes at the same
@@ -661,6 +667,11 @@ fn search(
     // load-sensitive or extension-bearing scene StateKeys preserves insertion order, so
     // the same check only folds states whose order-dependent future is also the same.
     if !visited.seen.insert(visited.keys.of(state)) {
+        return;
+    }
+    // Asked after the fold: a state already explored is no work refused. A stop ends the
+    // whole search, so the state it leaves recorded is never visited again.
+    if deadline.effort_stops(request, metrics) {
         return;
     }
     metrics.search_nodes_expanded = metrics.search_nodes_expanded.saturating_add(1);
@@ -810,14 +821,24 @@ mod tests {
         // Root plus four placements exactly consumes this counted prefix. Containers are
         // searched best root floor first, so `b-flat` -- the one the objective prefers --
         // has already produced a complete incumbent when the global exact search budget
-        // binds, and the remaining container must not erase that result.
+        // is spent, and the remaining container must not erase that result. Its floor
+        // cannot beat the incumbent, so it is skipped as proven: the budget refused no
+        // work and the search finished on exactly its budget, not stopped by it.
         let output = pack_json(&open_height_request(5)).expect("budgeted exact-small request");
         let result: serde_json::Value = serde_json::from_str(&output).unwrap();
 
         assert_eq!(result["complete"], true);
         assert_eq!(result["containers"][0]["container_type"], "b-flat");
         assert_eq!(result["algorithm"]["metrics"]["search_nodes_expanded"], 5);
+        assert_eq!(result["algorithm"]["effort_limit_reached"], false);
+        assert_eq!(result["termination"]["code"], "complete");
+
+        // One node short, `b-flat` is cut before its last placement and the stop is reported.
+        let output = pack_json(&open_height_request(4)).expect("budgeted exact-small request");
+        let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["algorithm"]["metrics"]["search_nodes_expanded"], 4);
         assert_eq!(result["algorithm"]["effort_limit_reached"], true);
+        assert_eq!(result["termination"]["code"], "effort_limit");
     }
 
     #[test]

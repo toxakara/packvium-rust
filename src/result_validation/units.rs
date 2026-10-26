@@ -33,6 +33,51 @@ pub(crate) const WEIGHT: Table = &[
     ("ticks", 1),
 ];
 
+/// Every name the engines read in `units.length`, after stripping ASCII whitespace and lowering
+/// ASCII case, to the [`LENGTH`] key it means.
+const REQUEST_LENGTH_UNITS: &[(&str, &str)] = &[
+    ("mm", "mm"),
+    ("cm", "cm"),
+    ("m", "m"),
+    ("in", "in"),
+    ("inch", "inch"),
+    ("inches", "inches"),
+    ("ft", "ft"),
+    ("tick", "tick"),
+    ("ticks", "ticks"),
+    ("millimeter", "mm"),
+    ("millimeters", "mm"),
+];
+
+/// `units.length` as every engine reads it: `units` or `units.length` absent or null
+/// is millimetres; `units` that is not an object, or a length unit the engines do not know, is
+/// refused naming the field.
+pub(crate) fn length_unit(request: &Json) -> Res<&'static str> {
+    let units = request.get_null("units")?;
+    if units.is_null() {
+        return Ok("mm");
+    }
+    if !matches!(units, Json::Dict(_)) {
+        return Err(MalformedResult::contract(
+            "units must be an object".to_owned(),
+        ));
+    }
+    let key = match units.get_null("length")? {
+        Json::Null => return Ok("mm"),
+        Json::Str(text) => text
+            .trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'))
+            .to_ascii_lowercase(),
+        _ => String::new(),
+    };
+    REQUEST_LENGTH_UNITS
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, unit)| *unit)
+        .ok_or_else(|| {
+            MalformedResult::contract("units.length must be one of mm, cm, m, in, ft".to_owned())
+        })
+}
+
 pub(crate) const TICKS_PER_MM: i128 = 16_000;
 pub(crate) const TICKS_PER_GRAM: i128 = 8_000_000;
 pub(crate) const TICKS_PER_KG: i128 = 8_000_000_000;

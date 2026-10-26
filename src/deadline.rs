@@ -1,4 +1,6 @@
+use crate::model::{PackingRequest, SolverMetrics, effort_exhausted};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use web_time::Instant;
 
 /// Monotonic time source used by [`Deadline`].
@@ -29,11 +31,17 @@ impl Clock for SystemClock {
 }
 
 /// Monotonic search budget with an injectable clock.
+///
+/// It also carries one start's effort-stop latch: a guard that finds the effort budget spent
+/// while work remains refuses that work and records it, so the effort flag says the budget
+/// stopped the search rather than that a counter equals its limit afterwards. Clones
+/// share the latch; [`Deadline::for_start`] gives a start its own.
 #[derive(Clone)]
 pub struct Deadline {
     clock: Arc<dyn Clock>,
     started_ns: u64,
     limit_ns: u64,
+    effort_stop: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Deadline {
@@ -57,7 +65,33 @@ impl Deadline {
             clock,
             started_ns,
             limit_ns: limit_ms.saturating_mul(1_000_000),
+            effort_stop: Arc::default(),
         }
+    }
+
+    /// The same clock and limit with a latch of its own, for one search start: parallel
+    /// starts share the clock but never each other's effort stop.
+    pub(crate) fn for_start(&self) -> Self {
+        Self {
+            effort_stop: Arc::default(),
+            ..self.clone()
+        }
+    }
+
+    /// Whether the effort budget stops the search here, recording that it did. Only a guard
+    /// about to do more counted work asks: asking is refusing that work. O(1); the latch is
+    /// written only when the guard fires, so the per-orientation check costs what it did.
+    pub(crate) fn effort_stops(&self, request: &PackingRequest, metrics: &SolverMetrics) -> bool {
+        if !effort_exhausted(request, metrics) {
+            return false;
+        }
+        self.effort_stop.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Whether a guard found the effort budget spent and stopped this start there.
+    pub(crate) fn effort_stopped(&self) -> bool {
+        self.effort_stop.load(Ordering::Relaxed)
     }
 
     pub fn expired(&self) -> bool {

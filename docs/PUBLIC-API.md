@@ -155,10 +155,16 @@ request field.
   - `termination.code`: `complete`, `time_limit`, `effort_limit`, or `error`;
   - `optimality.code`: `proven_optimal`, `proven_infeasible`, `best_found`, or `not_proven`.
     The 1.1.0 freeze reserved and typed `gap_key`, `absolute_gap` and `relative_gap`
-    alongside it. The pre-1.1.0 extension point remains open: closing the object would
-    make a previously valid producer fail a 1.1.0 validator, which is a breaking change
-    and therefore not legal in this minor release. No engine emits the reserved fields
-    yet, so `code` is still the only key any Packvium result carries;
+    alongside it, and the 1.8.0 freeze added `lower_bound`: the lower bound on
+    `score`, in the result's own score order, through the first position the result misses
+    -- or all of it when none is missed, which proves the result optimal for its objective
+    under the rules this library models. `gap_key` requires `lower_bound`, and absence of
+    `lower_bound` makes no statement at all; it is never "attained". The pre-1.1.0
+    extension point remains open: closing the object would make a previously valid
+    producer fail a validator, which is a breaking change. Every engine emits these fields
+    since, on the primary result and on each alternative, for the `default` and
+    `lowest_cost` objectives; a complete result that attains its bound reports `status:
+    optimal` and `code: proven_optimal`, and nothing else does;
 - legacy `status`: `optimal`, `feasible`, `best_found`, `time_limit`, `infeasible`, or `invalid_result`;
 - packed containers with exact coordinates, dimensions, rotations, and a
   `centre_of_mass_offset_ppm` — the weighted centre of mass's exact-integer Chebyshev
@@ -238,7 +244,10 @@ objective vector.
 
 `algorithm.time_limit_reached` and `algorithm.effort_limit_reached` identify distinct,
 mutually exclusive causes. The former is only a wall-clock deadline. The latter means
-one of the request's counted-work boundaries was reached. An unpacked `time_limit` or
+the selected start was stopped by one of the request's counted-work boundaries: the search
+had more work to do and the budget refused it. A start that finished having used exactly its
+budget was not stopped, and reports neither flag. No counter in `algorithm.metrics` ends
+above its limit: each counted step is checked before it is taken. An unpacked `time_limit` or
 `effort_limit` reason must match the corresponding flag.
 
 ## Loading and unloading sequences
@@ -401,8 +410,9 @@ deadline:
 Each fact is an open object with a required string `code`. Consumers must preserve an
 unknown code and any additional fields, allowing future effort/node/cancellation limits
 without turning a minor release into a parsing break. `status` remains for one
-compatibility cycle and is checked against the three facts. The alpha release emits no
-`proven_optimal` claim without a future proof/certificate.
+compatibility cycle and is checked against the three facts. `proven_optimal` is emitted only
+on a complete result whose score attains its stated `optimality.lower_bound`: a proof that no
+packing obeying the request's rules scores better on the result's own objective.
 
 `status: infeasible`, with `feasibility: infeasible` and `optimality: proven_infeasible`, is
 emitted only when the portfolio ranks no result at all. A request whose every item is proven
@@ -451,6 +461,23 @@ The fields answer separate questions:
 | `all_required_starts_completed` | Every planned start completed; false also covers starts not launched before the global deadline. |
 | `winning_start_truncated` | The selected packing itself came from an interrupted start. |
 | `global_deadline_reached` | The portfolio-wide deadline expired, independently of individual start slices. |
+
+**Under an `effort_budget` the clock is the request's fuse, and fires only as a whole.**
+Without one, Python and PHP give each start an even share of the time left, so one slow start
+cannot starve the rest. With one, every start may use all the time left: a request that
+bounds its work by counting must get the same answer on any machine, and a start cut by its
+own share of the clock would lose quietly, with no flag saying the answer depended on the
+machine's speed. When the clock does fire, the portfolio-wide deadline is reached and
+`time_limit_reached` is true. Rust and the JavaScript fallback always run their starts against
+the one portfolio deadline. Each start keeps its own counters against the whole budget in
+Python, PHP and Rust; the JavaScript fallback hands each later start what the earlier ones
+left of one budget, so the same number buys less search there.
+
+**Read `any_start_truncated` when the answer must not depend on the budget.** The selected
+start can finish while another start, one that might have won, was stopped by the budget; the
+top-level flags then read `complete`, because they describe the selected start.
+`any_start_truncated` is the only field that says a larger budget could change the answer. A
+checkout that caches a quote refuses one on it (ECOMMERCE-CHECKOUT-INTEGRATIONS.md D3).
 
 The aggregate fields are derived only from `starts`. Exactly one record is selected.
 `completed` and `truncated` are mutually exclusive and both require `started`.
@@ -526,9 +553,10 @@ valid. A result without the documented shape is refused as `MalformedResult`, wh
   same as one JSON document for a binding.
 - PyO3 (`packvium_native_rust`): `validate_json(request, result)` over JSON text, a list of
   `{"code", "detail"}` dicts, `MalformedResult` (a `ValueError`) with `kind`.
-- `@packvium/engine`: `validate(request, result)`, `MalformedResult`, and
-  `ValidatorUnavailableError` (`code: 'validator_unavailable'`) when the compiled addon is
-  absent, until the JavaScript fallback's port.
+- `@packvium/engine`: `validate(request, result)` and `MalformedResult`; the compiled addon
+  answers when it is loaded and the package's JavaScript port otherwise (1.8.0).
+  `ValidatorUnavailableError` (`code: 'validator_unavailable'`) is still exported but
+  deprecated: nothing throws it since 1.8.0.
 - `@packvium/browser`: `validate(request, result)`, a promise, `MalformedResult`.
 
 - PHP: `Packvium\Validation\validate(array $request, array $result)`, a `list<ResultIssue>`
@@ -727,3 +755,11 @@ depend on the exact shape.
 Python, PHP, Rust and the JavaScript fallback accept the same top-level keys: `units`,
 `configuration`, `items`, `containers`, `catalog_versions_used`, `policy`, `output` and
 `fixed_placements`.
+
+`units` holds one key, `length`: the unit of every length written without one, millimetres when
+`units`, or `units.length`, is absent or `null`. There is no request-wide weight unit. A weight
+takes its unit from the measure itself (`"2.5 kg"`, `{"value": "2.5", "unit": "kg"}`), and a
+bare number is grams. `units.weight` is not a field: today every engine ignores it without an
+error, so `{"length": "cm", "weight": "kg"}` still reads a bare weight `2` as 2 g. Write the unit
+on each weight instead. A future release that changes the request schema will refuse unknown
+keys in `units`, as it already refuses them in `configuration`.

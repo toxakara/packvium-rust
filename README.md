@@ -11,7 +11,7 @@ coordinates and rotations for each item, with a reason for anything that did not
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.7.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.8.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-rust/blob/main/docs/GUARANTEES.md)
@@ -25,7 +25,7 @@ or, in `Cargo.toml`:
 
 ```toml
 [dependencies]
-packvium = "1.7"
+packvium = "1.8"
 ```
 
 ## Quick start
@@ -167,6 +167,10 @@ as a fuse against a genuine hang. A search stopped by the budget says `effort_li
 an operational artifact built from it records its replay as `not_guaranteed`. `seed` is part
 of the request, so a different seed is a different, equally reproducible request.
 
+`effort_limit` means the budget stopped work the search still had: a search that finishes on
+exactly its budget reads `complete`, and `termination.any_start_truncated` says whether the
+budget cut a start that might have won.
+
 ## What it does
 
 - **Exact arithmetic.** Length is measured in ticks of 1/16000 mm and weight in 1/8 µg.
@@ -182,6 +186,10 @@ of the request, so a different seed is a different, equally reproducible request
   maximal-space and bounded exact search, selected by problem shape and profile.
 - **Answers you can check.** Every solution is re-validated by logic independent of the
   search. Unplaced items come back with a reason code, not silently missing.
+- **A proof, or the distance to one.** Under the `default` and `lowest_cost` objectives every
+  result states `optimality.lower_bound`. A complete result that attains it reports `optimal`,
+  which proves no packing obeying the request's rules scores better; any other carries the gap
+  to the bound (`gap_key`, `absolute_gap`, `relative_gap`).
 - **Multi-container and nested.** A request splits across as many containers as it needs;
   `pack_nested` solves caller-defined levels — cartons, then pallets — in order; a level with no
   items of its own packs the previous level's containers, and the chain stops at the first level
@@ -231,7 +239,7 @@ Documentation, the constraint reference and the benchmarks are at
 | --- | --- | --- |
 | Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
 | PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
-| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.7"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.8"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
 | Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
 | Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
 | PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |
@@ -254,7 +262,7 @@ CodeMeta form.
 @software{packvium_rust,
   author  = {{Packvium contributors}},
   title   = {Packvium for Rust},
-  version = {1.7.0},
+  version = {1.8.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

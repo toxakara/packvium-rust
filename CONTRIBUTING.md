@@ -70,3 +70,24 @@ exact input.
 
 For anything with security implications, follow [SECURITY.md](SECURITY.md) rather than
 opening a public issue.
+
+## How your feedback is handled
+
+Every issue and discussion is read by a maintainer. This is what happens next:
+
+1. **New issues are labelled `needs-triage`.** A maintainer answers with one of: a question
+   back to you, a confirmation, or a reason it will not be taken on.
+2. **A confirmed bug** gets the `bug` label and is reproduced from your request. A wrong result
+   in one package is checked against the others, because all of them implement the same
+   contract and must agree.
+3. **An accepted feature request or idea** is added to the project's backlog, and the issue is
+   labelled `accepted` with a comment saying so. An idea from Discussions is first turned into
+   an issue and linked back to the discussion.
+4. **When the change ships**, the issue is closed with the release it shipped in. A change to
+   the request or result format can only ship in a release that is allowed to change it, so
+   it may take more than one release.
+5. **Declined** requests are closed with the reason, so you are never left waiting on a
+   silent issue.
+
+Questions go to **Discussions → Q&A**; security problems go to **Report a vulnerability**
+under the Security tab, never to a public issue.

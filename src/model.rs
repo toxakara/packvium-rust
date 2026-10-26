@@ -1172,6 +1172,68 @@ pub fn axle_reactions(
     Some((denominator, front_numerator, rear_numerator))
 }
 
+#[derive(Clone, Copy)]
+pub struct AxleBase {
+    total_weight: i128,
+    doubled_weighted_x: i128,
+    front_pos: i128,
+    rear_pos: i128,
+    front_max: Option<i128>,
+    rear_max: Option<i128>,
+}
+
+impl AxleBase {
+    pub fn new(container: &Container, placements: &[Placement]) -> Option<Self> {
+        let [front, rear] = container.axles?;
+        let mut total_weight = container.tare_weight.0 as i128;
+        let mut doubled_weighted_x = (container.tare_weight.0 as i128)
+            .saturating_mul(container.inner_dimensions.length.0 as i128);
+        for placement in placements {
+            let weight = placement.instance.item.weight.0 as i128;
+            total_weight = total_weight.saturating_add(weight);
+            let centre = 2_i128
+                .saturating_mul(placement.position.x as i128)
+                .saturating_add(placement.dimensions.length.0 as i128);
+            doubled_weighted_x = doubled_weighted_x.saturating_add(weight.saturating_mul(centre));
+        }
+        let denominator = 2_i128.saturating_mul((rear.position.0 - front.position.0) as i128);
+        Some(Self {
+            total_weight,
+            doubled_weighted_x,
+            front_pos: front.position.0 as i128,
+            rear_pos: rear.position.0 as i128,
+            front_max: front
+                .max_load
+                .map(|limit| (limit.0 as i128).saturating_mul(denominator)),
+            rear_max: rear
+                .max_load
+                .map(|limit| (limit.0 as i128).saturating_mul(denominator)),
+        })
+    }
+
+    pub fn overloaded(&self, weight: Weight, box_: Aabb) -> bool {
+        let weight = weight.0 as i128;
+        let total_weight = self.total_weight.saturating_add(weight);
+        let centre = 2_i128
+            .saturating_mul(box_.origin.x as i128)
+            .saturating_add(box_.dimensions.length.0 as i128);
+        let doubled_weighted_x = self
+            .doubled_weighted_x
+            .saturating_add(weight.saturating_mul(centre));
+        let front_numerator = 2_i128
+            .saturating_mul(total_weight)
+            .saturating_mul(self.rear_pos)
+            .saturating_sub(doubled_weighted_x);
+        let rear_numerator = doubled_weighted_x.saturating_sub(
+            2_i128
+                .saturating_mul(total_weight)
+                .saturating_mul(self.front_pos),
+        );
+        self.front_max.is_some_and(|limit| front_numerator > limit)
+            || self.rear_max.is_some_and(|limit| rear_numerator > limit)
+    }
+}
+
 pub fn axle_overloaded(
     container: &Container,
     placements: &[Placement],
@@ -1550,6 +1612,34 @@ pub fn effort_exhausted(request: &PackingRequest, metrics: &SolverMetrics) -> bo
         .effort_budget
         .map(|budget| budget.exceeded(metrics))
         .unwrap_or(false)
+}
+
+/// How many more placements, each one counted placement attempt and one feasible candidate,
+/// the effort budget has room for: what a solver that counts a run of placements at once
+/// may add without either counter passing its limit. O(1).
+pub(crate) fn placement_room(request: &PackingRequest, metrics: &SolverMetrics) -> u64 {
+    let Some(budget) = request.config.effort_budget else {
+        return u64::MAX;
+    };
+    headroom(
+        budget.max_placement_attempts,
+        metrics.orientations_considered,
+    )
+    .min(headroom(
+        budget.max_candidates_evaluated,
+        metrics.feasible_candidates,
+    ))
+}
+
+/// How many more search nodes the effort budget has room for. O(1).
+pub(crate) fn node_room(request: &PackingRequest, metrics: &SolverMetrics) -> u64 {
+    request.config.effort_budget.map_or(u64::MAX, |budget| {
+        headroom(budget.max_search_nodes, metrics.search_nodes_expanded)
+    })
+}
+
+fn headroom(limit: Option<u64>, used: u64) -> u64 {
+    limit.map_or(u64::MAX, |limit| limit.saturating_sub(used))
 }
 
 #[derive(Clone, Debug, Default)]

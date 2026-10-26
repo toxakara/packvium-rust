@@ -138,6 +138,7 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
         return None;
     }
 
+    let deadline = &deadline.for_start();
     let started = deadline.now_ns();
     let item = &request.items[0];
     let mut remaining = item.quantity;
@@ -224,7 +225,7 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
         })
         .collect();
 
-    while remaining > 0 && !deadline.expired() && !effort_exhausted(request, &metrics) {
+    while remaining > 0 && !deadline.expired() {
         // Rank by what the objective rewards, not by raw capacity. Leading
         // with capacity reads as "the biggest box wins" -- it minimises container count
         // and then stops caring, so under `lowest_cost` a box holding one more item beat
@@ -247,6 +248,11 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
         else {
             break;
         };
+        // Asked once a container is there to fill: running out of containers is the search
+        // ending, not the budget stopping it.
+        if deadline.effort_stops(request, &metrics) {
+            break;
+        }
         let (container, rotation, physical, envelope, nx, ny, nz, capacity) = (
             *container, *rotation, *physical, *envelope, *nx, *ny, *nz, *capacity,
         );
@@ -255,7 +261,15 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
             sequence += 1;
             let clearance = request.config.clearance.0;
             let total = capacity.min(remaining);
-            if total > 0 && !request.config.require_placement_coordinates && nesting == 0 {
+            // The fast path counts the whole lattice in one step, so it is taken only when the
+            // budget has room for all of it; otherwise the per-item loop below lays the same
+            // lattice one counted item at a time and stops on the limit, never past it.
+            if total > 0
+                && !request.config.require_placement_coordinates
+                && nesting == 0
+                && placement_room(request, &metrics) >= total as u64
+                && node_room(request, &metrics) >= 1
+            {
                 // Quantity-compression fast path: the lattice parameters
                 // above already fully determine every coordinate in `O(r)`; skip the
                 // `O(n)` loop that would otherwise build one `Placement` per instance
@@ -315,7 +329,7 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
                         if placed >= capacity
                             || remaining == 0
                             || deadline.expired()
-                            || effort_exhausted(request, &metrics)
+                            || deadline.effort_stops(request, &metrics)
                         {
                             break 'outer;
                         }
@@ -379,7 +393,7 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
     }
 
     let timed_out = deadline.expired();
-    let effort_limited = effort_exhausted(request, &metrics);
+    let effort_limited = deadline.effort_stopped();
     let unpacked = (0..remaining)
         .map(|offset| {
             let instance = ItemInstance {

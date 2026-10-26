@@ -3,7 +3,7 @@
   "@type": "SoftwareSourceCode",
   "name": "Packvium for Rust",
   "description": "Deterministic 3D bin-packing and cartonization engine for pallets, containers, trucks and shipping cartons. Exact integer geometry, reproducible results.",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "license": "https://spdx.org/licenses/MIT",
   "author": [
     {
@@ -26,6 +26,8 @@
     "truck-loading",
     "packing-algorithm",
     "logistics",
-    "deterministic"
+    "deterministic",
+    "box-packing",
+    "load-planning"
   ]
 }

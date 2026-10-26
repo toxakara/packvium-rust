@@ -13,6 +13,7 @@
 //! value too large to compute exactly in `i128`. Both are [`MalformedResult`]s.
 
 mod accounting;
+mod bound;
 mod container;
 mod facts;
 mod geometry;
@@ -32,7 +33,7 @@ use std::fmt;
 use serde::Serialize;
 
 use json::{Json, Ordered, Res};
-use units::{LENGTH, ratio_of, to_ticks};
+use units::{LENGTH, length_unit, ratio_of, to_ticks};
 
 /// One way a result fails to be a sound answer to its request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -188,24 +189,28 @@ fn validate(request: &Json, result: &Json) -> Res<Vec<Issue>> {
         }
     }
     let empty = Json::Dict(Vec::new());
-    let unit = request
-        .get_or("units", &empty)?
-        .get_or("length", &Json::str_of("mm"))?
-        .text("units.length")?
-        .to_owned();
+    let unit = length_unit(request)?;
     let configuration = request.get_or("configuration", &empty)?;
+    let coordinates_required =
+        configuration.flag("require_placement_coordinates", true, "configuration")?;
     let clearance = to_ticks(
         configuration.get_or("clearance", &Json::Int(0))?,
-        &unit,
+        unit,
         LENGTH,
     )?;
     let global_support = ratio_of(configuration.get_or("minimum_support_ratio", &Json::Int(0))?)?;
-    let items = spec::parse_items(request, &unit)?;
-    let containers = spec::parse_containers(request, &unit)?;
+    let items = spec::parse_items(request, unit)?;
+    let containers = spec::parse_containers(request, unit)?;
 
     let mut issues = Vec::new();
-    let validated =
-        lattice::materialize(request, result, &items, &containers, clearance, &mut issues)?;
+    let validated = lattice::materialize(
+        coordinates_required,
+        result,
+        &items,
+        &containers,
+        clearance,
+        &mut issues,
+    )?;
     accounting::check_structure(&validated, &mut issues)?;
     facts::check_algorithm_metrics(&validated, &mut issues)?;
     facts::check_effort_budget(request, &validated, &mut issues)?;
@@ -231,7 +236,7 @@ fn validate(request: &Json, result: &Json) -> Res<Vec<Issue>> {
     )?;
     check_container_counts(&validated, configuration, &containers, &mut issues)?;
 
-    objective::check_fixed_placements(request, &validated, &unit, &mut issues)?;
+    objective::check_fixed_placements(request, &validated, unit, &mut issues)?;
     objective::check_groups(request, &validated, &mut issues)?;
     objective::check_solver_selection(request, &validated, &mut issues)?;
     let inputs = objective::Inputs {
@@ -240,7 +245,15 @@ fn validate(request: &Json, result: &Json) -> Res<Vec<Issue>> {
         fabricated: &fabricated,
         clearance,
     };
-    objective::check_objective(request, &validated, &inputs, &mut issues)?;
+    let score = objective::check_objective(request, &validated, &inputs, &mut issues)?;
+    bound::check_optimality_bound(
+        request,
+        &validated,
+        &items,
+        &containers,
+        &score,
+        &mut issues,
+    )?;
     Ok(issues)
 }
 

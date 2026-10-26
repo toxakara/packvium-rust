@@ -241,12 +241,13 @@ fn objective(
     })
 }
 
+/// Checks the reported score against the recomputed one, and returns the reported score.
 pub(crate) fn check_objective(
     request: &Json,
     result: &Json,
     inputs: &Inputs<'_>,
     issues: &mut Vec<Issue>,
-) -> Res<()> {
+) -> Res<Vec<i128>> {
     let empty = Json::Dict(Vec::new());
     let configuration = request.get_or("configuration", &empty)?;
     let default_objective = Json::str_of("default");
@@ -288,7 +289,7 @@ pub(crate) fn check_objective(
             ),
         ));
     }
-    Ok(())
+    Ok(reported)
 }
 
 pub(crate) fn check_solver_selection(

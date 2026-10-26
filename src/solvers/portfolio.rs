@@ -94,13 +94,18 @@ pub(crate) fn solve_portfolio_with_deadline(
     {
         return Ok(finalize_single_start(grid.clone(), deadline.expired()));
     }
-    if enabled("exact_small")
+    let exact_preflight = if enabled("exact_small")
         && request.config.profile == SolverProfile::ExactSmall
         && instances.len() <= request.config.exact_item_limit
-        && let Some(result) = pack_exact_one(request, &instances, constraints, scorers, deadline)
+    {
+        pack_exact_one(request, &instances, constraints, scorers, deadline)
+    } else {
+        None
+    };
+    if let Some(result) = exact_preflight.as_ref()
         && result.complete()
     {
-        return Ok(finalize_single_start(result, deadline.expired()));
+        return Ok(finalize_single_start(result.clone(), deadline.expired()));
     }
 
     let target = match request.config.profile {
@@ -280,7 +285,12 @@ pub(crate) fn solve_portfolio_with_deadline(
         && !deadline.expired()
         && results.len() < restart_limit
     {
-        if let Some(result) = pack_exact_one(request, &instances, constraints, scorers, deadline) {
+        let exact_result = if let Some(preflight) = exact_preflight {
+            Some(preflight)
+        } else {
+            pack_exact_one(request, &instances, constraints, scorers, deadline)
+        };
+        if let Some(result) = exact_result {
             results.push(result);
         } else if explicit_selection
             && request.config.solvers.len() == 1

@@ -1,0 +1,33 @@
+title: "[Show and tell] "
+labels: ["show-and-tell"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Using the library in a shop, a warehouse tool or a load planner? Tell us how. Leave out
+        anything confidential about your business.
+  - type: textarea
+    id: what
+    attributes:
+      label: What you built
+    validations:
+      required: true
+  - type: input
+    id: package-version
+    attributes:
+      label: Package and version
+      placeholder: "packvium 1.8.0 (Rust)"
+    validations:
+      required: false
+  - type: textarea
+    id: lessons
+    attributes:
+      label: What worked, and what got in the way
+    validations:
+      required: false
+  - type: input
+    id: link
+    attributes:
+      label: Link (optional)
+    validations:
+      required: false

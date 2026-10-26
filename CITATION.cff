@@ -5,7 +5,7 @@ type: software
 authors:
   - name: "Packvium contributors"
     website: "https://packvium.com"
-version: "1.7.0"
+version: "1.8.0"
 license: MIT
 url: "https://packvium.com"
 repository-code: "https://github.com/toxakara/packvium-rust"
@@ -23,3 +23,5 @@ keywords:
   - packing-algorithm
   - logistics
   - deterministic
+  - box-packing
+  - load-planning

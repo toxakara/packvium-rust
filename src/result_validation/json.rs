@@ -175,6 +175,19 @@ impl Json {
         }
     }
 
+    /// A field the request schema types boolean: absent or null is its default, and any other
+    /// non-boolean is refused, as every engine refuses it, rather than read by
+    /// truthiness.
+    pub(crate) fn flag(&self, key: &str, default: bool, owner: &str) -> Res<bool> {
+        match self.get_null(key)? {
+            Json::Null => Ok(default),
+            Json::Bool(flag) => Ok(*flag),
+            _ => Err(MalformedResult::contract(format!(
+                "{owner}.{key} must be a boolean"
+            ))),
+        }
+    }
+
     /// Python truthiness.
     pub(crate) fn truthy(&self) -> bool {
         match self {

@@ -1,0 +1,105 @@
+name: Bug report
+description: A result that is wrong, an error you did not expect, or a crash.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. A report we can run is a report we can fix, so the most useful
+        thing below is the smallest request that shows the problem.
+
+        **Security problems do not belong here.** Use **Report a vulnerability** under the
+        Security tab instead; it opens a private advisory.
+  - type: dropdown
+    id: package
+    attributes:
+      label: Package
+      description: Which package did you call?
+      options:
+        - "packvium (PyPI) — Packvium for Python"
+        - "packvium-native (PyPI) — Packvium native backend selector for Python"
+        - "packvium/packvium (Packagist) — Packvium for PHP"
+        - "packvium/native-bridge (Packagist) — Packvium native bridge for PHP"
+        - "@packvium/engine (npm) — Packvium for Node.js"
+        - "@packvium/browser (npm) — Packvium for browsers"
+        - "packvium (crates.io) — Packvium for Rust"
+        - "packvium-native-rust (PyPI) — Packvium native engines: Python wheels, Node addons and the C library"
+        - Not sure
+      default: 6
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      description: The exact version installed, for example 1.8.0.
+      placeholder: "1.8.0"
+    validations:
+      required: true
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime and operating system
+      description: Language runtime version and OS, for example "Python 3.12, Ubuntu 24.04" or "PHP 8.3, macOS 15".
+    validations:
+      required: true
+  - type: dropdown
+    id: profile
+    attributes:
+      label: Search profile
+      options:
+        - fast
+        - balanced
+        - quality
+        - exact_small
+        - Not set / default
+        - Not sure
+    validations:
+      required: false
+  - type: textarea
+    id: request
+    attributes:
+      label: Request that reproduces it
+      description: |
+        The JSON request, or the code that builds it, cut down as far as it still shows the
+        problem. Remove anything confidential; renamed item ids are fine.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: The result (or its relevant part), or the full error message and stack trace.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What the result should have been, and why. If another of the packages gives a different answer for the same request, say which.
+    validations:
+      required: true
+  - type: dropdown
+    id: stopped-by
+    attributes:
+      label: How was the search limited?
+      description: A search stopped by a time limit can differ between runs by design; one stopped by an effort budget cannot.
+      options:
+        - effort_budget
+        - time_limit_ms
+        - Both
+        - Neither / not sure
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues and did not find this one.
+          required: true
+        - label: I read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-rust/blob/HEAD/docs/GUARANTEES.md) and this is not something it says the library does not guarantee.
+          required: false

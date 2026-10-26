@@ -478,7 +478,7 @@ pub fn find_candidates_at_points(
     if points.is_empty() {
         return Vec::new();
     }
-    if deadline.expired() || effort_exhausted(request, metrics) {
+    if deadline.expired() || deadline.effort_stops(request, metrics) {
         return Vec::new();
     }
     let boundary = Aabb {
@@ -574,15 +574,18 @@ pub fn find_candidates_at_points(
         )
     });
     let flat_bag = state.packed.container.is_flat_bag();
+    let axle_base = AxleBase::new(&state.packed.container, &state.packed.placements);
     let mut candidates = CandidateAccumulator::new(limit);
     for (point_index, point) in points.into_iter().enumerate() {
-        if point_index > 0 && (deadline.expired() || effort_exhausted(request, metrics)) {
+        if point_index > 0 && (deadline.expired() || deadline.effort_stops(request, metrics)) {
             break;
         }
         metrics.candidate_points_considered = metrics.candidate_points_considered.saturating_add(1);
         for (rotation, physical, envelope, shape) in &rotations {
             let (rotation, physical, envelope) = (*rotation, *physical, *envelope);
-            if effort_exhausted(request, metrics) {
+            // Checked before each counted rotation, so neither `orientations_considered` nor
+            // `feasible_candidates` (at most one per rotation) passes its limit.
+            if deadline.effort_stops(request, metrics) {
                 break;
             }
             metrics.orientations_considered = metrics.orientations_considered.saturating_add(1);
@@ -670,11 +673,10 @@ pub fn find_candidates_at_points(
             if maximum_items_reached {
                 continue;
             }
-            if axle_overloaded(
-                &state.packed.container,
-                &state.packed.placements,
-                Some((item.item.weight, envelope_box)),
-            ) {
+            if axle_base
+                .as_ref()
+                .is_some_and(|base| base.overloaded(item.item.weight, envelope_box))
+            {
                 continue;
             }
             if item.item.must_be_on_floor && point.z != 0 {
@@ -689,6 +691,7 @@ pub fn find_candidates_at_points(
                 .map(|placement| placement_support_view(&state.packed.placements, placement));
             let (support_area, support_ratio) = match nested_support.as_ref() {
                 Some(support) => (support.area, support.ratio),
+                None if point.z == 0 => (envelope.base_area(), 1.0),
                 None => {
                     let area = supporting_area(state, envelope_box);
                     (area, support_ratio_of(area, envelope_box))
@@ -798,6 +801,7 @@ pub fn pack_order(
     solver_name: &str,
     deadline: &Deadline,
 ) -> PackingResult {
+    let deadline = &deadline.for_start();
     let started = deadline.now_ns();
     let mut metrics = SolverMetrics::default();
     let opened = open_fixed_containers(
@@ -844,7 +848,6 @@ pub fn pack_order(
                 .map(|maximum| packed.len() < maximum)
                 .unwrap_or(true)
             && !deadline.expired()
-            && !effort_exhausted(request, &metrics)
         {
             // Evaluate every eligible container type against the same
             // `remaining` items and commit to whichever placed the most, rather than
@@ -854,8 +857,13 @@ pub fn pack_order(
             // bound Python's `_across_containers`/PHP's `acrossContainers` already
             // implement (docs/ALGORITHMS-AND-COMPLEXITY.md) -- this was a Rust-specific
             // gap, not a new cost class.
+            // A round with no container to try is the search ending, not the budget stopping it.
+            let eligible = eligible_containers(request, &remaining, &inventory);
+            if eligible.is_empty() || deadline.effort_stops(request, &metrics) {
+                break;
+            }
             let mut best: Option<ContainerTrial> = None;
-            for container in eligible_containers(request, &remaining, &inventory) {
+            for container in eligible {
                 if deadline.expired() {
                     break;
                 }
@@ -914,7 +922,7 @@ pub fn pack_order(
     }
 
     let timed_out = deadline.expired();
-    let effort_limited = effort_exhausted(request, &metrics);
+    let effort_limited = deadline.effort_stopped();
     let unpacked = remaining
         .into_iter()
         .map(|instance| {
@@ -1011,6 +1019,11 @@ where
     let mut last = None;
     let mut trials = 0;
     for rung in rungs {
+        // Polled before every rung after the first, so the last rung finishing on its
+        // budget is not a stop: no rung was refused.
+        if trials > 0 && (deadline.expired() || deadline.effort_stops(request, metrics)) {
+            break;
+        }
         let (state, next) = fill(container.with_envelope(rung), sequence, remaining, metrics);
         trials += 1;
         if state.packed.placements.is_empty() {
@@ -1028,9 +1041,6 @@ where
                     ordering_key: key,
                 });
             }
-        }
-        if deadline.expired() || effort_exhausted(request, metrics) {
-            break;
         }
     }
     match best {
@@ -1100,7 +1110,13 @@ where
     for fixed in &request.fixed_containers {
         let mut seeded = fixed.container.clone();
         seeded.preloaded = fixed.placements.clone();
-        let (state, remaining) = if deadline.expired() || effort_exhausted(request, metrics) {
+        // With nothing left to place a fill is no counted work, so the budget refuses none.
+        let stops = if opened.remaining.is_empty() {
+            effort_exhausted(request, metrics)
+        } else {
+            deadline.effort_stops(request, metrics)
+        };
+        let (state, remaining) = if deadline.expired() || stops {
             (
                 ContainerState::new(seeded, fixed.sequence),
                 opened.remaining.clone(),
@@ -1233,7 +1249,7 @@ fn pack_container_plans(
                 if plan_nodes >= request.config.container_plan_node_limit {
                     break;
                 }
-                if deadline.expired() || effort_exhausted(request, metrics) {
+                if deadline.expired() || deadline.effort_stops(request, metrics) {
                     exhausted = true;
                     break;
                 }
@@ -1378,7 +1394,16 @@ fn commit_placement(state: &mut ContainerState, placement: Placement) {
     for point in exposed_points(state, envelope_box) {
         absorb_point(state, point);
     }
-    if let Some(loads) = calculate_top_loads(&state.packed.placements) {
+    let isolated_on_floor = envelope_box.origin.z == 0
+        && state.packed.placements[placement_index]
+            .instance
+            .item
+            .nesting_height
+            .is_none()
+        && !state.packed.placements[..placement_index]
+            .iter()
+            .any(|existing| existing.envelope_origin.z == envelope_box.z2());
+    if !isolated_on_floor && let Some(loads) = calculate_top_loads(&state.packed.placements) {
         for (placement, load) in state.packed.placements.iter_mut().zip(loads) {
             placement.top_load = Weight(load.clamp(0, i64::MAX as i128) as i64);
         }
@@ -1992,11 +2017,38 @@ impl CandidateScene<'_> {
     /// `upper`'s share of `downward` onto `lower`: proportional by contact area, with
     /// the last supporter taking the rounding remainder, exactly as the settled loads.
     fn share(&self, upper: usize, lower: usize, downward: i128) -> i128 {
-        let supporters = self.supporters(upper);
-        let total_area = supporters.iter().map(|edge| edge.area).sum::<i128>();
+        if upper == self.candidate_index() {
+            let supporters = self.below;
+            let total_area = supporters.iter().map(|edge| edge.area).sum::<i128>();
+            let mut distributed = 0_i128;
+            for (position, edge) in supporters.iter().enumerate() {
+                let share = if position + 1 == supporters.len() {
+                    downward.saturating_sub(distributed)
+                } else {
+                    downward.saturating_mul(edge.area) / total_area
+                };
+                if edge.index == lower {
+                    return share;
+                }
+                distributed = distributed.saturating_add(share);
+            }
+            return 0;
+        }
+        let base_supporters = self.sweep.graph.supporters(upper);
+        let extra = self
+            .above
+            .iter()
+            .find(|edge| edge.index == upper)
+            .map(|edge| ContactEdge {
+                index: self.candidate_index(),
+                area: edge.area,
+            });
+        let total_len = base_supporters.len() + usize::from(extra.is_some());
+        let total_area = base_supporters.iter().map(|edge| edge.area).sum::<i128>()
+            + extra.map_or(0, |edge| edge.area);
         let mut distributed = 0_i128;
-        for (position, edge) in supporters.iter().enumerate() {
-            let share = if position + 1 == supporters.len() {
+        for (position, edge) in base_supporters.iter().chain(extra.as_ref()).enumerate() {
+            let share = if position + 1 == total_len {
                 downward.saturating_sub(distributed)
             } else {
                 downward.saturating_mul(edge.area) / total_area
@@ -2631,7 +2683,12 @@ fn try_pack_into_greedy(
     let mut groups = group_member_indices(current);
 
     for cursor in 0..current.len() {
-        if effort_exhausted(request, metrics) {
+        // A member placed with its group is no work left, so it is skipped before the
+        // budget is asked: only an unplaced item can be refused.
+        if processed[cursor] {
+            continue;
+        }
+        if deadline.effort_stops(request, metrics) {
             next.extend(
                 current
                     .iter()
@@ -2640,9 +2697,6 @@ fn try_pack_into_greedy(
                     .map(|(_, item)| item.clone()),
             );
             break;
-        }
-        if processed[cursor] {
-            continue;
         }
         metrics.search_nodes_expanded = metrics.search_nodes_expanded.saturating_add(1);
         let batch_indices = if let Some(group) = current[cursor].item.group.as_deref() {
@@ -3039,7 +3093,7 @@ fn try_pack_into_beam(
         for node in &beam {
             if nodes >= request.config.container_plan_node_limit
                 || deadline.expired()
-                || effort_exhausted(request, metrics)
+                || deadline.effort_stops(request, metrics)
             {
                 exhausted = true;
                 break;

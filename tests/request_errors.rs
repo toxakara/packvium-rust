@@ -557,3 +557,32 @@ fn billing_units_and_a_negative_board_price_are_refused_as_the_reference_refuses
         );
     }
 }
+
+/// `"no"` used to be read as the field's default, so a typo packed as `stackable`.
+#[test]
+fn a_schema_boolean_refuses_anything_but_a_boolean() {
+    for (field, pointer) in [
+        ("keep_upright", "/items/0/keep_upright"),
+        ("stackable", "/items/0/stackable"),
+        ("must_be_on_floor", "/items/0/must_be_on_floor"),
+    ] {
+        for value in [json!("no"), json!(0), json!(1), json!([])] {
+            let mut request = base();
+            request["items"][0][field] = value;
+            let error = refused(&request);
+            assert_eq!(
+                (error.reason(), error.field(), error.detail()),
+                ("wrong_type", pointer, "must be a boolean")
+            );
+        }
+        let mut request = base();
+        request["items"][0][field] = Value::Null;
+        pack_json(&request.to_string()).expect("null is the default");
+    }
+    let mut request = base();
+    request["configuration"]["require_placement_coordinates"] = json!("false");
+    assert_eq!(
+        refused(&request).field(),
+        "/configuration/require_placement_coordinates"
+    );
+}

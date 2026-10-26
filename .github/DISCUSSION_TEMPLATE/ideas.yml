@@ -1,0 +1,28 @@
+title: "[Idea] "
+labels: ["idea"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas for new packing rules, outputs or integrations. An idea the maintainers take on
+        is moved to an issue and linked back here, so you can follow it.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem behind the idea
+      description: What real shipment or load does today's library not handle?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+    validations:
+      required: true
+  - type: input
+    id: package
+    attributes:
+      label: Package(s) you use
+      placeholder: "packvium"
+    validations:
+      required: false
