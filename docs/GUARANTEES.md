@@ -14,8 +14,11 @@ After a result reports `feasible` or `optimal` and passes independent validation
 - **exact arithmetic** — all geometry is integer, in units of 1/16000 mm for length and
   1/8 µg for weight. No coordinate is ever a binary floating-point number, so no
   placement decision depends on rounding;
-- **determinism** — identical input and identical seed produce an identical result, on
-  any platform, when the search completes or stops on `configuration.effort_budget`. A
+- **determinism** — for a fixed backend and version, identical input and seed produce
+  identical packing and deterministic diagnostics on supported platforms when the search
+  completes or stops on `configuration.effort_budget`. Wall-clock timing diagnostics,
+  such as `duration_ms` and `elapsed_ms`, are excluded. This does not promise identical
+  solutions between backends; their documented native quality differences remain. A
   search stopped by `time_limit_ms` stops where the host's speed let it, so it may differ
   between runs; the result says which limit stopped it;
 - **complete accounting** — every requested item instance appears exactly once, either
@@ -24,9 +27,15 @@ After a result reports `feasible` or `optimal` and passes independent validation
 ## It does not guarantee
 
 - **A globally optimal packing.** The `fast`, `balanced` and `quality` profiles are
-  heuristic. Only `exact_small`, within its item limit, searches exhaustively — and even
-  then optimality is not certified in the result. A returned solution is a good solution,
-  not a proven best one.
+  heuristic, and `exact_small` searches exhaustively only within its item limit. A returned
+  solution is a good solution, not a proven best one, unless the result proves it: under the
+  `default` and `lowest_cost` objectives a result states `optimality.lower_bound`, and a
+  complete result whose score attains that bound reports `optimal` / `proven_optimal`. That
+  proves no packing obeying the request's rules scores better on that objective; it says
+  nothing about a rule the request cannot express. Any other stated result carries the gap
+  to the bound, an upper limit on what a longer search could still gain. The statement is
+  withheld if its gap exceeds the portable integer ceiling of `2^53 - 1`, even when the
+  request's bound fits. Where geometry makes a request hard, expect a gap.
 - **Physical safety in transit.** Nothing here models vibration, shock, acceleration,
   tipping, strapping or load shifting. A geometrically valid packing can still be an
   unsafe shipment.
@@ -52,7 +61,7 @@ silently — if you need them, they belong in your own layer above this library.
 
 ## Status of this release
 
-Version `1.7.0` freezes the public API. Field names, status codes, the objective
+Version `1.8.0` freezes the public API. Field names, status codes, the objective
 vector, the numeric policy and the validation rules do not change without a major
 version, so any `1.x` is a safe upgrade from any earlier `1.x`. A caret or tilde
 constraint on `1.0` is enough; an exact pin is no longer required.

@@ -1,6 +1,6 @@
 [package]
 name = "packvium"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -10,7 +10,7 @@ repository = "https://github.com/toxakara/packvium-rust"
 homepage = "https://packvium.com"
 documentation = "https://packvium.com/docs"
 keywords = ["3d-bin-packing", "bin-packing", "3d-packing", "cartonization", "container-loading"]
-categories = ["algorithms", "mathematics", "data-structures"]
+categories = ["algorithms", "mathematics", "science"]
 authors = ["Packvium contributors"]
 
 # The published package name is `packvium`, matching the Python and PHP packages.

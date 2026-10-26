@@ -1,3 +1,4 @@
+use crate::bounds;
 use crate::canonical_json::json_integer;
 use crate::error::{PackError, PackResult, RequestError};
 use crate::fixed;
@@ -411,6 +412,10 @@ pub fn pack_request_with_policy(
     policy: &PolicyRuleSet,
 ) -> PackResult<PackingResult> {
     validate_request(request)?;
+    // Once per pack, from the request alone and before the first solver runs, so computing
+    // the bound never depends on which solver won or how much of the deadline was left
+    // (OPTIMALITY-GAP.md F3).
+    let objective_bound = bounds::for_request(request);
     // Registering the constraint is what makes an illegal candidate be rejected *during*
     // search rather than filtered out of a chosen answer -- and it is also what makes the
     // uniform-lattice and homogeneous-block fast paths stand down, since both gate on
@@ -473,7 +478,42 @@ pub fn pack_request_with_policy(
         crate::solvers::unpriceable_container(&alternative.containers, &request.config).is_none()
     });
     warn_unsupported_placements(&mut result, request.config.minimum_support_ratio);
+    state_optimality(&mut result, objective_bound.as_deref());
     Ok(result)
+}
+
+/// States the request's bound on a result and, by the same rule, on each alternative
+/// (OPTIMALITY-GAP.md § 1.3).
+///
+/// Attainment is the only route to `optimal`: a complete result whose score meets the bound
+/// on every position is proven, and nothing else is, so a status a registry-provided solver
+/// set without that proof is not carried through. A result the bound does not speak for
+/// (§ 1.5) keeps the fact derived from its status alone. `O(1)` per result.
+fn state_optimality(result: &mut PackingResult, bound: Option<&[i128]>) {
+    for alternative in &mut result.alternatives {
+        state_optimality(alternative, bound);
+    }
+    if result.status == PackingStatus::Optimal {
+        result.status = PackingStatus::Feasible;
+    }
+    if matches!(
+        result.status,
+        PackingStatus::Infeasible | PackingStatus::InvalidResult
+    ) {
+        return;
+    }
+    let Some(statement) = bound.and_then(|bound| bounds::statement(&result.score, bound)) else {
+        return;
+    };
+    let complete = result.complete();
+    if complete && statement.attained() {
+        result.status = PackingStatus::Optimal;
+    }
+    let code = derive_result_facts(result.status, complete, false).2.code;
+    result.optimality = Some(ResultFact {
+        code,
+        attributes: statement.attributes(),
+    });
 }
 
 /// Appends the warning to a result and, by the same rule, to each alternative.

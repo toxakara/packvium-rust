@@ -1,0 +1,30 @@
+title: "[Q&A] "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ask anything about using the library. If you have found a wrong result or an error,
+        a bug report is the better place.
+  - type: input
+    id: package-version
+    attributes:
+      label: Package and version
+      placeholder: "packvium 1.8.0 (Rust)"
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: What you are trying to pack, and what you tried.
+    validations:
+      required: true
+  - type: textarea
+    id: request
+    attributes:
+      label: Request (optional)
+      description: The JSON request or code, if it helps.
+      render: json
+    validations:
+      required: false

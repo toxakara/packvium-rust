@@ -84,6 +84,8 @@ const CONFIGURATION_FIELDS: [&str; 20] = [
     "time_limit_ms",
 ];
 const SIDES: [&str; 3] = ["length", "width", "height"];
+/// The item fields the request schema types `boolean`, in schema order.
+const ITEM_BOOLEANS: [&str; 3] = ["keep_upright", "stackable", "must_be_on_floor"];
 const AXES: [&str; 3] = ["x", "y", "z"];
 
 /// Refuse the request with its first violation, or return the request's length unit.
@@ -182,6 +184,7 @@ fn check_configuration(raw: Option<&Value>, unit: &str) -> Checked {
     optional(configuration, "clearance", at, |value, field| {
         measure(value, field, MeasureKind::Length, unit)
     })?;
+    optional(configuration, "require_placement_coordinates", at, boolean)?;
     let Some(effort) = present(configuration.get("effort_budget")) else {
         return Ok(());
     };
@@ -245,7 +248,20 @@ fn check_item(raw: &Value, at: &str, unit: &str) -> Checked {
     })?;
     optional(item, "shape_type", at, |value, field| {
         one_of(value, field, &SHAPE_TYPES)
-    })
+    })?;
+    for name in ITEM_BOOLEANS {
+        optional(item, name, at, boolean)?;
+    }
+    Ok(())
+}
+
+/// Only JSON `true`/`false`: reading anything else as its default would pack `"no"` as if
+/// the field were absent. O(1).
+fn boolean(value: &Value, field: &str) -> Checked {
+    if value.is_boolean() {
+        return Ok(());
+    }
+    Err(wrong_type(field, "must be a boolean"))
 }
 
 /// A nested copy sinks by less than its own height, or it would vanish into the one below

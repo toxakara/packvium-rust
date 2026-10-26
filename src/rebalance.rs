@@ -111,6 +111,9 @@ fn attempt_move(
         z: moving.position.z - moving.envelope_origin.z,
     };
 
+    let mut source_placements = source.placements.clone();
+    source_placements.remove(placement_index);
+    let refreshed_source = refreshed_top_loads(source_placements);
     for point in candidate_points(destination) {
         let mut relocated = moving.clone();
         relocated.envelope_origin = point;
@@ -123,17 +126,15 @@ fn attempt_move(
         relocated.top_load = Weight(0);
 
         let mut trial = containers.to_vec();
-        let mut source_placements = source.placements.clone();
-        source_placements.remove(placement_index);
-        trial[source_index].placements = refreshed_top_loads(source_placements);
+        trial[source_index].placements = refreshed_source.clone();
         let mut destination_placements = destination.placements.clone();
         destination_placements.push(relocated);
         trial[destination_index].placements = refreshed_top_loads(destination_placements);
 
         let mut trial_result = original.clone();
-        trial_result.containers = trial.clone();
+        trial_result.containers = trial;
         if IndependentValidator.validate(request, &trial_result).valid {
-            return Some(trial);
+            return Some(trial_result.containers);
         }
     }
     None

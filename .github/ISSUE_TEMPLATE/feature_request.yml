@@ -1,0 +1,62 @@
+name: Feature request
+description: A packing rule, constraint, output or integration the library does not support yet.
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Open-ended ideas are welcome in **Discussions → Ideas** first. Use this form when you can
+        describe a concrete problem the library does not solve today.
+  - type: dropdown
+    id: package
+    attributes:
+      label: Package you use
+      options:
+        - "packvium (PyPI) — Packvium for Python"
+        - "packvium-native (PyPI) — Packvium native backend selector for Python"
+        - "packvium/packvium (Packagist) — Packvium for PHP"
+        - "packvium/native-bridge (Packagist) — Packvium native bridge for PHP"
+        - "@packvium/engine (npm) — Packvium for Node.js"
+        - "@packvium/browser (npm) — Packvium for browsers"
+        - "packvium (crates.io) — Packvium for Rust"
+        - "packvium-native-rust (PyPI) — Packvium native engines: Python wheels, Node addons and the C library"
+        - More than one
+      default: 6
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      placeholder: "1.8.0"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you packing, into what, and what rule or output is missing? A real (anonymised) example helps more than a general description.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: The behaviour or field you have in mind, if you have one.
+    validations:
+      required: false
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do today
+      description: Any workaround you use, and what it costs you.
+    validations:
+      required: false
+  - type: markdown
+    attributes:
+      value: |
+        Every package implements one shared contract, so a new rule or result field lands in all
+        of them together, and a change to the request or result format waits for a release that
+        is allowed to change it. A request that is accepted may therefore take more than one
+        release to ship.

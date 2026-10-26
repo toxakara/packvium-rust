@@ -141,11 +141,18 @@ fn optional<T>(raw: &Json, key: &str, read: impl FnOnce(&Json) -> Res<T>) -> Res
 
 pub(crate) fn parse_items(request: &Json, unit: &str) -> Res<Ordered<ItemSpec>> {
     let mut items = Ordered::default();
-    for raw in request.at("items")?.list("request.items")? {
+    for (index, raw) in request
+        .at("items")?
+        .list("request.items")?
+        .iter()
+        .enumerate()
+    {
+        let owner = format!("items[{index}]");
+        let keep_upright = raw.flag("keep_upright", false, &owner)?;
+        let stackable = raw.flag("stackable", true, &owner)?;
+        let must_be_on_floor = raw.flag("must_be_on_floor", false, &owner)?;
         let rotations = match raw.get_null("allowed_rotations")? {
-            Json::Null if raw.get_null("keep_upright")?.truthy() => {
-                UPRIGHT_ROTATIONS.map(Json::str_of).to_vec()
-            }
+            Json::Null if keep_upright => UPRIGHT_ROTATIONS.map(Json::str_of).to_vec(),
             Json::Null => ROTATIONS
                 .iter()
                 .map(|(code, _)| Json::str_of(code))
@@ -159,8 +166,8 @@ pub(crate) fn parse_items(request: &Json, unit: &str) -> Res<Ordered<ItemSpec>> 
             weight: to_ticks(raw.get_or("weight", &Json::Int(0))?, "g", WEIGHT)?,
             quantity: raw.get_or("quantity", &Json::Int(1))?.clone(),
             allowed_rotations: rotations,
-            stackable: raw.get_or("stackable", &Json::Bool(true))?.truthy(),
-            must_be_on_floor: raw.get_null("must_be_on_floor")?.truthy(),
+            stackable,
+            must_be_on_floor,
             max_top_load: optional(raw, "max_top_load", |value| to_ticks(value, "g", WEIGHT))?,
             minimum_support_ratio: ratio_of(raw.get_or("minimum_support_ratio", &Json::Int(0))?)?,
             tags: tag_set(raw.get_or("tags", &EMPTY_LIST)?, "tags")?,

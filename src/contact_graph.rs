@@ -404,12 +404,26 @@ impl ContactGraph {
     }
 }
 
-fn cells(box_: Aabb, cell: i64) -> BTreeSet<(i64, i64)> {
+fn cells(box_: Aabb, cell: i64) -> impl Iterator<Item = (i64, i64)> {
     let x1 = box_.origin.x.div_euclid(cell);
     let y1 = box_.origin.y.div_euclid(cell);
     let x2 = box_.x2().saturating_sub(1).div_euclid(cell);
     let y2 = box_.y2().saturating_sub(1).div_euclid(cell);
-    BTreeSet::from([(x1, y1), (x2, y1), (x1, y2), (x2, y2)])
+    let mut out = [(x1, y1); 4];
+    let mut len = 1;
+    if x2 != x1 {
+        out[len] = (x2, y1);
+        len += 1;
+    }
+    if y2 != y1 {
+        out[len] = (x1, y2);
+        len += 1;
+        if x2 != x1 {
+            out[len] = (x2, y2);
+            len += 1;
+        }
+    }
+    out.into_iter().take(len)
 }
 
 #[cfg(test)]

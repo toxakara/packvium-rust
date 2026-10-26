@@ -309,14 +309,10 @@ fn validate_fixed_placements(
 
 // `pub(crate)`, not private: `sequence.rs`'s `verify_loading_prefix_business_rules`
 // reuses these exact calculations against every loading prefix, not only
-// the finished scene -- crate-visible so that reuse doesn't need to duplicate the
-// arithmetic, without widening this module's public API surface.
-pub(crate) fn validate_top_loads(container: &PackedContainer, issues: &mut Vec<ValidationIssue>) {
-    let graph = ContactGraph::from_placements(&container.placements);
-    validate_top_loads_with_graph(container, &graph, issues);
-}
-
-fn validate_top_loads_with_graph(
+// the finished scene, with one contact graph per prefix shared by all three checks --
+// crate-visible so that reuse doesn't need to duplicate the arithmetic, without
+// widening this module's public API surface.
+pub(crate) fn validate_top_loads_with_graph(
     container: &PackedContainer,
     graph: &ContactGraph,
     issues: &mut Vec<ValidationIssue>,
@@ -379,12 +375,7 @@ fn validate_top_loads_with_graph(
     }
 }
 
-pub(crate) fn ground_contact_valid(container: &PackedContainer, index: usize) -> bool {
-    let graph = ContactGraph::from_placements(&container.placements);
-    ground_contact_valid_with_graph(container, index, &graph)
-}
-
-fn ground_contact_valid_with_graph(
+pub(crate) fn ground_contact_valid_with_graph(
     container: &PackedContainer,
     index: usize,
     graph: &ContactGraph,
@@ -407,15 +398,7 @@ fn ground_contact_valid_with_graph(
     }
 }
 
-pub(crate) fn validate_stack_counts(
-    container: &PackedContainer,
-    issues: &mut Vec<ValidationIssue>,
-) {
-    let graph = ContactGraph::from_placements(&container.placements);
-    validate_stack_counts_with_graph(container, &graph, issues);
-}
-
-fn validate_stack_counts_with_graph(
+pub(crate) fn validate_stack_counts_with_graph(
     container: &PackedContainer,
     graph: &ContactGraph,
     issues: &mut Vec<ValidationIssue>,
@@ -651,7 +634,8 @@ mod tests {
             Some(Weight(Weight::TICKS_PER_KG * 3 / 4));
         let mut issues = Vec::new();
 
-        validate_top_loads(&packed, &mut issues);
+        let graph = ContactGraph::from_placements(&packed.placements);
+        validate_top_loads_with_graph(&packed, &graph, &mut issues);
 
         assert_eq!(
             issues
@@ -667,7 +651,8 @@ mod tests {
         let packed = nested_container(3, None, Some(1));
         let mut issues = Vec::new();
 
-        validate_stack_counts(&packed, &mut issues);
+        let graph = ContactGraph::from_placements(&packed.placements);
+        validate_stack_counts_with_graph(&packed, &graph, &mut issues);
 
         assert!(
             issues

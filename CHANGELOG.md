@@ -4,6 +4,40 @@ What changed in `packvium` on crates.io, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0]
+
+Results now say how far they can be from the best possible answer, `Optimal` means a proof,
+and a mistyped flag is refused instead of defaulted.
+
+### Added
+
+- **`optimality.lower_bound` and the gap** under the `default` and `lowest_cost` objectives,
+  with `bounds::for_request`, `from_items`, `statement` and `Statement`; `validate_json`
+  checks them.
+
+### Changed
+
+- **Only attaining the bound sets `Optimal`;** a registry solver's `Optimal` is demoted to
+  `Feasible` first.
+- **An effort budget names a stop:** a run that ends on exactly its budget is `complete`.
+- **A non-boolean `keep_upright`, `stackable`, `must_be_on_floor` or
+  `require_placement_coordinates` is `invalid_request` / `wrong_type`**; it was read as the
+  field's default.
+  `validate_json` returns `MalformedResult` (`contract`) for such a request, and reads `null` as
+  the default.
+- **Faster with identical answers:** loading-order checks about 3x, `exact_small` about 2x on
+  larger requests (the preflight answer is reused instead of solved twice), axle-limited solves
+  up to 25%, `rebalance_weight` about 18%.
+
+### Fixed
+
+- **`homogeneous_blocks` named alone packs under `fast` and `balanced`**; it stopped before
+  its first block and placed nothing.
+- **`validate` reads `units: null` and `units.length: null` as millimetres**, as the engines do,
+  and refuses a `units` that is not an object, or an unknown `units.length`, as a `contract`
+  `MalformedResult` naming the field. `units.weight` is not a field and is ignored: put the unit
+  on each weight.
+
 ## [1.7.0]
 
 The reference validator ships in the crate, `quality` looks ahead in its block solver and

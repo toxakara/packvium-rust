@@ -5,6 +5,7 @@ use crate::geometry::{Aabb, Dimensions, Point, Rotation, ShapeType};
 use crate::model::*;
 use crate::solver::PlacementConstraint;
 use crate::units::{Length, Weight};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -34,8 +35,8 @@ struct Block {
     ),
 }
 
-/// Lattice nodes the block start added to `fast` and `balanced` may enumerate per mode --
-/// the bound `quality` gives the same solver through `container_plan_node_limit`.
+/// Lattice nodes the block search may enumerate per mode under every profile but `quality`
+/// -- the bound `quality` gives the same solver through `container_plan_node_limit`.
 const BLOCK_START_NODE_LIMIT: usize = 100_000;
 
 /// Leading blocks the `quality` block lookahead completes in each round.
@@ -60,8 +61,26 @@ pub(crate) fn pack_homogeneous_blocks(
     constraints: &[Arc<dyn PlacementConstraint>],
     deadline: &Deadline,
 ) -> Option<PackingResult> {
-    supports(request, constraints)
-        .then(|| pack_blocks(request, items, &[COUNT_FIRST, VOLUME_FIRST], deadline))
+    supports(request, constraints).then(|| {
+        pack_blocks(
+            &with_block_node_limit(request),
+            items,
+            &[COUNT_FIRST, VOLUME_FIRST],
+            deadline,
+        )
+    })
+}
+
+/// The request the block search runs. Every profile but `quality` leaves
+/// `container_plan_node_limit` at one, which would stop the enumeration before its first
+/// block, so under them the search carries its own bound. O(n) for the copy.
+fn with_block_node_limit(request: &PackingRequest) -> Cow<'_, PackingRequest> {
+    if request.config.profile == SolverProfile::Quality {
+        return Cow::Borrowed(request);
+    }
+    let mut bounded = request.clone();
+    bounded.config.container_plan_node_limit = BLOCK_START_NODE_LIMIT;
+    Cow::Owned(bounded)
 }
 
 /// Whether the lattice can express the whole request as the one block start `fast` and
@@ -83,20 +102,17 @@ pub(crate) fn supports_block_start(
 /// The block start `fast` and `balanced` add to their own; the caller has already
 /// established [`supports_block_start`].
 ///
-/// Those profiles leave `container_plan_node_limit` at one, which would stop the
-/// enumeration before its first block, so the start carries its own bound. `fast` is
-/// latency-bound and enumerates one mode, the one its objective ranks by; `balanced`
-/// enumerates both, as `quality` does. Same O(B*S*T*R*X*Y) time and O(S+n) space as
+/// Those profiles leave `container_plan_node_limit` at one, so the start carries its own
+/// bound ([`with_block_node_limit`]). `fast` is latency-bound and enumerates one mode,
+/// the one its objective ranks by; `balanced` enumerates both, as `quality` does. Same O(B*S*T*R*X*Y) time and O(S+n) space as
 /// [`pack_homogeneous_blocks`], with X*Y capped at `BLOCK_START_NODE_LIMIT` per mode.
 pub(crate) fn pack_block_start(
     request: &PackingRequest,
     items: &[ItemInstance],
     deadline: &Deadline,
 ) -> PackingResult {
-    let mut bounded = request.clone();
-    bounded.config.container_plan_node_limit = BLOCK_START_NODE_LIMIT;
     pack_blocks(
-        &bounded,
+        &with_block_node_limit(request),
         items,
         block_start_modes(&request.config),
         deadline,
@@ -120,6 +136,7 @@ fn pack_blocks(
     modes: &[bool],
     deadline: &Deadline,
 ) -> PackingResult {
+    let deadline = &deadline.for_start();
     let started = deadline.now_ns();
     let mut remaining = items.to_vec();
     let mut packed = Vec::new();
@@ -228,7 +245,7 @@ fn pack_blocks(
         })
         .collect::<Vec<_>>();
     let score = score_solution(&packed, &unpacked, &request.config);
-    let effort_limited = effort_exhausted(request, &metrics);
+    let effort_limited = deadline.effort_stopped();
     PackingResult {
         status: if unpacked.is_empty() {
             PackingStatus::Feasible
@@ -470,7 +487,8 @@ fn group_winner(
     let mut largest = 0;
     for nx in 1..=maximum_x.min(capacity) {
         for ny in 1..=maximum_y.min(capacity / nx) {
-            if *nodes >= node_limit || deadline.expired() || effort_exhausted(request, metrics) {
+            if *nodes >= node_limit || deadline.expired() || deadline.effort_stops(request, metrics)
+            {
                 return Group::Stopped;
             }
             *nodes += 1;
@@ -582,7 +600,10 @@ fn complete(
         if reached {
             break;
         }
-        commit(&mut round, block, request, metrics);
+        if !commit(&mut round, block, request, deadline, metrics) {
+            reached = true;
+            break;
+        }
     }
     round.finish(reached)
 }
@@ -619,6 +640,7 @@ fn lookahead(
     let mut known = (!greedy.2).then(|| greedy.clone());
     let mut best = greedy;
     let mut nodes = 0_usize;
+    let mut cut = false;
     while round.open() {
         let (leading, mut reached) = leading_blocks(
             &round,
@@ -643,7 +665,10 @@ fn lookahead(
         let first = usize::from(chosen.is_some());
         for (index, block) in leading.iter().enumerate().skip(first) {
             let mut trial = round.clone();
-            commit(&mut trial, block, request, metrics);
+            if !commit(&mut trial, block, request, deadline, metrics) {
+                reached = true;
+                break;
+            }
             let solution = complete(
                 trial,
                 request,
@@ -669,10 +694,13 @@ fn lookahead(
             best_key = key;
             best = solution.clone();
         }
-        commit(&mut round, &leading[index], request, metrics);
+        if !commit(&mut round, &leading[index], request, deadline, metrics) {
+            cut = true;
+            break;
+        }
         known = Some(solution);
     }
-    let stopped = best.2 || deadline.expired();
+    let stopped = cut || best.2 || deadline.expired();
     (best.0, best.1, stopped)
 }
 
@@ -812,17 +840,59 @@ fn leading_blocks(
 }
 
 /// Place every member of `block`, bottom layer first, and carve it from the free spaces.
-fn commit(round: &mut Round, block: &Block, request: &PackingRequest, metrics: &mut SolverMetrics) {
+///
+/// Each member is one counted candidate and placement attempt. When the effort budget has
+/// room for fewer than the whole block, only the members it has room for are placed, the
+/// stop is recorded and `false` says the search ends here: no counter passes its limit
+///. Members go x fastest, then y, then z, so a member above the bottom layer always
+/// rests on the member beneath it. O(count * p) time for the bottom layer's support.
+fn commit(
+    round: &mut Round,
+    block: &Block,
+    request: &PackingRequest,
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+) -> bool {
+    let room = placement_room(request, metrics);
+    let members = usize::try_from(room).map_or(block.count, |room| block.count.min(room));
+    place_members(round, block, members, request, metrics);
+    if members < block.count {
+        deadline.effort_stops(request, metrics);
+        return false;
+    }
+    let occupied = Aabb {
+        origin: block.space.0.origin,
+        dimensions: Dimensions {
+            length: Length(block.nx * block.envelope.length.0),
+            width: Length(block.ny * block.envelope.width.0),
+            height: Length(block.nz * block.envelope.height.0),
+        },
+    };
+    round.spaces = subtract_all(std::mem::take(&mut round.spaces), occupied, metrics);
+    true
+}
+
+/// The block's first `members` members, x fastest, then y, then z.
+fn place_members(
+    round: &mut Round,
+    block: &Block,
+    members: usize,
+    request: &PackingRequest,
+    metrics: &mut SolverMetrics,
+) {
     let available = round
         .remaining
         .get_mut(&block.item_id)
         .expect("candidate item exists");
-    let chosen = available.drain(..block.count).collect::<Vec<_>>();
+    let chosen = available.drain(..members).collect::<Vec<_>>();
     let clearance = request.config.clearance.0;
     let mut index = 0;
     for z in 0..block.nz {
         for y in 0..block.ny {
             for x in 0..block.nx {
+                if index == members {
+                    return;
+                }
                 let origin = Point {
                     x: block.space.0.origin.x + x * block.envelope.length.0,
                     y: block.space.0.origin.y + y * block.envelope.width.0,
@@ -856,15 +926,6 @@ fn commit(round: &mut Round, block: &Block, request: &PackingRequest, metrics: &
             }
         }
     }
-    let occupied = Aabb {
-        origin: block.space.0.origin,
-        dimensions: Dimensions {
-            length: Length(block.nx * block.envelope.length.0),
-            width: Length(block.ny * block.envelope.width.0),
-            height: Length(block.nz * block.envelope.height.0),
-        },
-    };
-    round.spaces = subtract_all(std::mem::take(&mut round.spaces), occupied, metrics);
 }
 
 #[cfg(test)]
@@ -999,6 +1060,44 @@ mod tests {
             ],
             "containers": [{"id":"box","quantity":1,"inner_dimensions":{"length":"300","width":"200","height":"200"},"max_payload":{"value":"1000","unit":"g"}}]
         }).to_string()
+    }
+
+    /// The cartons of [`request`] under `profile`, at that profile's own node limit unless
+    /// one is given.
+    fn named_blocks(profile: &str, node_limit: Option<usize>) -> serde_json::Value {
+        let mut request: serde_json::Value = serde_json::from_str(&request(1, true)).unwrap();
+        let configuration = &mut request["configuration"];
+        configuration["solver_profile"] = profile.into();
+        configuration["container_plan_beam_width"] = 1.into();
+        match node_limit {
+            Some(limit) => configuration["container_plan_node_limit"] = limit.into(),
+            None => {
+                configuration
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("container_plan_node_limit");
+            }
+        }
+        serde_json::from_str(&pack_json(&request.to_string()).expect("solve")).unwrap()
+    }
+
+    #[test]
+    fn a_named_block_solver_outside_quality_reaches_its_first_block() {
+        // Both profiles leave `container_plan_node_limit` at one, short of the first block
+        //.
+        for profile in ["fast", "balanced"] {
+            let result = named_blocks(profile, None);
+            assert_eq!(result["summary"]["packed_item_count"], 28, "{profile}");
+            assert_eq!(result["termination"]["code"], "complete", "{profile}");
+        }
+    }
+
+    #[test]
+    fn a_node_limit_stop_is_the_search_answer_not_a_time_limit() {
+        let result = named_blocks("quality", Some(1));
+        assert_eq!(result["summary"]["packed_item_count"], 0);
+        assert_eq!(result["algorithm"]["time_limit_reached"], false);
+        assert_eq!(result["termination"]["code"], "complete");
     }
 
     /// One 60x60x40 base and three 40x60x50 tops in a 100 mm crate. The greedy block pass,

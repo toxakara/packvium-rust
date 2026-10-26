@@ -26,6 +26,7 @@ pub fn pack_maximal_order(
     scorers: &[Arc<dyn CandidateScorer>],
     deadline: &Deadline,
 ) -> PackingResult {
+    let deadline = &deadline.for_start();
     let started = deadline.now_ns();
     let mut metrics = SolverMetrics::default();
     let fill = |container: Container,
@@ -106,7 +107,7 @@ pub fn pack_maximal_order(
         })
         .collect::<Vec<_>>();
     let score = score_solution(&packed, &unpacked, &request.config);
-    let effort_limited = effort_exhausted(request, &metrics);
+    let effort_limited = deadline.effort_stopped();
     PackingResult {
         status: if unpacked.is_empty() {
             PackingStatus::Feasible
@@ -180,7 +181,7 @@ fn fill_container(
     let mut sorted_points: Option<Vec<Point>> = None;
 
     for item in remaining.iter().cloned() {
-        if deadline.expired() || effort_exhausted(request, metrics) {
+        if deadline.expired() || deadline.effort_stops(request, metrics) {
             next.push(item);
             continue;
         }

@@ -7,7 +7,6 @@
 
 use crate::geometry::{self, Aabb, Dimensions};
 use crate::model::{Container, PackedContainer, Placement};
-use crate::validation::{ground_contact_valid, validate_stack_counts, validate_top_loads};
 use std::collections::BTreeSet;
 use thiserror::Error;
 
@@ -521,8 +520,10 @@ pub fn replay_loading_order(
 }
 
 /// Independently reuse the exact constraint calculations already proven for
-/// a finished scene (`validation::validate_top_loads`, `validate_stack_counts`,
-/// `ground_contact_valid`) against every loading *prefix*, not only the final state.
+/// a finished scene (`validation::validate_top_loads_with_graph`,
+/// `validate_stack_counts_with_graph`, `ground_contact_valid_with_graph`) against every
+/// loading *prefix*, not only the final state. Each prefix builds its contact graph once
+/// and the three checks share it.
 /// Additive to `replay_loading_order` above rather than a change to it or to any of
 /// the bare-geometry functions in this module, so every existing caller keeps working
 /// unmodified.
@@ -551,23 +552,32 @@ pub fn verify_loading_prefix_business_rules(
             reason: "order is not a permutation of every placement index exactly once",
         });
     }
-    let mut present: Vec<Placement> = Vec::new();
+    let mut scratch = PackedContainer {
+        container: container.clone(),
+        sequence: 0,
+        placements: Vec::with_capacity(placements.len()),
+        lattice_summary: None,
+        lattice_items: Vec::new(),
+    };
     for (step, index) in order.iter().copied().enumerate() {
-        present.push(placements[index].clone());
-        let scratch = PackedContainer {
-            container: container.clone(),
-            sequence: 0,
-            placements: present.clone(),
-            lattice_summary: None,
-            lattice_items: Vec::new(),
-        };
+        scratch.placements.push(placements[index].clone());
+        let graph = crate::contact_graph::ContactGraph::from_placements(&scratch.placements);
         let mut issues = Vec::new();
-        validate_top_loads(&scratch, &mut issues);
-        validate_stack_counts(&scratch, &mut issues);
-        if !ground_contact_valid(&scratch, present.len() - 1) {
+        crate::validation::validate_top_loads_with_graph(&scratch, &graph, &mut issues);
+        crate::validation::validate_stack_counts_with_graph(&scratch, &graph, &mut issues);
+        if !crate::validation::ground_contact_valid_with_graph(
+            &scratch,
+            scratch.placements.len() - 1,
+            &graph,
+        ) {
             issues.push(crate::validation::ValidationIssue {
                 code: "ground_contact_violation".into(),
-                message: present.last().expect("just pushed").instance.id(),
+                message: scratch
+                    .placements
+                    .last()
+                    .expect("just pushed")
+                    .instance
+                    .id(),
             });
         }
         if let Some(problem) = issues.first() {

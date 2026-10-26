@@ -1,0 +1,60 @@
+name: rc
+
+# A pre-release tag (`v1.9.0-rc.1`) builds and tests exactly as `release.yml` does and then
+# runs `cargo publish --dry-run`. Nothing is uploaded: crates.io has no test registry, and a
+# version published there "can never be overwritten, and the code cannot be deleted". A
+# consumer tries the RC as a git dependency on the tag:
+#   packvium = { git = "https://github.com/toxakara/packvium-rust", tag = "v<version>" }
+# Publishing real `-rc` versions to crates.io would be the owner's decision; it needs no new
+# account, but every one stays on the crate page for good. There is no GitHub Release.
+
+on:
+  push:
+    tags: ["v*-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # The tag and the packaged version must agree. Without this, `git tag v0.2.0` on a
+      # tree that still says 0.1.0 publishes 0.1.0 under a name that claims otherwise,
+      # and the mistake is only visible after it is public and immutable.
+      - name: The tag must match the version in Cargo.toml
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          built=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$tagged" != "$built" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $built" >&2
+            exit 1
+          fi
+
+      - name: The tag must have a changelog entry
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^## \[${tagged}\]" CHANGELOG.md; then
+            echo "CHANGELOG.md has no '## [${tagged}]' section for tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+      - run: cargo test
+      - run: cargo package --locked
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crate
+          path: target/package/*.crate
+
+  publish-dry-run:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+      - run: cargo publish --dry-run --locked

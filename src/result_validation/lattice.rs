@@ -13,7 +13,7 @@ use super::{Issue, MalformedResult};
 const SIDES: [&str; 3] = ["length", "width", "height"];
 
 pub(crate) fn materialize(
-    request: &Json,
+    coordinates_required: bool,
     result: &Json,
     items: &Ordered<ItemSpec>,
     containers: &Ordered<ContainerSpec>,
@@ -27,20 +27,13 @@ pub(crate) fn materialize(
     {
         return Ok(result.clone());
     }
-    let empty = Json::Dict(Vec::new());
-    let coordinates_optional = matches!(
-        request
-            .get_or("configuration", &empty)?
-            .get("require_placement_coordinates")?,
-        Some(Json::Bool(false))
-    );
     let mut expanded = result.clone();
     let mut rewritten = Vec::with_capacity(packed_containers.len());
     for packed in packed_containers {
         let mut packed = packed.clone();
         if let Some(placements) = expand(
             &packed,
-            coordinates_optional,
+            coordinates_required,
             items,
             containers,
             clearance,
@@ -57,7 +50,7 @@ pub(crate) fn materialize(
 /// The placements to write into one container: `None` leaves it untouched.
 fn expand(
     packed: &Json,
-    coordinates_optional: bool,
+    coordinates_required: bool,
     items: &Ordered<ItemSpec>,
     containers: &Ordered<ContainerSpec>,
     clearance: i128,
@@ -68,7 +61,7 @@ fn expand(
         Some(summary) => summary,
     };
     let container_id = py_str(packed.get_or("id", &Json::str_of("?"))?);
-    if !coordinates_optional {
+    if coordinates_required {
         issues.push(Issue::new(
             "unexpected_lattice_summary",
             format!("{container_id}: request requires explicit placement coordinates"),
