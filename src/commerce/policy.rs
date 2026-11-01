@@ -125,7 +125,7 @@ impl Predicate {
     }
 }
 
-/// Value equality over the JSON scalar types, matching the reference implementation
+/// Recursive JSON value equality, matching the reference implementation
 /// exactly -- including that a boolean equals the integer it stands for, the one place
 /// a naive structural comparison would disagree and quietly change a decision.
 fn values_equal(left: &Value, right: &Value) -> bool {
@@ -139,6 +139,11 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b).all(|(x, y)| values_equal(x, y))
         }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, value)| b.get(key).is_some_and(|other| values_equal(value, other)))
+        }
         _ => false,
     }
 }
@@ -148,6 +153,10 @@ fn contains(haystack: &Value, needle: &Value) -> bool {
         Value::Array(entries) => entries.iter().any(|entry| values_equal(entry, needle)),
         Value::String(text) => match needle {
             Value::String(part) => text.contains(part.as_str()),
+            _ => false,
+        },
+        Value::Object(entries) => match needle {
+            Value::String(key) => entries.contains_key(key),
             _ => false,
         },
         _ => false,
@@ -305,7 +314,10 @@ pub fn decide(
     // context, so one permissive rule can never quietly override a more specific denial.
     let pool = if rejects.is_empty() { allows } else { rejects };
     let winner = pool.into_iter().min_by(|left, right| {
-        (-left.priority, &left.rule_id).cmp(&(-right.priority, &right.rule_id))
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.rule_id.cmp(&right.rule_id))
     });
 
     match winner {

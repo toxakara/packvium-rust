@@ -8,6 +8,7 @@ use crate::made_to_measure::sides_of;
 use crate::model::*;
 use crate::solver::{CandidateScorer, PlacementConstraint, SolverContext};
 use crate::spatial_index::SpatialIndex;
+use crate::support_polygon::centre_of_gravity_supported;
 use crate::units::{Length, Weight};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -153,6 +154,8 @@ pub struct ContainerState {
     /// Candidate origins ordered by (z, y, x), matching the reference engines.
     points: BTreeSet<(i64, i64, i64)>,
     spatial_index: SpatialIndex,
+    placements_by_top: BTreeMap<i64, Vec<usize>>,
+    placements_by_bottom: BTreeMap<i64, Vec<usize>>,
 }
 
 struct ContainerTrial {
@@ -191,6 +194,8 @@ impl ContainerState {
             extent: [0, 0, 0],
             points: BTreeSet::new(),
             spatial_index,
+            placements_by_top: BTreeMap::new(),
+            placements_by_bottom: BTreeMap::new(),
         };
         absorb_point(&mut state, Point::ZERO);
         for box_ in obstacle_boxes {
@@ -709,12 +714,22 @@ pub fn find_candidates_at_points(
             ) {
                 continue;
             }
+            // Area alone is not stability. At or below half the base the
+            // centroid can still fall outside the contact hull, which Python and PHP refuse
+            // as centre_of_gravity_unsupported; above half it cannot.
+            if point.z != 0
+                && required_support > 0.0
+                && support_area * 2 <= envelope.base_area()
+                && !centre_of_gravity_carried(state, nested_support.as_ref(), envelope_box)
+            {
+                continue;
+            }
             let ground_contact_allowed = nested_support.as_ref().map_or_else(
                 || {
-                    ground_contact_allowed(
+                    ground_contact_allowed_in_state(
                         item.item.ground_contact_rule.as_deref(),
                         envelope_box,
-                        &state.packed.placements,
+                        state,
                     )
                 },
                 |support| {
@@ -729,11 +744,7 @@ pub fn find_candidates_at_points(
                 continue;
             }
             if (state.route_sensitive || item.item.stop_index.is_some())
-                && !route_contact_allowed(
-                    item.item.stop_index,
-                    envelope_box,
-                    &state.packed.placements,
-                )
+                && !route_contact_allowed_in_state(item.item.stop_index, envelope_box, state)
             {
                 continue;
             }
@@ -1232,8 +1243,17 @@ fn pack_container_plans(
     let mut beam = vec![initial];
     let mut plan_nodes = 0_usize;
     let maximum = request.config.max_containers.unwrap_or(usize::MAX);
+    // A beam wider than its node budget used to stop after trying the first
+    // container in static order, so the order chose it, not the objective. The budget is at
+    // least one trial per container type for every plan the beam keeps.
+    let node_limit = request.config.container_plan_node_limit.max(
+        request
+            .config
+            .container_plan_beam_width
+            .saturating_mul(request.containers.len()),
+    );
 
-    while !beam.is_empty() && plan_nodes < request.config.container_plan_node_limit {
+    while !beam.is_empty() && plan_nodes < node_limit {
         let mut expansions = Vec::new();
         let mut exhausted = false;
         for plan in &beam {
@@ -1246,7 +1266,7 @@ fn pack_container_plans(
                 continue;
             }
             for container in eligible_containers(request, &plan.remaining, &plan.inventory) {
-                if plan_nodes >= request.config.container_plan_node_limit {
+                if plan_nodes >= node_limit {
                     break;
                 }
                 if deadline.expired() || deadline.effort_stops(request, metrics) {
@@ -1400,9 +1420,17 @@ fn commit_placement(state: &mut ContainerState, placement: Placement) {
             .item
             .nesting_height
             .is_none()
-        && !state.packed.placements[..placement_index]
-            .iter()
-            .any(|existing| existing.envelope_origin.z == envelope_box.z2());
+        && !state.placements_by_bottom.contains_key(&envelope_box.z2());
+    state
+        .placements_by_top
+        .entry(envelope_box.z2())
+        .or_default()
+        .push(placement_index);
+    state
+        .placements_by_bottom
+        .entry(envelope_box.origin.z)
+        .or_default()
+        .push(placement_index);
     if !isolated_on_floor && let Some(loads) = calculate_top_loads(&state.packed.placements) {
         for (placement, load) in state.packed.placements.iter_mut().zip(loads) {
             placement.top_load = Weight(load.clamp(0, i64::MAX as i128) as i64);
@@ -1585,15 +1613,51 @@ fn solid_boxes(state: &ContainerState) -> impl Iterator<Item = Aabb> + '_ {
         )
 }
 
+/// The supporters are the ones whose area `support_area_sufficient` just counted: the
+/// nested view's graph when the candidate nests, else every placed top face on its base.
+fn centre_of_gravity_carried(
+    state: &ContainerState,
+    nested: Option<&CandidateSupportView>,
+    box_: Aabb,
+) -> bool {
+    match nested {
+        Some(view) => {
+            let candidate = view.placements.len() - 1;
+            centre_of_gravity_supported(
+                box_,
+                view.graph
+                    .supporters(candidate)
+                    .iter()
+                    .map(|edge| view.placements[edge.index].envelope_box()),
+            )
+        }
+        None => centre_of_gravity_supported(
+            box_,
+            state
+                .placements_by_top
+                .get(&box_.origin.z)
+                .into_iter()
+                .flatten()
+                .map(|&index| state.packed.placements[index].envelope_box()),
+        ),
+    }
+}
+
 /// Square ticks of placed top faces directly under `box_`'s base plane.
 fn supporting_area(state: &ContainerState, box_: Aabb) -> i128 {
     state
-        .packed
-        .placements
-        .iter()
-        .filter(|placement| placement.envelope_box().z2() == box_.origin.z)
-        .map(|placement| placement.envelope_box().overlap_area_xy(box_))
-        .sum::<i128>()
+        .placements_by_top
+        .get(&box_.origin.z)
+        .map_or(0, |indices| {
+            indices
+                .iter()
+                .map(|&index| {
+                    state.packed.placements[index]
+                        .envelope_box()
+                        .overlap_area_xy(box_)
+                })
+                .sum()
+        })
 }
 
 /// The reported fraction, for the placement record only: the feasibility decision reads
@@ -1672,7 +1736,11 @@ fn candidate_respects_loads(
     // needs the placements themselves -- the two are required to agree exactly, which is
     // what `contact_graph`'s append property test holds them to.
     if let Some(sweep) = sweep {
-        return sweep.allows(LoadBody::of(&item.item, candidate_box));
+        return sweep.allows(LoadBody::of(
+            &item.item,
+            candidate_box,
+            candidate.dimensions.base_area(),
+        ));
     }
     let mut placements = state.packed.placements.clone();
     placements.push(Placement {
@@ -1714,6 +1782,9 @@ pub(crate) trait LoadSubject {
     fn max_top_load_ticks(&self) -> Option<i64>;
     fn max_stacked_items(&self) -> Option<usize>;
     fn max_compression_pressure_kpa(&self) -> Option<i64>;
+    /// The item's own footprint, which a load presses on; the envelope is grown by the
+    /// clearance and carries the support graph.
+    fn footprint(&self) -> i128;
     fn stacking_group(&self) -> Option<&str>;
     /// The code refusing an item of `upper_group` resting directly on this box.
     fn stacking_refusal(&self, upper_group: Option<&str>) -> Option<&'static str>;
@@ -1722,6 +1793,9 @@ pub(crate) trait LoadSubject {
 impl LoadSubject for Placement {
     fn envelope(&self) -> Aabb {
         self.envelope_box()
+    }
+    fn footprint(&self) -> i128 {
+        self.dimensions.base_area()
     }
     fn weight_ticks(&self) -> i64 {
         self.instance.item.weight.0
@@ -1748,6 +1822,7 @@ impl LoadSubject for Placement {
 #[derive(Clone, Copy, Debug)]
 struct LoadBody<'a> {
     envelope: Aabb,
+    footprint: i128,
     weight: i64,
     stackable: bool,
     max_top_load: Option<i64>,
@@ -1758,9 +1833,10 @@ struct LoadBody<'a> {
 }
 
 impl<'a> LoadBody<'a> {
-    fn of(item: &'a Item, envelope: Aabb) -> Self {
+    fn of(item: &'a Item, envelope: Aabb, footprint: i128) -> Self {
         Self {
             envelope,
+            footprint,
             weight: item.weight.0,
             stackable: item.stackable,
             max_top_load: item.max_top_load.map(|weight| weight.0),
@@ -1780,6 +1856,9 @@ impl<'a> LoadBody<'a> {
 impl LoadSubject for LoadBody<'_> {
     fn envelope(&self) -> Aabb {
         self.envelope
+    }
+    fn footprint(&self) -> i128 {
+        self.footprint
     }
     fn weight_ticks(&self) -> i64 {
         self.weight
@@ -1832,7 +1911,13 @@ impl<'a> LoadSweep<'a> {
             .packed
             .placements
             .iter()
-            .map(|placement| LoadBody::of(&placement.instance.item, placement.envelope_box()))
+            .map(|placement| {
+                LoadBody::of(
+                    &placement.instance.item,
+                    placement.envelope_box(),
+                    placement.dimensions.base_area(),
+                )
+            })
             .collect::<Vec<_>>();
         let boxes = bodies.iter().map(|body| body.envelope).collect::<Vec<_>>();
         let graph = ContactGraph::with_cell_hint(&boxes, widest_footprint);
@@ -1937,7 +2022,7 @@ impl<'a> LoadSweep<'a> {
             let body = scene.body(*index);
             let footprint_area = body.envelope.dimensions.base_area();
             if let Some(limit) = body.max_compression_pressure_kpa
-                && crush_exceeded(limit, *load, footprint_area)
+                && crush_exceeded(limit, *load, body.footprint)
             {
                 return false;
             }
@@ -2117,14 +2202,21 @@ fn density_within(weight: i64, load: i128, maximum: Weight, footprint_area: i128
     total.saturating_mul(SQUARE_METRE_TICKS) <= i128::from(maximum.0).saturating_mul(footprint_area)
 }
 
-fn ground_contact_allowed(rule: Option<&str>, candidate: Aabb, placements: &[Placement]) -> bool {
+fn ground_contact_allowed_in_state(
+    rule: Option<&str>,
+    candidate: Aabb,
+    state: &ContainerState,
+) -> bool {
     if candidate.origin.z == 0 || matches!(rule, None | Some("free")) {
         return true;
     }
-    let supporters = placements
-        .iter()
-        .map(Placement::envelope_box)
-        .filter(|other| other.z2() == candidate.origin.z && other.overlap_area_xy(candidate) > 0)
+    let supporters = state
+        .placements_by_top
+        .get(&candidate.origin.z)
+        .into_iter()
+        .flatten()
+        .map(|&index| state.packed.placements[index].envelope_box())
+        .filter(|other| other.overlap_area_xy(candidate) > 0)
         .collect::<Vec<_>>();
     match rule {
         Some("single") => supporters.len() == 1,
@@ -2353,6 +2445,52 @@ fn stop_accessible(
     })
 }
 
+fn route_contact_allowed_in_state(
+    candidate_stop: Option<usize>,
+    candidate: Aabb,
+    state: &ContainerState,
+) -> bool {
+    let candidate_stop = candidate_stop.unwrap_or(RIDES_THE_WHOLE_ROUTE);
+    let below_ok = state
+        .placements_by_top
+        .get(&candidate.origin.z)
+        .into_iter()
+        .flatten()
+        .all(|&index| {
+            let other = &state.packed.placements[index];
+            let other_stop = other
+                .instance
+                .item
+                .stop_index
+                .unwrap_or(RIDES_THE_WHOLE_ROUTE);
+            if candidate_stop == RIDES_THE_WHOLE_ROUTE && other_stop == RIDES_THE_WHOLE_ROUTE {
+                return true;
+            }
+            other.envelope_box().overlap_area_xy(candidate) == 0 || candidate_stop <= other_stop
+        });
+    if !below_ok {
+        return false;
+    }
+    state
+        .placements_by_bottom
+        .get(&candidate.z2())
+        .into_iter()
+        .flatten()
+        .all(|&index| {
+            let other = &state.packed.placements[index];
+            let other_stop = other
+                .instance
+                .item
+                .stop_index
+                .unwrap_or(RIDES_THE_WHOLE_ROUTE);
+            if candidate_stop == RIDES_THE_WHOLE_ROUTE && other_stop == RIDES_THE_WHOLE_ROUTE {
+                return true;
+            }
+            other.envelope_box().overlap_area_xy(candidate) == 0 || candidate_stop >= other_stop
+        })
+}
+
+#[cfg(test)]
 fn route_contact_allowed(
     candidate_stop: Option<usize>,
     candidate: Aabb,
@@ -2457,13 +2595,12 @@ fn placement_stack_sensitive(item: &Item) -> bool {
 /// volume for every candidate orientation.
 fn used_volume_delta(placements: &[Placement], placement: &Placement) -> i128 {
     let mut delta = occupied_volume(placement);
-    let Some(depth) = placement.instance.item.nesting_height else {
+    if placement.instance.item.nesting_height.is_none() {
         return delta;
-    };
-    let overlap = (depth.0 as i128).saturating_mul(placement.envelope_dimensions.base_area());
+    }
     for existing in placements {
         if valid_nesting(existing, placement) {
-            delta = delta.saturating_sub(overlap);
+            delta = delta.saturating_sub(nested_overlap(existing, placement));
         }
     }
     delta
@@ -2509,9 +2646,8 @@ fn stack_density_valid_with_loads<T: LoadSubject>(
 /// `crushed` without the offender's name, over any bearing subject.
 fn crush_free<T: LoadSubject>(bodies: &[T], loads: &[i128]) -> bool {
     bodies.iter().zip(loads).all(|(body, load)| {
-        body.max_compression_pressure_kpa().is_none_or(|limit| {
-            !crush_exceeded(limit, *load, body.envelope().dimensions.base_area())
-        })
+        body.max_compression_pressure_kpa()
+            .is_none_or(|limit| !crush_exceeded(limit, *load, body.footprint()))
     })
 }
 
@@ -4739,6 +4875,7 @@ mod tests {
                 origin,
                 dimensions: dimensions(side, side, 10 + lcg.next(2) as i64 * 10),
             },
+            footprint: i128::from(side * side),
             weight: lcg.next(5) as i64 * 1_000,
             stackable: lcg.next(6) != 0,
             max_top_load: (lcg.next(3) == 0).then(|| lcg.next(4) as i64 * 1_500),

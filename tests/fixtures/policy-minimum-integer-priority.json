@@ -1,0 +1,17 @@
+{
+  "document": {
+    "policy_rules": [
+      {"rule_id": "a-minimum", "versions": [{
+        "scope": "facility", "action": "reject", "priority": -9223372036854775808,
+        "effective_at": 0,
+        "predicates": [{"scope": "facility", "field": "x", "operator": "exists"}]
+      }]},
+      {"rule_id": "z-zero", "versions": [{
+        "scope": "facility", "action": "reject", "priority": 0,
+        "effective_at": 0,
+        "predicates": [{"scope": "facility", "field": "x", "operator": "exists"}]
+      }]}
+    ]
+  },
+  "request": {"scope": "facility", "context": {"x": null}, "as_of": 0}
+}

@@ -46,9 +46,33 @@ pub fn pack_exact_one(
     let mut searched_all_containers = true;
     let mut metrics = SolverMetrics::default();
 
+    let mut type_ids = BTreeMap::<String, u32>::new();
+    let mut equiv_ids = BTreeMap::<(String, i64, i64, i64, i64, Vec<u8>), u32>::new();
     let profiled = items
         .iter()
-        .map(|item| (item.clone(), exact_item_profile(item, &request.config)))
+        .map(|item| {
+            let next_type = type_ids.len() as u32;
+            let type_id = *type_ids.entry(item.item.id.clone()).or_insert(next_type);
+            let next_equiv = equiv_ids.len() as u32;
+            let equiv_id = *equiv_ids
+                .entry((
+                    item.item.id.clone(),
+                    item.item.dimensions.length.0,
+                    item.item.dimensions.width.0,
+                    item.item.dimensions.height.0,
+                    item.item.weight.0,
+                    item.item
+                        .allowed_rotations
+                        .iter()
+                        .map(|r| *r as u8)
+                        .collect(),
+                ))
+                .or_insert(next_equiv);
+            (
+                item.clone(),
+                exact_item_profile(item, &request.config, type_id, equiv_id),
+            )
+        })
         .collect::<Vec<_>>();
     let mut containers = request.containers.clone();
     containers.sort_by_key(|container| container_order_key(container, &request.config));
@@ -109,20 +133,27 @@ pub fn pack_exact_one(
             ),
             seen: BTreeSet::new(),
         };
-        search(
-            can_fit,
-            &cannot_fit,
-            request,
-            constraints,
-            scorers,
-            deadline,
-            &initial,
-            &mut best_state,
-            &mut best_state_score,
-            &complete_lower_bound,
-            &mut metrics,
-            &mut visited,
-        );
+        let initial_key = visited.keys.of(&initial);
+        if !deadline.expired()
+            && visited.seen.insert(initial_key.clone())
+            && !deadline.effort_stops(request, &metrics)
+        {
+            search(
+                can_fit,
+                &cannot_fit,
+                request,
+                constraints,
+                scorers,
+                deadline,
+                &initial,
+                initial_key,
+                &mut best_state,
+                &mut best_state_score,
+                &complete_lower_bound,
+                &mut metrics,
+                &mut visited,
+            );
+        }
 
         let placed = best_state
             .packed
@@ -260,9 +291,16 @@ struct ExactItemProfile {
     occupied_volume: i128,
     minimum_height: i64,
     weight: i64,
+    type_id: u32,
+    equiv_id: u32,
 }
 
-fn exact_item_profile(item: &ItemInstance, config: &PackingConfig) -> ExactItemProfile {
+fn exact_item_profile(
+    item: &ItemInstance,
+    config: &PackingConfig,
+    type_id: u32,
+    equiv_id: u32,
+) -> ExactItemProfile {
     let minimum_height = item
         .item
         .dimensions
@@ -282,6 +320,8 @@ fn exact_item_profile(item: &ItemInstance, config: &PackingConfig) -> ExactItemP
         occupied_volume: occupied_item_volume(&item.item),
         minimum_height,
         weight: item.item.weight.0,
+        type_id,
+        equiv_id,
     }
 }
 
@@ -426,16 +466,17 @@ fn optimistic_completion_score(
     // item cap bounds it outright. Without these a weight-capped container searched
     // every ordering of items it could never take -- a million placement attempts to
     // prove three light boxes fit where the volume bound said all six might.
+    let mut weights = remaining
+        .iter()
+        .map(|(_, profile)| profile.weight)
+        .collect::<Vec<_>>();
+    weights.sort_unstable();
     if let Some(maximum) = container.max_payload {
         let free_payload = i128::from(maximum.0) - i128::from(state.payload);
-        let mut weights = remaining
-            .iter()
-            .map(|(_, profile)| i128::from(profile.weight))
-            .collect::<Vec<_>>();
-        weights.sort_unstable();
         let mut admitted = 0;
         let mut lightest_sum = 0_i128;
         for weight in &weights {
+            let weight = i128::from(*weight);
             if lightest_sum + weight > free_payload {
                 break;
             }
@@ -498,11 +539,6 @@ fn optimistic_completion_score(
         0
     };
     let cost = container.cost_minor as i128;
-    let mut weights = remaining
-        .iter()
-        .map(|(_, profile)| profile.weight)
-        .collect::<Vec<_>>();
-    weights.sort_unstable();
     let gross_weight = weights
         .iter()
         .take(placeable)
@@ -637,6 +673,32 @@ impl StateKeys {
         }
         key
     }
+
+    fn extend(
+        &self,
+        parent: &StateKey,
+        type_id: u32,
+        candidate: &super::extreme::Candidate,
+    ) -> StateKey {
+        let entry = (
+            type_id,
+            candidate.envelope_origin.x,
+            candidate.envelope_origin.y,
+            candidate.envelope_origin.z,
+            candidate.rotation as u8,
+        );
+        let mut key = Vec::with_capacity(parent.len() + 1);
+        if self.canonicalize_order {
+            let pos = parent.partition_point(|existing| *existing <= entry);
+            key.extend_from_slice(&parent[..pos]);
+            key.push(entry);
+            key.extend_from_slice(&parent[pos..]);
+        } else {
+            key.extend_from_slice(parent);
+            key.push(entry);
+        }
+        key
+    }
 }
 
 // Each parameter is independently-varying recursive DFS state (the remaining work,
@@ -653,27 +715,13 @@ fn search(
     scorers: &[Arc<dyn CandidateScorer>],
     deadline: &Deadline,
     state: &ContainerState,
+    state_key: StateKey,
     best: &mut ContainerState,
     best_score: &mut Vec<i128>,
     complete_lower_bound: &[i128],
     metrics: &mut SolverMetrics,
     visited: &mut VisitedStates,
 ) {
-    if deadline.expired() {
-        return;
-    }
-    // In an order-insensitive scene, two item orders that seat the same boxes at the same
-    // places reach the same state and the first visit already explored its subtree. In a
-    // load-sensitive or extension-bearing scene StateKeys preserves insertion order, so
-    // the same check only folds states whose order-dependent future is also the same.
-    if !visited.seen.insert(visited.keys.of(state)) {
-        return;
-    }
-    // Asked after the fold: a state already explored is no work refused. A stop ends the
-    // whole search, so the state it leaves recorded is never visited again.
-    if deadline.effort_stops(request, metrics) {
-        return;
-    }
     metrics.search_nodes_expanded = metrics.search_nodes_expanded.saturating_add(1);
     // This node's own score leads with `remaining.len() + unfit.len()` unpacked, so it can only
     // beat the incumbent when that count does not already lose the first element;
@@ -710,19 +758,19 @@ fn search(
         return;
     }
 
-    let mut equivalent = BTreeSet::new();
+    // Keep configurable large exact searches logarithmic in overflow classes.
+    let mut seen_equiv_mask = 0_u64;
+    let mut seen_equiv_overflow = BTreeSet::<u32>::new();
     for index in 0..remaining.len() {
-        let item = &remaining[index].0;
-        let signature = format!(
-            "{}:{}:{}:{}:{}:{:?}",
-            item.item.id,
-            item.item.dimensions.length.0,
-            item.item.dimensions.width.0,
-            item.item.dimensions.height.0,
-            item.item.weight.0,
-            item.item.allowed_rotations,
-        );
-        if !equivalent.insert(signature) {
+        let (item, profile) = &remaining[index];
+        let equiv_id = profile.equiv_id;
+        if equiv_id < 64 {
+            let bit = 1_u64 << equiv_id;
+            if (seen_equiv_mask & bit) != 0 {
+                continue;
+            }
+            seen_equiv_mask |= bit;
+        } else if !seen_equiv_overflow.insert(equiv_id) {
             continue;
         }
         let candidates = find_candidates(
@@ -737,6 +785,17 @@ fn search(
             metrics,
         );
         for candidate in candidates {
+            if deadline.expired() {
+                continue;
+            }
+            let next_key = visited.keys.extend(&state_key, profile.type_id, &candidate);
+            if visited.seen.contains(&next_key) {
+                continue;
+            }
+            visited.seen.insert(next_key.clone());
+            if deadline.effort_stops(request, metrics) {
+                continue;
+            }
             let mut next_state = state.clone();
             apply_candidate(&mut next_state, item.clone(), &candidate);
             let mut next_remaining = remaining.clone();
@@ -749,6 +808,7 @@ fn search(
                 scorers,
                 deadline,
                 &next_state,
+                next_key,
                 best,
                 best_score,
                 complete_lower_bound,
@@ -764,6 +824,7 @@ fn search(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::api::pack_json;
 
     fn open_height_request(max_search_nodes: u64) -> String {
@@ -1070,5 +1131,194 @@ mod tests {
 
         assert_eq!(result["complete"], true);
         assert_eq!(result["score"], serde_json::json!([0, 1, 0, 0, 1000000]));
+    }
+
+    fn profiled_instances(items: serde_json::Value) -> Vec<(ItemInstance, ExactItemProfile)> {
+        let request = crate::api::request_from_json(&serde_json::json!({
+            "units": {"length": "mm"},
+            "items": items,
+            "containers": [{"id": "crate",
+                "inner_dimensions": {"length": "100", "width": "100", "height": "100"}}]
+        }))
+        .expect("request");
+        let config = request.config.clone();
+        request
+            .items
+            .iter()
+            .flat_map(|item| (0..item.quantity).map(move |_| item.clone()))
+            .enumerate()
+            .map(|(sequence, item)| {
+                let instance = ItemInstance { item, sequence };
+                let profile = exact_item_profile(&instance, &config, 0, 0);
+                (instance, profile)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_child_key_extended_from_its_parent_equals_the_key_rebuilt_from_the_child() {
+        // The search extends each child's visited key from its parent's instead
+        // of rebuilding it from every placement; the fold is only sound if the two agree,
+        // in insertion order and canonicalized, whatever order the placements arrive in.
+        let profiled = profiled_instances(serde_json::json!([
+            {"id": "b", "quantity": 2, "dimensions": {"length": "10", "width": "10", "height": "10"}},
+            {"id": "a", "quantity": 1, "dimensions": {"length": "10", "width": "20", "height": "10"}},
+        ]));
+        let request = crate::api::request_from_json(&serde_json::json!({
+            "units": {"length": "mm"},
+            "items": [{"id": "a", "quantity": 1, "dimensions": {"length": "1", "width": "1", "height": "1"}}],
+            "containers": [{"id": "crate",
+                "inner_dimensions": {"length": "100", "width": "100", "height": "100"}}]
+        }))
+        .expect("request");
+        let origins = [(40, 0, 0), (0, 0, 0), (0, 30, 0), (0, 0, 10)];
+        for canonicalize_order in [false, true] {
+            let keys = StateKeys::new(&profiled, canonicalize_order);
+            let mut state = ContainerState::new(request.containers[0].clone(), 1);
+            let mut key = keys.of(&state);
+            for (index, (x, y, z)) in origins.iter().copied().enumerate() {
+                let (instance, _) = &profiled[index % profiled.len()];
+                let origin = crate::geometry::Point { x, y, z };
+                let candidate = super::super::extreme::Candidate {
+                    envelope_origin: origin,
+                    position: origin,
+                    rotation: crate::geometry::Rotation::Lwh,
+                    dimensions: instance.item.dimensions,
+                    envelope_dimensions: instance.item.dimensions,
+                    support_ratio: 1.0,
+                    score: 0,
+                };
+                key = keys.extend(&key, keys.types[&instance.item.id], &candidate);
+                apply_candidate(&mut state, instance.clone(), &candidate);
+                assert_eq!(
+                    key,
+                    keys.of(&state),
+                    "canonicalize_order={canonicalize_order}, step {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equivalent_items_past_the_sixty_fourth_class_still_branch_once() {
+        // Equivalence classes below 64 are folded through a bitmask and the rest
+        // through an ordered set. A duplicate in the 65th class must still add no branch: the root
+        // considers exactly the orientations it would with that duplicate absent.
+        let items = |copies: u32| {
+            let mut items = (0..64)
+                .map(|index| {
+                    serde_json::json!({"id": format!("t{index:02}"), "quantity": 1,
+                    "allowed_rotations": ["LWH"],
+                    "dimensions": {"length": "1", "width": "1", "height": (index + 1).to_string()}})
+                })
+                .collect::<Vec<_>>();
+            items.push(
+                serde_json::json!({"id": "t64", "quantity": copies, "allowed_rotations": ["LWH"],
+                "dimensions": {"length": "1", "width": "1", "height": "99"}}),
+            );
+            items
+        };
+        let root_work = |copies: u32| {
+            let request = serde_json::json!({
+                "units": {"length": "mm"},
+                "configuration": {"solvers": ["exact_small"], "solver_profile": "exact_small",
+                    "exact_item_limit": 80, "max_containers": 1, "time_limit_ms": 300000,
+                    "effort_budget": {"max_candidates_evaluated": 1000000,
+                        "max_placement_attempts": 1000000, "max_search_nodes": 1}},
+                "items": items(copies),
+                "containers": [{"id": "crate", "quantity": 1,
+                    "inner_dimensions": {"length": "100", "width": "100", "height": "100"}}]
+            });
+            let output = pack_json(&request.to_string()).expect("a 65-class exact request");
+            let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(result["algorithm"]["metrics"]["search_nodes_expanded"], 1);
+            result["algorithm"]["metrics"]["orientations_considered"].clone()
+        };
+        assert_eq!(root_work(2), root_work(1));
+    }
+
+    /// One millisecond per reading, so a test can say on which check the deadline passes.
+    struct SteppingClock(std::sync::atomic::AtomicU64);
+
+    impl crate::deadline::Clock for SteppingClock {
+        fn now_ns(&self) -> u64 {
+            self.0
+                .fetch_add(1_000_000, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn stepping(limit_ms: u64) -> crate::deadline::Deadline {
+        crate::deadline::Deadline::with_clock(
+            limit_ms,
+            std::sync::Arc::new(SteppingClock(std::sync::atomic::AtomicU64::new(0))),
+        )
+    }
+
+    fn cubes(quantity: usize, containers: serde_json::Value) -> crate::model::PackingRequest {
+        crate::api::request_from_json(&serde_json::json!({
+            "units": {"length": "mm"},
+            "configuration": {"solvers": ["exact_small"], "solver_profile": "exact_small",
+                              "time_limit_ms": 300000},
+            "items": [{"id": "cube", "quantity": quantity, "allowed_rotations": ["LWH"],
+                       "dimensions": {"length": "10", "width": "10", "height": "10"}}],
+            "containers": containers
+        }))
+        .expect("a valid request")
+    }
+
+    fn exact(
+        request: &crate::model::PackingRequest,
+        deadline: &crate::deadline::Deadline,
+    ) -> Option<crate::model::PackingResult> {
+        super::pack_exact_one(request, &request.instances(), &[], &[], deadline)
+    }
+
+    fn crate_of(id: &str, length: &str) -> serde_json::Value {
+        serde_json::json!({"id": id, "quantity": 1,
+            "inner_dimensions": {"length": length, "width": "10", "height": "10"}})
+    }
+
+    #[test]
+    fn a_deadline_passed_before_the_first_container_answers_nothing() {
+        let request = cubes(2, serde_json::json!([crate_of("box", "20")]));
+        assert!(exact(&request, &stepping(1)).is_none());
+    }
+
+    #[test]
+    fn a_deadline_passed_mid_search_keeps_the_incumbent_and_names_the_limit() {
+        // Two containers, neither of which holds all four cubes: the first search runs out
+        // of clock partway, so the answer is the partial incumbent, flagged as cut off.
+        let request = cubes(
+            4,
+            serde_json::json!([crate_of("short", "20"), crate_of("long", "30")]),
+        );
+        let result = exact(&request, &stepping(12)).expect("an incumbent");
+        assert!(result.algorithm.time_limit_reached);
+        assert_eq!(result.status, crate::model::PackingStatus::TimeLimit);
+        assert!(!result.unpacked.is_empty());
+        assert!(
+            result
+                .unpacked
+                .iter()
+                .all(|item| item.reason == "time_limit")
+        );
+    }
+
+    #[test]
+    fn a_container_that_takes_no_item_leaves_every_item_unpacked() {
+        let mut request = cubes(2, serde_json::json!([crate_of("box", "20")]));
+        request.containers[0].max_items = Some(0);
+        let result = exact(&request, &stepping(60_000)).expect("an answer");
+        assert!(result.containers.is_empty());
+        assert_eq!(result.unpacked.len(), 2);
+    }
+
+    #[test]
+    fn a_container_item_limit_caps_the_floor_and_the_answer() {
+        let mut request = cubes(3, serde_json::json!([crate_of("box", "30")]));
+        request.containers[0].max_items = Some(1);
+        let result = exact(&request, &stepping(60_000)).expect("an answer");
+        assert_eq!(result.containers[0].placements.len(), 1);
+        assert_eq!(result.unpacked.len(), 2);
     }
 }

@@ -8,8 +8,8 @@ use super::pyfmt::{int_tuple, list, py_repr, py_str, str_repr, tuple};
 use super::spec::{ContainerSpec, ItemSpec, rotation_axes};
 use super::stacking::{
     Entry, Envelopes, SQUARE_METRE_TICKS, check_crush, check_route_removal_order,
-    check_stack_density, check_support_and_load, entries, occupied_volume, placed_hull,
-    propagate_load, support_graph, valid_nesting,
+    check_stack_density, check_stack_top_load, check_support_and_load, entries, occupied_volume,
+    placed_hull, propagate_load, support_graph, valid_nesting,
 };
 use super::{Issue, Label, MalformedResult};
 
@@ -395,6 +395,7 @@ pub(crate) fn check_container(
     let graph = support_graph(&envelopes)?;
     check_support_and_load(&envelopes, &graph, global_support, issues)?;
     let loads = propagate_load(&envelopes, &graph)?;
+    check_stack_top_load(&envelopes, &loads, issues);
     if let Some(max_density) = spec.max_stack_density {
         check_stack_density(&packed_id, &envelopes, &loads, max_density, issues)?;
     }
@@ -410,7 +411,7 @@ pub(crate) fn check_container(
 
     check_limits(packed, &packed_id, placements, spec, items, payload, issues)?;
     check_volumes(
-        packed, &packed_id, placements, spec, items, &envelopes, &loads, issues,
+        packed, &packed_id, placements, spec, items, &envelopes, &loads, clearance, issues,
     )?;
     let total_weight = payload_of(packed, items)?;
     check_centre_of_mass(
@@ -583,6 +584,7 @@ fn check_volumes(
     items: &Ordered<ItemSpec>,
     envelopes: &Envelopes<'_>,
     loads: &[i128],
+    clearance: i128,
     issues: &mut Vec<Issue>,
 ) -> Res<()> {
     let list = entries(envelopes);
@@ -603,11 +605,18 @@ fn check_volumes(
     for (first, (_, left)) in list.iter().enumerate() {
         for (_, right) in &list[first + 1..] {
             if valid_nesting(left, right)? {
+                // The envelopes sink by the nesting height; the items themselves overlap by
+                // twice the clearance less, over their own footprint.
                 let nesting = left.spec.and_then(|spec| spec.nesting_height).unwrap_or(0);
-                used = sub(
-                    used,
-                    mul(mul(nesting, left.envelope.length)?, left.envelope.width)?,
-                )?;
+                let margin = mul(2, clearance)?;
+                let overlap = sub(nesting, margin)?;
+                if overlap > 0 {
+                    let footprint = mul(
+                        sub(left.envelope.length, margin)?,
+                        sub(left.envelope.width, margin)?,
+                    )?;
+                    used = sub(used, mul(overlap, footprint)?)?;
+                }
             }
         }
     }

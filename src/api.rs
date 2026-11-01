@@ -1855,9 +1855,27 @@ fn parse_aabb(map: &Map<String, Value>, unit: &str) -> PackResult<Aabb> {
 fn parse_point(value: Option<&Value>, unit: &str) -> PackResult<Point> {
     let point = value.and_then(Value::as_object);
     Ok(Point {
-        x: parse_optional_length(point.and_then(|value| value.get("x")), unit)?.0,
-        y: parse_optional_length(point.and_then(|value| value.get("y")), unit)?.0,
-        z: parse_optional_length(point.and_then(|value| value.get("z")), unit)?.0,
+        x: parse_optional_length(
+            point
+                .and_then(|value| value.get("x"))
+                .filter(|value| !value.is_null()),
+            unit,
+        )?
+        .0,
+        y: parse_optional_length(
+            point
+                .and_then(|value| value.get("y"))
+                .filter(|value| !value.is_null()),
+            unit,
+        )?
+        .0,
+        z: parse_optional_length(
+            point
+                .and_then(|value| value.get("z"))
+                .filter(|value| !value.is_null()),
+            unit,
+        )?
+        .0,
     })
 }
 

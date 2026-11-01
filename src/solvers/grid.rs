@@ -54,7 +54,7 @@ fn grid_selection_key(
     let top = if layers == 0 {
         0
     } else {
-        envelope.height.0 + (layers as i64 - 1) * (envelope.height.0 - nesting)
+        column_layer_z(layers as i64 - 1, envelope.height.0, nesting) + envelope.height.0
     };
     let unused_ppm = if volume > 0 {
         (volume - used) * SCORE_SCALE / volume
@@ -168,12 +168,11 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
                 };
                 let nx = container.inner_dimensions.length.0 / envelope.length.0;
                 let ny = container.inner_dimensions.width.0 / envelope.width.0;
-                let layer_step = envelope.height.0 - nesting;
-                let mut nz = if container.inner_dimensions.height.0 < envelope.height.0 {
-                    0
-                } else {
-                    (container.inner_dimensions.height.0 - envelope.height.0) / layer_step + 1
-                };
+                let mut nz = column_layers(
+                    container.inner_dimensions.height.0,
+                    envelope.height.0,
+                    nesting,
+                );
                 // Every lattice edge joins two items of this one type, so the stacking-group
                 // rule holds for the whole lattice exactly when the type carries itself.
                 if item.must_be_on_floor || !item.carries_itself() {
@@ -201,7 +200,8 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
                 let top = if layers == 0 {
                     0
                 } else {
-                    envelope.height.0 + (layers as i64 - 1) * layer_step
+                    column_layer_z(layers as i64 - 1, envelope.height.0, nesting)
+                        + envelope.height.0
                 };
                 let key = (Reverse(useful), top, envelope.volume(), rotation.as_str());
                 let replace = match &best {
@@ -349,7 +349,7 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
                         let origin = Point {
                             x: x * envelope.length.0,
                             y: y * envelope.width.0,
-                            z: z * (envelope.height.0 - nesting),
+                            z: column_layer_z(z, envelope.height.0, nesting),
                         };
                         placements.push(Placement {
                             instance,

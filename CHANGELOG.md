@@ -4,6 +4,43 @@ What changed in `packvium` on crates.io, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0]
+
+No API change, but admission is stricter: some requests 1.8 accepted are now refused (see the
+weight and length limits below). The centre of gravity is checked, and answers agree with the
+other engines where 1.8 found them apart.
+
+### Changed
+
+- **Under a clearance a compressible item bears its load on its own footprint**, so its crush
+  check is stricter and `validate` measures its own compressed volume.
+- **A weight is at most `2^63 - 1` ticks, and so is every item's weight times its quantity plus
+  the heaviest tare**: past it, `invalid_request` / `above_maximum`; a weight written as a JSON
+  number past `2^53 - 1` is `invalid_value` and must be a string.
+- **The centre of gravity is checked under a `minimum_support_ratio` above 0:** a placement
+  covering at most half its base with the centroid outside the contact hull is refused.
+  A request without a ratio packs as before.
+- **Agrees with the other engines where 1.8 did not:** nesting under a clearance shares the
+  items' own overlap and a deep nesting column nests in pairs; a length past `2^53 - 1` ticks or
+  a box past `10^30` cubic ticks is `invalid_request` / `above_maximum`; a side that reads as zero
+  ticks is `invalid_value` / `must be positive`; an obstacle box outside its container is
+  `invalid_value` / `lies outside inner_dimensions`, each at its own pointer.
+- **`validate` checks the centroid (`centre_of_gravity_unsupported`) and the whole stack's load
+  (`top_load_exceeded`)**, an item on several bearers shared by contact area. It no longer
+  holds that item's whole weight against every bearer, so it accepts some results 1.8 rejected
+  and names the overloaded bearer.
+- **A plan beam wider than 1 compares every container type**, whatever the node limit.
+- **`exact_small` is 9-28% faster** on the searches that run it (interned item ids, a child's
+  state key extended from its parent's); answers are identical.
+
+### Fixed
+
+- **A container past about `1.7 x 10^32` cubic ticks overflowed**; it is now refused at
+  admission, and a deep nesting column on the lattice no longer returns an answer `validate_json`
+  refuses.
+- **Null obstacle coordinates default to zero**, including additional boxes, as request
+  admission already permits.
+
 ## [1.8.0]
 
 Results now say how far they can be from the best possible answer, `Optimal` means a proof,

@@ -147,6 +147,132 @@ pub(crate) fn measure_ticks(
     unbounded_ticks(value, default_unit, kind).map(|(_, ticks)| ticks)
 }
 
+/// What a measure `measure_ticks` overflowed on is, read exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Overflowed {
+    Negative,
+    /// Its ticks are past the ceiling the caller named.
+    Beyond,
+    /// Unreadable here too, or a vanishing fraction with a vast denominator.
+    Unreadable,
+}
+
+/// Reads over decimal digits a measure `i128` could not hold, to say whether it is negative or
+/// past `ceiling` ticks. Ticks round to nearest, so they pass an odd `ceiling` once
+/// `2 n m >= (2 ceiling + 1) d`; the tie itself rounds up to even. O(digits^2).
+pub(crate) fn overflowed_measure(
+    value: &Value,
+    default_unit: &str,
+    kind: MeasureKind,
+    ceiling: u64,
+) -> Overflowed {
+    let Ok((raw, unit)) = scalar_and_unit(value, default_unit) else {
+        return Overflowed::Unreadable;
+    };
+    let (Some(multiplier), Some((negative, numerator, denominator))) =
+        (kind.multiplier(&unit), exact_fraction(&raw))
+    else {
+        return Overflowed::Unreadable;
+    };
+    if numerator.is_empty() {
+        return Overflowed::Unreadable;
+    }
+    if negative {
+        return Overflowed::Negative;
+    }
+    let doubled = digits_mul(&numerator, &digits_of(2 * multiplier as u128));
+    let threshold = digits_mul(&denominator, &digits_of(2 * u128::from(ceiling) + 1));
+    if digits_cmp(&doubled, &threshold) == Ordering::Less {
+        Overflowed::Unreadable
+    } else {
+        Overflowed::Beyond
+    }
+}
+
+/// `parse_rational` over little-endian decimal digits, without leading zeros: the sign,
+/// numerator and denominator, or `None` for any other text.
+fn exact_fraction(text: &str) -> Option<(bool, Vec<u8>, Vec<u8>)> {
+    let text = text.trim().replace('\u{00a0}', " ");
+    let negative = text.starts_with('-');
+    let signed = |part: &str| digits(part.strip_prefix(['+', '-']).unwrap_or(part));
+    let (numerator, denominator) = if let Some((whole, fraction)) = text.split_once(' ')
+        && let Some((numerator, denominator)) = fraction.split_once('/')
+    {
+        let denominator = digits(denominator.trim())?;
+        let whole = digits_mul(&signed(whole)?, &denominator);
+        (digits_add(&whole, &digits(numerator.trim())?), denominator)
+    } else if let Some((numerator, denominator)) = text.split_once('/') {
+        (signed(numerator.trim())?, digits(denominator.trim())?)
+    } else if let Some((whole, fraction)) = text.split_once('.') {
+        let shifted = format!("{}{fraction}", whole.trim_start_matches(['+', '-']));
+        (
+            digits(&shifted)?,
+            digits(&format!("1{}", "0".repeat(fraction.len())))?,
+        )
+    } else {
+        (signed(&text)?, vec![1])
+    };
+    if denominator.is_empty() {
+        return None;
+    }
+    Some((negative && !numerator.is_empty(), numerator, denominator))
+}
+
+fn digits(text: &str) -> Option<Vec<u8>> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let mut digits: Vec<u8> = text.bytes().rev().map(|byte| byte - b'0').collect();
+    while digits.last() == Some(&0) {
+        digits.pop();
+    }
+    Some(digits)
+}
+
+fn digits_of(value: u128) -> Vec<u8> {
+    digits(&value.to_string()).unwrap_or_default()
+}
+
+fn digits_add(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut sum = Vec::with_capacity(a.len().max(b.len()) + 1);
+    let mut carry = 0;
+    for index in 0..a.len().max(b.len()) {
+        let digit = a.get(index).unwrap_or(&0) + b.get(index).unwrap_or(&0) + carry;
+        sum.push(digit % 10);
+        carry = digit / 10;
+    }
+    if carry > 0 {
+        sum.push(carry);
+    }
+    sum
+}
+
+fn digits_mul(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut product = vec![0_u32; a.len() + b.len()];
+    for (i, &left) in a.iter().enumerate() {
+        for (j, &right) in b.iter().enumerate() {
+            product[i + j] += u32::from(left) * u32::from(right);
+        }
+    }
+    let mut carry = 0;
+    for digit in &mut product {
+        *digit += carry;
+        carry = *digit / 10;
+        *digit %= 10;
+    }
+    let mut product: Vec<u8> = product.into_iter().map(|digit| digit as u8).collect();
+    while product.last() == Some(&0) {
+        product.pop();
+    }
+    product
+}
+
+fn digits_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    a.len()
+        .cmp(&b.len())
+        .then_with(|| a.iter().rev().cmp(b.iter().rev()))
+}
+
 fn scalar_and_unit(value: &Value, default_unit: &str) -> PackResult<(String, String)> {
     match value {
         Value::Object(map) => {
@@ -328,6 +454,112 @@ fn decimal_string(numerator: i128, denominator: i128, places: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VAST: &str = "10000000000000000000000000000000000000000";
+    const CEILING: u64 = (1 << 53) - 1;
+
+    fn overflowed(text: &str) -> Overflowed {
+        overflowed_measure(
+            &Value::String(text.into()),
+            "mm",
+            MeasureKind::Length,
+            CEILING,
+        )
+    }
+
+    #[test]
+    fn every_spelling_of_a_vast_length_is_past_the_ceiling() {
+        for text in [
+            VAST.to_owned(),
+            format!("{VAST}.5"),
+            format!("{VAST}/3"),
+            format!("{VAST} 1/2"),
+            format!("{VAST} cm"),
+            format!("+{VAST}"),
+        ] {
+            assert_eq!(overflowed(&text), Overflowed::Beyond, "{text}");
+        }
+        let object = serde_json::json!({"value": VAST, "unit": "ticks"});
+        assert_eq!(
+            overflowed_measure(&object, "mm", MeasureKind::Length, CEILING),
+            Overflowed::Beyond
+        );
+    }
+
+    #[test]
+    fn a_vast_negative_measure_is_negative() {
+        assert_eq!(overflowed(&format!("-{VAST}")), Overflowed::Negative);
+        assert_eq!(overflowed(&format!("-{VAST} 1/2")), Overflowed::Negative);
+    }
+
+    #[test]
+    fn a_vanishing_or_unreadable_measure_is_neither() {
+        for text in [
+            format!("1/{VAST}"),
+            format!("0/{VAST}"),
+            format!("{VAST}/0"),
+            format!("{VAST}x"),
+            "-0".to_owned(),
+        ] {
+            assert_eq!(overflowed(&text), Overflowed::Unreadable, "{text}");
+        }
+        assert_eq!(
+            overflowed_measure(&Value::Bool(true), "mm", MeasureKind::Length, CEILING),
+            Overflowed::Unreadable
+        );
+        let furlongs = serde_json::json!({"value": VAST, "unit": "furlong"});
+        assert_eq!(
+            overflowed_measure(&furlongs, "mm", MeasureKind::Length, CEILING),
+            Overflowed::Unreadable
+        );
+    }
+
+    #[test]
+    fn the_ceiling_itself_rounds_to_nearest_with_the_tie_to_even() {
+        // MAX + 1/2 ticks rounds to MAX + 1, past the ceiling; MAX + 1/2 - 1/10 does not.
+        let doubled = 2 * u128::from(CEILING) + 1;
+        let tie = format!("{doubled}/2");
+        let ticks = |text: &str| {
+            overflowed_measure(
+                &Value::String(text.into()),
+                "ticks",
+                MeasureKind::Length,
+                CEILING,
+            )
+        };
+        assert_eq!(ticks(&tie), Overflowed::Beyond);
+        assert_eq!(
+            ticks(&format!("{}/20", doubled * 10 - 2)),
+            Overflowed::Unreadable
+        );
+        assert_eq!(digits_add(&[9, 9], &[1]), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn each_unit_is_worth_its_definition_in_ticks() {
+        // 1 in = 25.4 mm, 1 ft = 12 in, 1 lb = 453.59237 g, 1 oz = 1/16 lb.
+        let one = |unit: &str| serde_json::json!({"value": "1", "unit": unit});
+        for (unit, ticks) in [
+            ("mm", 16_000),
+            ("cm", 160_000),
+            ("m", 16_000_000),
+            ("in", 406_400),
+            ("ft", 4_876_800),
+            ("ticks", 1),
+        ] {
+            assert_eq!(Length::parse(&one(unit), "mm").unwrap().0, ticks, "{unit}");
+        }
+        for (unit, ticks) in [
+            ("mg", 8_000),
+            ("g", 8_000_000),
+            ("kg", 8_000_000_000),
+            ("oz", 226_796_185),
+            ("lb", 3_628_738_960),
+            ("ticks", 1),
+        ] {
+            assert_eq!(Weight::parse(&one(unit), "g").unwrap().0, ticks, "{unit}");
+        }
+    }
 
     #[test]
     fn fractional_inches_are_exact() {

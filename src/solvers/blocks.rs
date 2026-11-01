@@ -315,7 +315,7 @@ fn supports(request: &PackingRequest, constraints: &[Arc<dyn PlacementConstraint
 }
 
 /// The share of a member's base that rests on the floor or on a box beneath it.
-fn member_support(placements: &[Placement], origin: Point, envelope: Dimensions) -> f64 {
+fn member_support(supporters: &[Aabb], origin: Point, envelope: Dimensions) -> f64 {
     if origin.z == 0 {
         return 1.0;
     }
@@ -323,10 +323,8 @@ fn member_support(placements: &[Placement], origin: Point, envelope: Dimensions)
         origin,
         dimensions: envelope,
     };
-    let area = placements
+    let area = supporters
         .iter()
-        .map(Placement::envelope_box)
-        .filter(|below| below.z2() == origin.z)
         .map(|below| below.overlap_area_xy(base))
         .sum::<i128>();
     (area as f64 / envelope.base_area() as f64).min(1.0)
@@ -886,6 +884,26 @@ fn place_members(
         .expect("candidate item exists");
     let chosen = available.drain(..members).collect::<Vec<_>>();
     let clearance = request.config.clearance.0;
+    let base_z = block.space.0.origin.z;
+    let supporters = if base_z > 0 && members > 0 {
+        let block_footprint = Aabb {
+            origin: block.space.0.origin,
+            dimensions: Dimensions {
+                length: Length(block.nx * block.envelope.length.0),
+                width: Length(block.ny * block.envelope.width.0),
+                height: block.envelope.height,
+            },
+        };
+        round
+            .packed
+            .placements
+            .iter()
+            .map(Placement::envelope_box)
+            .filter(|below| below.z2() == base_z && below.overlap_area_xy(block_footprint) > 0)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut index = 0;
     for z in 0..block.nz {
         for y in 0..block.ny {
@@ -899,7 +917,7 @@ fn place_members(
                     z: block.space.0.origin.z + z * block.envelope.height.0,
                 };
                 let support_ratio = if z == 0 {
-                    member_support(&round.packed.placements, origin, block.envelope)
+                    member_support(&supporters, origin, block.envelope)
                 } else {
                     1.0
                 };
