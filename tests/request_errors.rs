@@ -586,3 +586,215 @@ fn a_schema_boolean_refuses_anything_but_a_boolean() {
         "/configuration/require_placement_coordinates"
     );
 }
+
+#[test]
+fn a_length_or_a_box_past_the_admission_ceiling_is_refused_where_it_is_spelled() {
+    let too_long = "must be at most 9007199254740991 ticks";
+    let cases: [(Edit, &str, &str, &str); 6] = [
+        (
+            |r| r["items"][0]["dimensions"]["length"] = json!(9_007_199_254_740_992_u64),
+            "above_maximum",
+            "/items/0/dimensions/length",
+            too_long,
+        ),
+        (
+            |r| r["items"][0]["dimensions"]["length"] = json!(-1e20),
+            "negative_measure",
+            "/items/0/dimensions/length",
+            "cannot be negative",
+        ),
+        (
+            |r| r["items"][0]["dimensions"]["length"] = json!(1e20),
+            "above_maximum",
+            "/items/0/dimensions/length",
+            too_long,
+        ),
+        (
+            |r| r["items"][0]["dimensions"]["length"] = json!(-9_007_199_254_740_992_i64),
+            "negative_measure",
+            "/items/0/dimensions/length",
+            "cannot be negative",
+        ),
+        (
+            |r| {
+                let vast = json!({"value": "9007199254740991", "unit": "ticks"});
+                r["containers"][0]["inner_dimensions"] =
+                    json!({"length": vast, "width": vast, "height": vast});
+            },
+            "above_maximum",
+            "/containers/0/inner_dimensions",
+            "must enclose at most 10^30 cubic ticks",
+        ),
+        (
+            |r| {
+                let side = json!({"value": "10000000001", "unit": "ticks"});
+                r["containers"][0]["inner_dimensions"] =
+                    json!({"length": side, "width": side, "height": side});
+            },
+            "above_maximum",
+            "/containers/0/inner_dimensions",
+            "must enclose at most 10^30 cubic ticks",
+        ),
+    ];
+    for (edit, reason, field, detail) in cases {
+        let mut request = base();
+        edit(&mut request);
+        let error = refused(&request);
+        assert_eq!(
+            (error.reason(), error.field(), error.detail()),
+            (reason, field, detail)
+        );
+    }
+}
+
+#[test]
+fn a_side_of_zero_ticks_is_refused_where_it_is_spelled() {
+    for (edit, field) in [
+        (
+            (|r| r["items"][0]["dimensions"]["width"] = json!("0")) as Edit,
+            "/items/0/dimensions/width",
+        ),
+        (
+            |r| r["containers"][0]["inner_dimensions"]["length"] = json!("0.00001"),
+            "/containers/0/inner_dimensions/length",
+        ),
+    ] {
+        let mut request = base();
+        edit(&mut request);
+        let error = refused(&request);
+        assert_eq!(
+            (error.reason(), error.field(), error.detail()),
+            ("invalid_value", field, "must be positive")
+        );
+    }
+}
+
+#[test]
+fn an_obstacle_and_each_of_its_boxes_lie_inside_the_container() {
+    let pillar = |extra: Value| {
+        let mut obstacle = json!({"id": "pillar", "origin": {"x": "150"},
+            "dimensions": {"length": "10", "width": "10", "height": "10"}});
+        obstacle
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        obstacle
+    };
+    for (obstacle, reason, field, detail) in [
+        (
+            pillar(json!({"origin": {"x": "195"}})),
+            "invalid_value",
+            "/containers/0/obstacles/0",
+            "lies outside inner_dimensions",
+        ),
+        (
+            pillar(json!({"additional_boxes": [{"origin": {"z": "195"},
+                "dimensions": {"length": "10", "width": "10", "height": "10"}}]})),
+            "invalid_value",
+            "/containers/0/obstacles/0/additional_boxes/0",
+            "lies outside inner_dimensions",
+        ),
+        (
+            pillar(json!({"additional_boxes": {"origin": {}}})),
+            "wrong_type",
+            "/containers/0/obstacles/0/additional_boxes",
+            "must be a list",
+        ),
+    ] {
+        let mut request = base();
+        request["containers"][0]["obstacles"] = json!([obstacle]);
+        let error = refused(&request);
+        assert_eq!(
+            (error.reason(), error.field(), error.detail()),
+            (reason, field, detail)
+        );
+    }
+    let mut touching = base();
+    touching["containers"][0]["obstacles"] = json!([pillar(json!({"origin": {"x": "190"},
+        "additional_boxes": [{"dimensions": {"length": "10", "width": "10", "height": "10"}}]}))]);
+    pack_json(&touching.to_string()).expect("an obstacle touching the far wall is admitted");
+}
+
+#[test]
+fn null_obstacle_coordinates_default_to_zero() {
+    for additional in [false, true] {
+        for axis in ["x", "y", "z"] {
+            let mut request = base();
+            let mut box_ =
+                json!({"origin": {}, "dimensions": {"length": "1", "width": "1", "height": "1"}});
+            box_["origin"][axis] = Value::Null;
+            let obstacle = if additional {
+                json!({"id": "o", "dimensions": {"length": "1", "width": "1", "height": "1"}, "additional_boxes": [box_]})
+            } else {
+                box_["id"] = json!("o");
+                box_
+            };
+            request["containers"][0]["obstacles"] = json!([obstacle]);
+            pack_json(&request.to_string()).expect("a null optional coordinate means zero");
+        }
+    }
+}
+
+/// R19-01: a weight is at most `i64::MAX` ticks, read exactly even past `i128`; one written as a
+/// JSON number past 2^53 - 1 is a string's job; and the request's total weight is bounded too.
+#[test]
+fn a_weight_past_a_signed_64_bit_integer_is_refused_at_its_pointer() {
+    let detail = "must be at most 9223372036854775807 ticks";
+    let cases: [(Value, (&str, &str, &str)); 6] = [
+        (
+            json!({ "value": "9223372036854775808", "unit": "ticks" }),
+            ("above_maximum", "/items/0/weight", detail),
+        ),
+        (
+            json!("1e40"),
+            ("wrong_type", "/items/0/weight", "must be a measure"),
+        ),
+        (
+            json!({ "value": "1000000000000000000000000000000000000000", "unit": "ticks" }),
+            ("above_maximum", "/items/0/weight", detail),
+        ),
+        (
+            json!({ "value": "-1000000000000000000000000000000000000000", "unit": "ticks" }),
+            ("negative_measure", "/items/0/weight", "cannot be negative"),
+        ),
+        (
+            json!({ "value": 9_007_199_254_740_993_u64, "unit": "ticks" }),
+            (
+                "invalid_value",
+                "/items/0/weight",
+                "must be written as a string past 9007199254740991",
+            ),
+        ),
+        (
+            json!({ "value": -9_007_199_254_740_993_i64, "unit": "ticks" }),
+            ("negative_measure", "/items/0/weight", "cannot be negative"),
+        ),
+    ];
+    for (weight, (reason, field, message)) in cases {
+        let mut request = base();
+        request["items"][0]["weight"] = weight.clone();
+        let error = refused(&request);
+        assert_eq!((error.reason(), error.field()), (reason, field), "{weight}");
+        assert!(error.to_string().ends_with(message), "{weight}: {error}");
+    }
+}
+
+#[test]
+fn every_item_weight_times_its_quantity_and_the_heaviest_tare_fit_the_ceiling() {
+    let mut request = base();
+    request["items"][0]["weight"] = json!({ "value": (1_u64 << 62).to_string(), "unit": "ticks" });
+    request["items"][0]["quantity"] = json!(2.0);
+    let error = refused(&request);
+    assert_eq!((error.reason(), error.field()), ("above_maximum", "/items"));
+    assert!(
+        error.to_string().ends_with(
+            "must weigh at most 9223372036854775807 ticks in all, with the heaviest tare"
+        )
+    );
+    request["items"][0]["weight"] =
+        json!({ "value": ((1_u64 << 62) - 1).to_string(), "unit": "ticks" });
+    request["containers"][0]["tare_weight"] = json!({ "value": "1", "unit": "ticks" });
+    assert!(pack_json(&request.to_string()).is_ok());
+    request["containers"][0]["tare_weight"] = json!({ "value": "2", "unit": "ticks" });
+    assert_eq!(refused(&request).field(), "/items");
+}

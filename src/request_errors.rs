@@ -11,7 +11,7 @@ use crate::canonical_json::{MAX_EXACT_MAGNITUDE, json_integer, json_spelling, sp
 use crate::error::RequestError;
 use crate::fixed::unknown_keys;
 use crate::made_to_measure::MadeToMeasure;
-use crate::units::{MeasureKind, measure_ticks};
+use crate::units::{MeasureKind, Overflowed, measure_ticks, overflowed_measure};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 
@@ -84,6 +84,14 @@ const CONFIGURATION_FIELDS: [&str; 20] = [
     "time_limit_ms",
 ];
 const SIDES: [&str; 3] = ["length", "width", "height"];
+/// The admission ceiling every engine refuses past: a length is a tick count
+/// every engine holds exactly, JavaScript's `Number` included, and a box encloses no more than
+/// the bound path can sum, so `volume x 10^6` stays inside `i128`.
+const MAX_LENGTH_TICKS: u64 = MAX_EXACT_MAGNITUDE;
+const MAX_VOLUME_TICKS3: i128 = 10_i128.pow(30);
+/// A weight, and every item's weight times its quantity plus the heaviest tare, fit an `i64`,
+/// which is how the search adds a container's payload (R19-01).
+const MAX_WEIGHT_TICKS: u64 = i64::MAX as u64;
 /// The item fields the request schema types `boolean`, in schema order.
 const ITEM_BOOLEANS: [&str; 3] = ["keep_upright", "stackable", "must_be_on_floor"];
 const AXES: [&str; 3] = ["x", "y", "z"];
@@ -106,7 +114,37 @@ pub(crate) fn check_request(data: &Value) -> Checked<&str> {
         check_container(raw, &join("/containers", &index.to_string()), unit)?;
     }
     require_unique_ids(containers, "containers")?;
+    total_weight(items, containers)?;
     Ok(unit)
+}
+
+/// Every item's weight times its quantity, plus the heaviest tare, against `MAX_WEIGHT_TICKS`:
+/// no container's gross weight can pass it. Each value was admitted above. O(items + containers).
+fn total_weight(items: &[Value], containers: &[Value]) -> Checked {
+    let ticks = |holder: &Value, name: &str| {
+        present(holder.get(name))
+            .and_then(|value| measure_ticks(value, "g", MeasureKind::Weight).ok())
+            .unwrap_or(0)
+    };
+    let heaviest_tare = containers
+        .iter()
+        .map(|container| ticks(container, "tare_weight"))
+        .max()
+        .unwrap_or(0);
+    let total = items.iter().fold(heaviest_tare, |total, item| {
+        let quantity = present(item.get("quantity"))
+            .and_then(json_integer)
+            .map_or(1, i128::from);
+        total.saturating_add(ticks(item, "weight").saturating_mul(quantity))
+    });
+    if total > i128::from(MAX_WEIGHT_TICKS) {
+        return Err(RequestError::new(
+            "above_maximum",
+            "/items",
+            format!("must weigh at most {MAX_WEIGHT_TICKS} ticks in all, with the heaviest tare"),
+        ));
+    }
+    Ok(())
 }
 
 /// `base` extended by one RFC 6901 reference token, escaping `~` and `/` in it.
@@ -328,7 +366,7 @@ fn check_container(raw: &Value, at: &str, unit: &str) -> Checked {
     optional(container, "tag_limits", at, tag_limits)?;
     optional(container, "rate_table", at, rate_table)?;
     optional(container, "obstacles", at, |value, field| {
-        obstacles(value, field, unit)
+        obstacles(value, field, unit, inner_ticks(container, unit))
     })?;
     optional(container, "deformable_boundary", at, |value, field| {
         deformable_boundary(container, value, field, at)
@@ -364,7 +402,7 @@ fn made_to_measure(
     }
     for name in ["minimum", "increment", "outer_allowance"] {
         optional(machine, name, field, |value, at| {
-            dimensions(value, at, unit)
+            sides(value, at, unit, false)
         })?;
     }
     optional(
@@ -493,14 +531,36 @@ fn set_beside_a_bag(name: &str, value: Option<&Value>) -> bool {
 }
 
 fn dimensions(raw: &Value, at: &str, unit: &str) -> Checked {
+    sides(raw, at, unit, true)
+}
+
+/// A box's three sides, each a measure; a box that holds or is something has no empty side
+///, while a made-to-measure step states its own rule for zero.
+fn sides(raw: &Value, at: &str, unit: &str, positive: bool) -> Checked {
     let sides = object(raw, at)?;
+    let mut volume = Some(1_i128);
     for side in SIDES {
-        measure(
-            required(sides, side, at)?,
-            &join(at, side),
-            MeasureKind::Length,
-            unit,
-        )?;
+        let value = required(sides, side, at)?;
+        let field = join(at, side);
+        measure(value, &field, MeasureKind::Length, unit)?;
+        let ticks = measure_ticks(value, unit, MeasureKind::Length).ok();
+        if positive && ticks == Some(0) {
+            return Err(RequestError::new(
+                "invalid_value",
+                field,
+                "must be positive",
+            ));
+        }
+        volume = volume
+            .zip(ticks)
+            .and_then(|(volume, ticks)| volume.checked_mul(ticks));
+    }
+    if volume.is_none_or(|volume| volume > MAX_VOLUME_TICKS3) {
+        return Err(RequestError::new(
+            "above_maximum",
+            at,
+            "must enclose at most 10^30 cubic ticks",
+        ));
     }
     Ok(())
 }
@@ -532,23 +592,65 @@ fn rate_table(raw: &Value, at: &str) -> Checked {
     Ok(())
 }
 
-fn obstacles(raw: &Value, at: &str, unit: &str) -> Checked {
+fn obstacles(raw: &Value, at: &str, unit: &str, inner: [i128; 3]) -> Checked {
     for (index, entry) in list(raw, at)?.iter().enumerate() {
         let here = join(at, &index.to_string());
         let obstacle = object(entry, &here)?;
-        if let Some(origin) = present(obstacle.get("origin")) {
-            let origin_at = join(&here, "origin");
-            let point = object(origin, &origin_at)?;
-            for axis in AXES {
-                optional(point, axis, &origin_at, |value, field| {
-                    measure(value, field, MeasureKind::Length, unit)
-                })?;
+        placed_box(obstacle, &here, unit, inner)?;
+        if let Some(extra) = present(obstacle.get("additional_boxes")) {
+            let boxes = join(&here, "additional_boxes");
+            for (position, part) in list(extra, &boxes)?.iter().enumerate() {
+                let part_at = join(&boxes, &position.to_string());
+                placed_box(object(part, &part_at)?, &part_at, unit, inner)?;
             }
         }
-        let sides = required(obstacle, "dimensions", &here)?;
-        dimensions(sides, &join(&here, "dimensions"), unit)?;
     }
     Ok(())
+}
+
+/// An optional `origin` and required `dimensions`: an obstacle, or one more box of it
+///, whose measures are read in the request's unit like every other length, and
+/// which lies inside the container.
+fn placed_box(entry: &Map<String, Value>, here: &str, unit: &str, inner: [i128; 3]) -> Checked {
+    let origin = present(entry.get("origin"));
+    if let Some(origin) = origin {
+        let origin_at = join(here, "origin");
+        let point = object(origin, &origin_at)?;
+        for axis in AXES {
+            optional(point, axis, &origin_at, |value, field| {
+                measure(value, field, MeasureKind::Length, unit)
+            })?;
+        }
+    }
+    let sides = required(entry, "dimensions", here)?;
+    dimensions(sides, &join(here, "dimensions"), unit)?;
+    let ticks = |value: Option<&Value>| {
+        value.map_or(0, |value| {
+            measure_ticks(value, unit, MeasureKind::Length).unwrap_or(0)
+        })
+    };
+    for (index, axis) in AXES.iter().enumerate() {
+        let start = ticks(origin.and_then(|origin| present(origin.get(*axis))));
+        if start + ticks(sides.get(SIDES[index])) > inner[index] {
+            return Err(RequestError::new(
+                "invalid_value",
+                here,
+                "lies outside inner_dimensions",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A container's inner sides in ticks, already checked by the time its obstacles are.
+fn inner_ticks(container: &Map<String, Value>, unit: &str) -> [i128; 3] {
+    SIDES.map(|side| {
+        container
+            .get("inner_dimensions")
+            .and_then(|sides| sides.get(side))
+            .and_then(|value| measure_ticks(value, unit, MeasureKind::Length).ok())
+            .unwrap_or(0)
+    })
 }
 
 /// Checked once every entry is well formed, so the later of two equal ids is the one named.
@@ -656,26 +758,100 @@ fn access_directions(raw: &Value, at: &str) -> Checked {
     each_one_of(raw, at, &ACCESS_DIRECTIONS)
 }
 
-/// A measure is an integer, a string or `{value, unit}`, in a known unit, and never negative.
+/// A measure is an integer, a string or `{value, unit}`, in a known unit, and never negative;
+/// a length is at most `MAX_LENGTH_TICKS` and a weight at most `MAX_WEIGHT_TICKS`.
 fn measure(value: &Value, field: &str, kind: MeasureKind, unit: &str) -> Checked {
+    let length = kind == MeasureKind::Length;
     match value {
         // A fraction in binary floating point is not the decimal the caller wrote.
-        Value::Number(number) if number.is_f64() && json_integer(value).is_none() => {
+        Value::Number(number)
+            if number.is_f64()
+                && json_integer(value).is_none()
+                && whole_beyond_exact(value).is_none() =>
+        {
             return Err(wrong_type(field, "must be a measure"));
         }
         Value::Number(_) | Value::String(_) => {}
         Value::Object(map) => require_measure_unit(map, field, kind, unit)?,
         _ => return Err(wrong_type(field, "must be a measure")),
     }
-    match measure_ticks(value, unit, kind) {
-        Ok(ticks) if ticks < 0 => Err(RequestError::new(
-            "negative_measure",
-            field,
-            "cannot be negative",
-        )),
-        Ok(_) => Ok(()),
-        Err(_) => Err(wrong_type(field, "must be a measure")),
+    let amount = value.get("value").unwrap_or(value);
+    // Past 2^53 - 1 a JSON number is the same whole number to every engine however its parser
+    // stored it, and its ticks are past the ceiling in every unit.
+    if length && let Some(negative) = whole_beyond_exact(amount) {
+        return Err(if negative {
+            negative_measure(field)
+        } else {
+            too_long(field)
+        });
     }
+    // Past 2^53 - 1 JavaScript has already rounded a JSON number before it reads it, so a
+    // weight that large is written as a string, which every engine reads exactly.
+    if !length && let Some(negative) = whole_beyond_exact(amount) {
+        return Err(if negative {
+            negative_measure(field)
+        } else {
+            RequestError::new(
+                "invalid_value",
+                field,
+                format!("must be written as a string past {MAX_EXACT_MAGNITUDE}"),
+            )
+        });
+    }
+    let ceiling = if length {
+        MAX_LENGTH_TICKS
+    } else {
+        MAX_WEIGHT_TICKS
+    };
+    match measure_ticks(value, unit, kind) {
+        Ok(ticks) if ticks < 0 => Err(negative_measure(field)),
+        Ok(ticks) if ticks > i128::from(ceiling) => Err(beyond(field, kind)),
+        Ok(_) => Ok(()),
+        Err(_) => match overflowed_measure(value, unit, kind, ceiling) {
+            Overflowed::Negative => Err(negative_measure(field)),
+            Overflowed::Beyond => Err(beyond(field, kind)),
+            Overflowed::Unreadable => Err(wrong_type(field, "must be a measure")),
+        },
+    }
+}
+
+fn beyond(field: &str, kind: MeasureKind) -> RequestError {
+    match kind {
+        MeasureKind::Length => too_long(field),
+        MeasureKind::Weight => RequestError::new(
+            "above_maximum",
+            field,
+            format!("must be at most {MAX_WEIGHT_TICKS} ticks"),
+        ),
+    }
+}
+
+/// `Some(is negative)` for a whole JSON number past 2^53 - 1.
+fn whole_beyond_exact(value: &Value) -> Option<bool> {
+    let Value::Number(number) = value else {
+        return None;
+    };
+    let beyond = if let Some(integer) = number.as_i64() {
+        integer.unsigned_abs() > MAX_EXACT_MAGNITUDE
+    } else if let Some(integer) = number.as_u64() {
+        integer > MAX_EXACT_MAGNITUDE
+    } else {
+        let float = number.as_f64()?;
+        float.is_finite() && float.fract() == 0.0 && float.abs() > MAX_EXACT_MAGNITUDE as f64
+    };
+    beyond.then(|| number.as_f64().is_some_and(|float| float < 0.0))
+}
+
+fn negative_measure(field: &str) -> RequestError {
+    RequestError::new("negative_measure", field, "cannot be negative")
+}
+
+fn too_long(field: &str) -> RequestError {
+    RequestError::new(
+        "above_maximum",
+        field,
+        format!("must be at most {MAX_LENGTH_TICKS} ticks"),
+    )
 }
 
 fn require_measure_unit(

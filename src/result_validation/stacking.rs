@@ -175,6 +175,16 @@ pub(crate) fn check_support_and_load(
                         fixed6(required.to_f64())
                     ),
                 ));
+            } else if mul(area, 2)? <= envelope.base_area
+                && !centroid_supported(
+                    envelope,
+                    supporting.iter().map(|(lower, _)| &list[*lower].1.envelope),
+                )?
+            {
+                issues.push(Issue::new(
+                    "centre_of_gravity_unsupported",
+                    format!("{item_id}: centroid outside its support hull"),
+                ));
             }
         }
         for (lower, _) in supporting {
@@ -194,17 +204,6 @@ pub(crate) fn check_support_and_load(
                 issues.push(Issue::new(
                     "stacking_group_incompatible",
                     format!("{item_id} rests on {lower_id}"),
-                ));
-            }
-            if let Some(limit) = lower_spec.max_top_load
-                && spec.weight > limit
-            {
-                issues.push(Issue::new(
-                    "top_load_exceeded",
-                    format!(
-                        "{item_id} ({} ticks) on {lower_id} (limit {limit})",
-                        spec.weight
-                    ),
                 ));
             }
         }
@@ -233,6 +232,63 @@ pub(crate) fn check_support_and_load(
         }
     }
     Ok(())
+}
+
+type Point2 = (i128, i128);
+
+/// Whether the base centroid lies in the convex hull of the contact areas, the rule
+/// the searches apply once a support ratio is enforced; reached only at or below half the
+/// base, where it can refuse. Coordinates are doubled so the centroid is an integer
+/// for odd extents; every product is checked. The corners come four to a positive-area
+/// overlap, so the hull is empty or has at least three vertices. `O(s log s)` time and `O(s)`
+/// space for `s` supporters.
+fn centroid_supported<'c>(
+    envelope: &Cuboid,
+    surfaces: impl Iterator<Item = &'c Cuboid>,
+) -> Res<bool> {
+    let mut points: Vec<Point2> = Vec::new();
+    for surface in surfaces {
+        for x in [envelope.x.max(surface.x), envelope.x2.min(surface.x2)] {
+            for y in [envelope.y.max(surface.y), envelope.y2.min(surface.y2)] {
+                points.push((mul(x, 2)?, mul(y, 2)?));
+            }
+        }
+    }
+    points.sort_unstable();
+    points.dedup();
+    let mut hull = half_hull(points.iter().copied())?;
+    hull.extend(half_hull(points.iter().rev().copied())?);
+    let centroid = (add(envelope.x, envelope.x2)?, add(envelope.y, envelope.y2)?);
+    if hull.is_empty() {
+        return Ok(false);
+    }
+    for index in 0..hull.len() {
+        if cross(hull[index], hull[(index + 1) % hull.len()], centroid)? < 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// One half of Andrew's monotone chain, its last point dropped for the other half to close.
+fn half_hull(order: impl Iterator<Item = Point2>) -> Res<Vec<Point2>> {
+    let mut chain: Vec<Point2> = Vec::new();
+    for point in order {
+        while chain.len() >= 2 && cross(chain[chain.len() - 2], chain[chain.len() - 1], point)? <= 0
+        {
+            chain.pop();
+        }
+        chain.push(point);
+    }
+    chain.pop();
+    Ok(chain)
+}
+
+fn cross(o: Point2, a: Point2, b: Point2) -> Res<i128> {
+    sub(
+        mul(sub(a.0, o.0)?, sub(b.1, o.1)?)?,
+        mul(sub(a.1, o.1)?, sub(b.0, o.0)?)?,
+    )
 }
 
 fn check_ground_contact(
@@ -330,6 +386,31 @@ fn pressure(load: i128, base_area: i128) -> Res<Ratio> {
         .mul(Ratio::new(1, base_area)?)
 }
 
+/// `max_top_load` against the whole stack an item bears, as every engine checks it.
+/// The only top-load rule since 1.9.0: an item resting on several bearers shares its
+/// weight among them by contact area. `O(n)` over the loads `propagate_load` built.
+pub(crate) fn check_stack_top_load(
+    envelopes: &Envelopes<'_>,
+    loads: &[i128],
+    issues: &mut Vec<Issue>,
+) {
+    for (index, (item_id, entry)) in entries(envelopes).iter().enumerate() {
+        let Some(limit) = entry.spec.and_then(|spec| spec.max_top_load) else {
+            continue;
+        };
+        if loads[index] > limit {
+            issues.push(Issue::new(
+                "top_load_exceeded",
+                format!(
+                    "{} bears {} ticks (limit {limit})",
+                    py_str(item_id),
+                    loads[index]
+                ),
+            ));
+        }
+    }
+}
+
 /// No `compressible` item may carry more pressure than it declared.
 pub(crate) fn check_crush(
     packed_id: &Label,
@@ -344,7 +425,8 @@ pub(crate) fn check_crush(
         else {
             continue;
         };
-        let pressure = pressure(loads[index], entry.envelope.base_area)?;
+        let [length, width, _] = physical_sides(entry.placement)?;
+        let pressure = pressure(loads[index], mul(length, width)?)?;
         if pressure.compare_int(limit)? == Ordering::Greater {
             issues.push(Issue::new(
                 "crush_violation",
@@ -359,11 +441,29 @@ pub(crate) fn check_crush(
     Ok(())
 }
 
+/// The placed item's own sides, without the clearance its envelope adds.
+fn physical_sides(placement: &Json) -> Res<[i128; 3]> {
+    let dimensions = placement.at("dimensions")?;
+    let side = |name: &str| -> Res<i128> {
+        dimensions
+            .at(name)?
+            .at("ticks")?
+            .int("a placement dimension")
+    };
+    Ok([side("length")?, side("width")?, side("height")?])
+}
+
 /// Occupied height under load, rounded up, never below one tick. A crushed item keeps its
-/// height: `check_crush` already reports it.
-pub(crate) fn compressed_height(envelope: &Cuboid, spec: &ItemSpec, load: i128) -> Res<i128> {
+/// height: `check_crush` already reports it. The load presses on the item itself, so the
+/// footprint and the height are its own, not its envelope's.
+pub(crate) fn compressed_height(
+    height: i128,
+    footprint: i128,
+    spec: &ItemSpec,
+    load: i128,
+) -> Res<i128> {
     let Some(limit) = spec.max_compression_pressure_kpa else {
-        return Ok(envelope.height);
+        return Ok(height);
     };
     // The reference asserts the pair: a pressure limit without a ratio is not a request it reads.
     let ratio_ppm = spec.compression_ratio_ppm.ok_or_else(|| {
@@ -372,13 +472,13 @@ pub(crate) fn compressed_height(envelope: &Cuboid, spec: &ItemSpec, load: i128) 
             spec.id
         ))
     })?;
-    let pressure = pressure(load, envelope.base_area)?;
+    let pressure = pressure(load, footprint)?;
     if pressure.compare_int(limit)? == Ordering::Greater || limit == 0 {
-        return Ok(envelope.height);
+        return Ok(height);
     }
     let divisor = mul(mul(limit, 1_000_000)?, pressure.denominator)?;
     let retained = sub(divisor, mul(ratio_ppm, pressure.numerator)?)?;
-    Ok(ceil_div(mul(envelope.height, retained)?, divisor)?.max(1))
+    Ok(ceil_div(mul(height, retained)?, divisor)?.max(1))
 }
 
 /// Weight per square metre of an item's own base, at every level of the stack.
@@ -563,10 +663,9 @@ pub(crate) fn occupied_volume(
 ) -> Res<i128> {
     if let Some(spec) = spec {
         if spec.max_compression_pressure_kpa.is_some() {
-            return mul(
-                entry_envelope.base_area,
-                compressed_height(entry_envelope, spec, load)?,
-            );
+            let [length, width, height] = physical_sides(placement)?;
+            let footprint = mul(length, width)?;
+            return mul(footprint, compressed_height(height, footprint, spec, load)?);
         }
         if spec.is_convex_hull()
             && let Some(vertices) = &spec.hull_vertices
@@ -577,14 +676,8 @@ pub(crate) fn occupied_volume(
     }
     let solid = placed_hull(entry_envelope, placement, spec)?;
     if solid == entry_envelope.vertices() {
-        let dimensions = placement.at("dimensions")?;
-        let side = |name: &str| -> Res<i128> {
-            dimensions
-                .at(name)?
-                .at("ticks")?
-                .int("a placement dimension")
-        };
-        return mul(mul(side("length")?, side("width")?)?, side("height")?);
+        let [length, width, height] = physical_sides(placement)?;
+        return mul(mul(length, width)?, height);
     }
     hull_volume(&solid)
 }

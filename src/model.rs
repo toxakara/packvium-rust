@@ -265,7 +265,7 @@ pub fn crushed(placements: &[Placement], loads: &[i128]) -> Option<(String, Stri
         let Some(limit) = item.max_compression_pressure_kpa else {
             continue;
         };
-        if crush_exceeded(limit, *load, placement.envelope_dimensions.base_area()) {
+        if crush_exceeded(limit, *load, placement.dimensions.base_area()) {
             return Some(("crush_violation".into(), placement.instance.id()));
         }
     }
@@ -984,10 +984,7 @@ impl PackedContainer {
         for (index, placement) in self.placements.iter().enumerate() {
             for other in self.placements.iter().skip(index + 1) {
                 if valid_nesting(placement, other) {
-                    overlap = overlap.saturating_add(
-                        placement.instance.item.nesting_height.unwrap_or_default().0 as i128
-                            * placement.envelope_dimensions.base_area(),
-                    );
+                    overlap = overlap.saturating_add(nested_overlap(placement, other));
                 }
             }
         }
@@ -1358,6 +1355,43 @@ pub fn axle_admits_alone(container: &Container, item_weight: Weight, envelope_le
 
 fn ceil_div(a: i128, b: i128) -> i128 {
     -(-a).div_euclid(b)
+}
+
+/// The physical space a valid nesting pair shares. The pair sinks by `nesting_height`
+/// envelope to envelope, so under a clearance the items themselves overlap by twice the
+/// clearance less, over their own footprint rather than the envelope's. Equal to
+/// `nesting_height x base area` with no clearance. `O(1)`.
+pub fn nested_overlap(lower: &Placement, upper: &Placement) -> i128 {
+    let (a, b) = (lower.box_(), upper.box_());
+    let height = i128::from(a.z2().min(b.z2()) - a.origin.z.max(b.origin.z));
+    if height > 0 {
+        a.overlap_area_xy(b).saturating_mul(height)
+    } else {
+        0
+    }
+}
+
+/// The bottom of layer `layer` in a column of identical envelopes `height` tall that each sink
+/// `nesting` into the one beneath. Only a directly adjacent pair may overlap:
+/// once `2 x nesting > height` a third copy sunk into the second would reach into the first,
+/// so the column nests in pairs, the third resting on the pair. `O(1)`.
+pub(crate) fn column_layer_z(layer: i64, height: i64, nesting: i64) -> i64 {
+    if 2 * nesting <= height {
+        return layer * (height - nesting);
+    }
+    layer / 2 * (2 * height - nesting) + layer % 2 * (height - nesting)
+}
+
+/// How many layers `column_layer_z` fits under `room`. `O(1)`.
+pub(crate) fn column_layers(room: i64, height: i64, nesting: i64) -> i64 {
+    if room < height {
+        return 0;
+    }
+    if 2 * nesting <= height {
+        return (room - height) / (height - nesting) + 1;
+    }
+    let pair = 2 * height - nesting;
+    2 * (room / pair) + i64::from(room % pair >= height)
 }
 
 pub fn valid_nesting(a: &Placement, b: &Placement) -> bool {
@@ -2294,5 +2328,25 @@ mod tests {
             occupied_volume(&placement),
             SIDE as i128 * SIDE as i128 * SIDE as i128 / 2
         );
+    }
+
+    #[test]
+    fn a_nest_deeper_than_half_the_height_goes_in_pairs() {
+        // 120-tick cups nesting 100: a third sunk into the second would reach the first.
+        let bottoms: Vec<i64> = (0..5)
+            .map(|layer| column_layer_z(layer, 120, 100))
+            .collect();
+        assert_eq!(bottoms, [0, 20, 140, 160, 280]);
+        assert_eq!(column_layers(400, 120, 100), 5);
+        assert_eq!(column_layers(399, 120, 100), 4);
+        assert_eq!(column_layers(119, 120, 100), 0);
+    }
+
+    #[test]
+    fn a_nest_of_at_most_half_the_height_chains_every_layer() {
+        let bottoms: Vec<i64> = (0..3).map(|layer| column_layer_z(layer, 100, 50)).collect();
+        assert_eq!(bottoms, [0, 50, 100]);
+        assert_eq!(column_layers(200, 100, 50), 3);
+        assert_eq!(column_layers(280, 100, 40), 4);
     }
 }

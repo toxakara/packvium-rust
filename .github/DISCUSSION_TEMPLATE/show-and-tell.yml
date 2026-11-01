@@ -16,7 +16,7 @@ body:
     id: package-version
     attributes:
       label: Package and version
-      placeholder: "packvium 1.8.0 (Rust)"
+      placeholder: "packvium 1.9.0 (Rust)"
     validations:
       required: false
   - type: textarea

@@ -239,6 +239,9 @@ All counters are non-negative integers. A zero means the selected solver did not
 that phase; it does not mean the metric is unsupported. Compatibility fields
 `algorithm.placements_attempted` and `algorithm.candidates_evaluated` remain and must
 equal `metrics.orientations_considered` and `metrics.feasible_candidates`.
+For a multi-start portfolio these counters belong to the selected start; the complete
+list of starts is recorded separately in `termination.starts`. Counters are not summed
+across starts.
 Metrics are diagnostics: they never participate in feasibility, ranking or the
 objective vector.
 
@@ -469,9 +472,9 @@ bounds its work by counting must get the same answer on any machine, and a start
 own share of the clock would lose quietly, with no flag saying the answer depended on the
 machine's speed. When the clock does fire, the portfolio-wide deadline is reached and
 `time_limit_reached` is true. Rust and the JavaScript fallback always run their starts against
-the one portfolio deadline. Each start keeps its own counters against the whole budget in
-Python, PHP and Rust; the JavaScript fallback hands each later start what the earlier ones
-left of one budget, so the same number buys less search there.
+the one portfolio deadline. Each start keeps its own counters against the whole budget, in all
+four engines; until 1.9.0 the JavaScript fallback handed each later start what the earlier ones
+left of one budget, so the same number bought less search there.
 
 **Read `any_start_truncated` when the answer must not depend on the budget.** The selected
 start can finish while another start, one that might have won, was stopped by the budget; the

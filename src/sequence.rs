@@ -522,8 +522,10 @@ pub fn replay_loading_order(
 /// Independently reuse the exact constraint calculations already proven for
 /// a finished scene (`validation::validate_top_loads_with_graph`,
 /// `validate_stack_counts_with_graph`, `ground_contact_valid_with_graph`) against every
-/// loading *prefix*, not only the final state. Each prefix builds its contact graph once
-/// and the three checks share it.
+/// loading *prefix*, not only the final state. A prefix whose new box is a floor box with
+/// nothing nested yet and no placed box resting on its top plane adds no contact edge, so
+/// it leaves every earlier load unchanged and only its own density can fail; any other
+/// prefix builds its contact graph once and the three checks share it.
 /// Additive to `replay_loading_order` above rather than a change to it or to any of
 /// the bare-geometry functions in this module, so every existing caller keeps working
 /// unmodified.
@@ -552,6 +554,28 @@ pub fn verify_loading_prefix_business_rules(
             reason: "order is not a permutation of every placement index exactly once",
         });
     }
+    if placements.is_empty() {
+        return Ok(());
+    }
+    let has_load_rules = container.max_stack_density.is_some()
+        || placements.iter().any(|placement| {
+            let item = &placement.instance.item;
+            !item.stackable
+                || !item.accepts_stacking_groups.is_empty()
+                || item.max_top_load.is_some()
+                || item.max_stacked_items.is_some()
+                || item.max_compression_pressure_kpa.is_some()
+        });
+    let has_ground_rules = placements.iter().any(|placement| {
+        placement.envelope_origin.z != 0
+            && !matches!(
+                placement.instance.item.ground_contact_rule.as_deref(),
+                None | Some("free")
+            )
+    });
+    if !has_load_rules && !has_ground_rules {
+        return Ok(());
+    }
     let mut scratch = PackedContainer {
         container: container.clone(),
         sequence: 0,
@@ -559,17 +583,50 @@ pub fn verify_loading_prefix_business_rules(
         lattice_summary: None,
         lattice_items: Vec::new(),
     };
+    let mut elevated_bases = BTreeSet::new();
+    let mut any_nesting = false;
     for (step, index) in order.iter().copied().enumerate() {
-        scratch.placements.push(placements[index].clone());
+        let candidate = &placements[index];
+        scratch.placements.push(candidate.clone());
+        let candidate_box = candidate.envelope_box();
+        if candidate_box.origin.z != 0 {
+            elevated_bases.insert(candidate_box.origin.z);
+        }
+        if candidate.instance.item.nesting_height.is_some() {
+            any_nesting = true;
+        }
+        let isolated_floor_step = candidate_box.origin.z == 0
+            && !any_nesting
+            && !elevated_bases.contains(&candidate_box.z2());
+        if isolated_floor_step {
+            if let Some(maximum) = container.max_stack_density {
+                const SQUARE_METRE_TICKS: i128 = 16_000_000_i128 * 16_000_000_i128;
+                let total = candidate.instance.item.weight.0 as i128;
+                if total.saturating_mul(SQUARE_METRE_TICKS)
+                    > (maximum.0 as i128).saturating_mul(candidate.envelope_dimensions.base_area())
+                {
+                    return Err(SequenceError::Replay {
+                        index: index as isize,
+                        step: step as isize,
+                        reason: "stack_density_exceeded",
+                    });
+                }
+            }
+            continue;
+        }
         let graph = crate::contact_graph::ContactGraph::from_placements(&scratch.placements);
         let mut issues = Vec::new();
-        crate::validation::validate_top_loads_with_graph(&scratch, &graph, &mut issues);
-        crate::validation::validate_stack_counts_with_graph(&scratch, &graph, &mut issues);
-        if !crate::validation::ground_contact_valid_with_graph(
-            &scratch,
-            scratch.placements.len() - 1,
-            &graph,
-        ) {
+        if has_load_rules {
+            crate::validation::validate_top_loads_with_graph(&scratch, &graph, &mut issues);
+            crate::validation::validate_stack_counts_with_graph(&scratch, &graph, &mut issues);
+        }
+        if has_ground_rules
+            && !crate::validation::ground_contact_valid_with_graph(
+                &scratch,
+                scratch.placements.len() - 1,
+                &graph,
+            )
+        {
             issues.push(crate::validation::ValidationIssue {
                 code: "ground_contact_violation".into(),
                 message: scratch

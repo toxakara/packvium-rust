@@ -28,6 +28,7 @@ mod sequence;
 mod solver;
 mod solvers;
 mod spatial_index;
+mod support_polygon;
 mod units;
 mod validation;
 mod value_text;

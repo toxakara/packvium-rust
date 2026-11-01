@@ -8,7 +8,7 @@
 //! down and then prices against it.
 
 use packvium_core::commerce::catalog::{CatalogRegistry, Snapshot};
-use packvium_core::commerce::policy::{PolicyOperator, Predicate};
+use packvium_core::commerce::policy::{PolicyAction, PolicyOperator, Predicate, Rule, decide};
 use packvium_core::commerce::rating::AccessorialCharge;
 use packvium_core::commerce::{
     PolicyScope, catalog_version_info_json, evaluate_policy_json, quote_json,
@@ -617,17 +617,12 @@ fn value_equality_covers_every_scalar_pairing() {
     // Cross-type pairs that share no arm at all.
     assert!(!matches(json!("1"), json!(1)));
     assert!(!matches(json!(null), json!(0)));
-    assert!(
-        !matches(json!({"a": 1}), json!({"a": 1})),
-        "objects are never equal"
-    );
 }
 
-/// `in` accepts a list or a substring search, and must refuse anything else rather than
-/// guessing. A number haystack silently reading as "no match" is correct; reading as a
-/// panic or as a match is not.
+/// Membership supports list values, substrings and object keys; scalar values do not
+/// act as containers.
 #[test]
-fn membership_is_defined_only_over_lists_and_strings() {
+fn membership_is_defined_over_lists_strings_and_object_keys() {
     let matches = |haystack: Value, actual: Value| {
         predicate(PolicyOperator::In, haystack).matches(&context(&[("f", actual)]))
     };
@@ -643,8 +638,161 @@ fn membership_is_defined_only_over_lists_and_strings() {
     );
     assert!(!matches(json!(7), json!(7)), "a number is not a container");
     assert!(
-        !matches(json!({"a": 1}), json!("a")),
-        "an object is not a container"
+        matches(json!({"a": 1}), json!("a")),
+        "an object contains its keys"
     );
     assert!(!matches(json!(null), json!(null)));
+}
+
+#[test]
+fn minimum_signed_priority_loses_to_every_higher_priority_without_overflow() {
+    for higher_priority in [i64::MIN + 1, 0, i64::MAX] {
+        let rules = json!({"policy_rules": [
+            {"rule_id": "a-minimum", "versions": [{
+                "scope": "carrier", "action": "reject", "priority": i64::MIN,
+                "effective_at": 0, "predicates": [{"scope": "carrier", "field": "f", "operator": "absent"}],
+            }]},
+            {"rule_id": "z-higher", "versions": [{
+                "scope": "carrier", "action": "reject", "priority": higher_priority,
+                "effective_at": 0, "predicates": [{"scope": "carrier", "field": "f", "operator": "absent"}],
+            }]},
+            {"rule_id": "allow", "versions": [{
+                "scope": "carrier", "action": "allow", "priority": i64::MAX,
+                "effective_at": 0, "predicates": [{"scope": "carrier", "field": "f", "operator": "absent"}],
+            }]},
+        ]});
+        let answer = evaluate_policy_json(&call(
+            rules,
+            json!({"scope": "carrier", "context": {}, "as_of": 0}),
+        ))
+        .expect("every signed integer priority is valid");
+        let answer: Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(answer["decision"]["allowed"], false);
+        assert_eq!(answer["decision"]["citation"]["rule_id"], "z-higher");
+        assert_eq!(answer["decision"]["citation"]["priority"], higher_priority);
+    }
+}
+
+#[test]
+fn minimum_signed_priority_is_preserved_when_reading_json() {
+    let answer = evaluate_policy_json(include_str!(
+        "fixtures/policy-minimum-integer-priority.json"
+    ))
+    .expect("the minimum signed integer is a valid priority");
+    let answer: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(answer["decision"]["allowed"], false);
+    assert_eq!(answer["decision"]["citation"]["rule_id"], "z-zero");
+    assert_eq!(answer["decision"]["citation"]["priority"], 0);
+}
+
+#[test]
+fn equal_minimum_priorities_still_choose_the_lexicographically_first_rule_id() {
+    let rules = ["z-last", "a-first"].map(|rule_id| Rule {
+        rule_id: rule_id.to_owned(),
+        version: 1,
+        scope: PolicyScope::Carrier,
+        action: PolicyAction::Reject,
+        priority: i64::MIN,
+        effective_at: 0,
+        reason: String::new(),
+        predicates: vec![predicate(PolicyOperator::Absent, Value::Null)],
+    });
+    for ordered in [[&rules[0], &rules[1]], [&rules[1], &rules[0]]] {
+        let decision = decide(&ordered, PolicyScope::Carrier, &context(&[]));
+        assert!(!decision.allowed);
+        let citation = decision.citation.expect("a matching rejection is cited");
+        assert_eq!(citation.rule_id, "a-first");
+        assert_eq!(citation.priority, i64::MIN);
+    }
+}
+
+#[test]
+fn object_equality_compares_nested_values_and_exact_key_sets() {
+    let cases = [
+        (json!({}), json!({}), true),
+        (
+            json!({"a": 1, "b": true, "nested": [{"enabled": false}, [true, null]]}),
+            json!({"nested": [{"enabled": 0}, [1, null]], "b": 1, "a": true}),
+            true,
+        ),
+        (json!({"a": 1}), json!({"a": 2}), false),
+        (json!({"a": null}), json!({"b": null}), false),
+        (json!({"a": null}), json!({}), false),
+        (json!({}), json!({"a": null}), false),
+        (json!({"nested": {}}), json!({"nested": {"a": null}}), false),
+        (json!({"nested": [1, 2]}), json!({"nested": [2, 1]}), false),
+        (json!({"nested": [true]}), json!({"nested": [1, 2]}), false),
+        (json!({"a": 1}), json!([1]), false),
+    ];
+    for (expected, actual, equal) in cases {
+        let context = context(&[("f", actual)]);
+        assert_eq!(
+            predicate(PolicyOperator::Equals, expected.clone()).matches(&context),
+            equal
+        );
+        assert_eq!(
+            predicate(PolicyOperator::NotEquals, expected).matches(&context),
+            !equal
+        );
+    }
+}
+
+#[test]
+fn list_membership_uses_recursive_object_equality() {
+    let haystack = json!([{"a": 1, "nested": [false, {"b": true}]}, {"other": null}]);
+    for (actual, included) in [
+        (json!({"nested": [0, {"b": 1}], "a": true}), true),
+        (json!({"other": null}), true),
+        (json!({"a": 1, "nested": [true, {"b": true}]}), false),
+        (json!({"missing": null}), false),
+        (json!({}), false),
+    ] {
+        let context = context(&[("f", actual)]);
+        assert_eq!(
+            predicate(PolicyOperator::In, haystack.clone()).matches(&context),
+            included
+        );
+        assert_eq!(
+            predicate(PolicyOperator::NotIn, haystack.clone()).matches(&context),
+            !included
+        );
+    }
+}
+
+#[test]
+fn object_membership_tests_only_string_keys_including_null_valued_keys() {
+    let haystack = json!({"present": null, "1": "value"});
+    for (actual, included) in [
+        (json!("present"), true),
+        (json!("1"), true),
+        (json!("missing"), false),
+        (json!("value"), false),
+        (json!(1), false),
+        (json!(null), false),
+        (json!(true), false),
+        (json!([]), false),
+        (json!({}), false),
+    ] {
+        let context = context(&[("f", actual)]);
+        assert_eq!(
+            predicate(PolicyOperator::In, haystack.clone()).matches(&context),
+            included
+        );
+        assert_eq!(
+            predicate(PolicyOperator::NotIn, haystack.clone()).matches(&context),
+            !included
+        );
+    }
+}
+
+#[test]
+fn object_comparisons_do_not_match_an_absent_context_field() {
+    for operator in [
+        PolicyOperator::Equals,
+        PolicyOperator::NotEquals,
+        PolicyOperator::In,
+        PolicyOperator::NotIn,
+    ] {
+        assert!(!predicate(operator, json!({"a": null})).matches(&context(&[])));
+    }
 }

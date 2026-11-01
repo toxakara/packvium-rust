@@ -315,6 +315,16 @@ fn a_fixed_set_that_cannot_hold_is_refused_before_search() {
                     .push(fixed("0", "0", 2));
             }),
         ),
+        (
+            "centre_of_gravity_unsupported",
+            Box::new(|d| {
+                d["configuration"] = json!({"minimum_support_ratio": 0.25});
+                d["fixed_placements"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(fixed("40", "100", 1));
+            }),
+        ),
     ];
     for (fragment, mutate) in cases {
         let mut data = default_request();
@@ -593,7 +603,13 @@ fn a_box_placed_past_the_integer_range_is_outside_not_wrapped_inside() {
     let error = pack_json(&data.to_string())
         .expect_err("refused")
         .to_string();
-    assert!(error.contains("obstacle far outside box"), "{error}");
+    // An obstacle's origin is a request length, so the admission ceiling refuses it before
+    // the container ever sees it.
+    assert!(
+        error
+            .contains("/containers/0/obstacles/0/origin/x: must be at most 9007199254740991 ticks"),
+        "{error}"
+    );
 }
 
 #[test]

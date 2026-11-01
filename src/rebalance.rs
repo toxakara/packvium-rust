@@ -85,6 +85,12 @@ fn candidate_points(container: &PackedContainer) -> Vec<Point> {
         points.insert((box_.x2(), box_.origin.y, box_.origin.z));
         points.insert((box_.origin.x, box_.y2(), box_.origin.z));
         points.insert((box_.origin.x, box_.origin.y, box_.z2()));
+        if let Some(depth) = placement.instance.item.nesting_height {
+            let nested_z = box_.z2() - depth.0;
+            if nested_z >= 0 {
+                points.insert((box_.origin.x, box_.origin.y, nested_z));
+            }
+        }
     }
     let mut points = points
         .into_iter()
@@ -168,22 +174,25 @@ pub fn rebalance_weight(
             break;
         }
         let source_index = (0..working.len())
-            .max_by_key(|index| weights[*index])
+            .max_by_key(|index| (weights[*index], std::cmp::Reverse(*index)))
             .unwrap();
         let mut placements = (0..working[source_index].placements.len()).collect::<Vec<_>>();
         placements.sort_by_key(|index| {
-            std::cmp::Reverse(
-                working[source_index].placements[*index]
-                    .instance
-                    .item
-                    .weight
-                    .0,
+            (
+                std::cmp::Reverse(
+                    working[source_index].placements[*index]
+                        .instance
+                        .item
+                        .weight
+                        .0,
+                ),
+                *index,
             )
         });
         let mut destinations = (0..working.len())
             .filter(|index| *index != source_index)
             .collect::<Vec<_>>();
-        destinations.sort_by_key(|index| weights[*index]);
+        destinations.sort_by_key(|index| (weights[*index], *index));
 
         let mut committed = None;
         'search: for placement_index in placements {
@@ -581,5 +590,75 @@ mod tests {
             trial.containers = balanced.containers;
             assert!(IndependentValidator.validate(&request, &trial).valid);
         }
+    }
+
+    #[test]
+    fn a_nesting_item_offers_the_point_where_the_next_one_sinks_into_it() {
+        let mut tote = item("tote", 100, 1);
+        tote.nesting_height = Some(Length(5));
+        let packed = PackedContainer {
+            container: container(),
+            sequence: 1,
+            placements: vec![placement(&tote, 1, 0, 0)],
+            lattice_summary: None,
+            lattice_items: Vec::new(),
+        };
+
+        let points = candidate_points(&packed);
+
+        assert!(points.contains(&Point { x: 0, y: 0, z: 5 }), "{points:?}");
+        assert!(points.contains(&Point { x: 0, y: 0, z: 10 }), "{points:?}");
+    }
+
+    #[test]
+    fn tied_heaviest_containers_select_the_first_and_consider_nesting_points() {
+        let mut tote = item("tote", 100, 4);
+        tote.nesting_height = Some(Length(5));
+        let mut narrow = container();
+        narrow.inner_dimensions = Dimensions {
+            length: Length(10),
+            width: Length(10),
+            height: Length(15),
+        };
+        narrow.quantity = Some(3);
+        let request = PackingRequest {
+            items: vec![tote.clone()],
+            containers: vec![narrow.clone()],
+            config: PackingConfig::default(),
+            output_length_unit: "ticks".into(),
+            output_weight_unit: "ticks".into(),
+            catalog_versions_used: Vec::new(),
+            fixed_placements: Vec::new(),
+            fixed_containers: Vec::new(),
+        };
+        let original = result(vec![
+            PackedContainer {
+                container: narrow.clone(),
+                sequence: 1,
+                placements: vec![placement(&tote, 1, 0, 0), placement(&tote, 2, 0, 5)],
+                lattice_summary: None,
+                lattice_items: Vec::new(),
+            },
+            PackedContainer {
+                container: narrow.clone(),
+                sequence: 2,
+                placements: vec![placement(&tote, 3, 0, 0), placement(&tote, 4, 0, 5)],
+                lattice_summary: None,
+                lattice_items: Vec::new(),
+            },
+            PackedContainer {
+                container: narrow,
+                sequence: 3,
+                placements: Vec::new(),
+                lattice_summary: None,
+                lattice_items: Vec::new(),
+            },
+        ]);
+
+        let balanced = rebalance_weight(&request, &original, 1);
+
+        assert_eq!(balanced.moves.len(), 1);
+        assert_eq!(balanced.moves[0].from_container_id, "box#1");
+        assert_eq!(balanced.moves[0].to_container_id, "box#3");
     }
 }

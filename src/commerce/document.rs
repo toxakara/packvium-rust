@@ -477,6 +477,9 @@ fn publish_catalog_version(
         let effective_at = optional(fields, "effective_at")
             .map(|found| integer(found, &format!("{path}.effective_at")))
             .transpose()?;
+        if published_at < 0 || effective_at.is_some_and(|value| value < 0) {
+            return fail(path, "effective_at and published_at cannot be negative");
+        }
         let note = match optional(fields, "note") {
             None => String::new(),
             Some(found) => text(found, &format!("{path}.note"))?,

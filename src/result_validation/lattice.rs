@@ -212,7 +212,7 @@ fn problems(
         ("layer_step", &fields.layer_step),
         ("count", &fields.count),
     ] {
-        if !value.strict_int().is_some_and(|number| number >= 1) {
+        if value.strict_int().is_none_or(|number| number < 1) {
             problems.push(format!(
                 "{name} must be a positive integer, got {}",
                 py_repr(value)

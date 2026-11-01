@@ -59,6 +59,42 @@ a caller would get a number from one and a refusal from another for the same inp
 carries the guarded sums in a representation that holds `10^30` exactly: Python's `int`,
 PHP's `BigInt` decimal strings, JavaScript's `BigInt`, Rust's `i128`.
 
+Areas follow the same rule in the search itself (1.9.0). Two lengths below
+`PHP_INT_MAX` ticks multiply past a native `int` -- a 10 mm wide item longer than about
+3,600 km already does -- and Python and Rust hold that product exactly. PHP forms every such
+product (base and contact areas, their sums and the load shared by them, the centre-of-gravity
+hull, lattice slot counts, the candidate score's room-left term) through
+`Packvium\Support\ExactInteger` and `ExactGeometry`: the native `int` while it fits, an exact
+decimal string past it, so an ordinary request pays one `is_int` check. The public
+`Dimensions::baseAreaTicks()` and `AxisAlignedBox::overlapAreaXY()` keep their `int` contract.
+`support_ratio` and `volume_utilization` are Python's correctly rounded `int / int`, not a
+quotient of two doubles.
+
+**The admission ceiling (1.9.0).** Every engine refuses, before any model is built, a
+JSON request with a length past `2^53 - 1` ticks (about 563,000 km) or a box -- an item, a
+container's inner or outer dimensions, an obstacle, a made-to-measure step -- enclosing more than
+`10^30` cubic ticks (about 244 million cubic metres). Both are `invalid_request` with reason
+`above_maximum` at the offending pointer (ERRORS.md). The first is the largest tick
+count JavaScript's `Number` holds exactly; the second is the bound path's own ceiling, which keeps
+`volume x 10^6` inside Rust's `i128`. Until 1.9.0 each engine failed past its own native limit: Rust
+and PHP refused a length past `2^63 - 1` ticks with different errors, Python and JavaScript answered,
+Python died with `decimal.InvalidOperation` at `10^20` mm, and Rust overflowed `i128` on a container
+past about `1.7 x 10^32` cubic ticks. A whole JSON number past `2^53 - 1` is refused the
+same way however a parser stored it, and a value past a native integer is read exactly to tell
+which way it is out of range.
+
+**Weights (1.9.0).** A weight is at most `2^63 - 1` ticks (about 1.15 million
+tonnes), and so is every item's weight times its quantity plus the heaviest container tare, so
+no container's payload or gross weight can pass a signed 64-bit integer, which is how Rust and
+PHP add them. Past either, the request is `invalid_request` / `above_maximum`, at the weight or at
+`/items`. A weight written as a JSON number past `2^53 - 1` is `invalid_value`: JavaScript has
+rounded such a number before any engine code reads it, so a weight that large is written as a
+string. Inside the ceiling every engine is exact: Python's `int`, PHP's `int` and `BigInt`,
+Rust's `i64` with `i128` products, and in JavaScript a `BigInt` for every weight sum. A
+JavaScript result carries a weight's `ticks`, and a `shipping_cost` score position, as a `Number`
+while it is exact and as a `BigInt` past `2^53 - 1`; `stringifyExact` and `parseExact` move such
+a result through JSON text without rounding it, and `pack` uses them on both backends.
+
 That intermediate ceiling is deliberately not the result ceiling. The five bound keys can
 cross JSON and are returned as JavaScript `Number` values, so every engine also refuses a
 final key above **`2^53 - 1` (`9,007,199,254,740,991`)**. This is the largest integer all four

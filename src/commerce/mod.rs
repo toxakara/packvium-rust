@@ -141,6 +141,9 @@ pub fn catalog_version_info_json(input: &str) -> Result<String, CommerceInputErr
         )?;
         let catalog_id = text(&request["catalog_id"], "request.catalog_id")?;
         let resolved_at = integer(&request["resolved_at"], "request.resolved_at")?;
+        if resolved_at < 0 {
+            return fail("request.resolved_at", "cannot be negative");
+        }
         let version = optional(request, "version")
             .map(|found| integer(found, "request.version"))
             .transpose()?;

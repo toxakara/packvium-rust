@@ -150,6 +150,10 @@ history with a hole or a duplicated version number.
 All three top-level keys are optional; a document that only needs to price a shipment
 may carry only `tariffs`. Field-level rules:
 
+- A tariff history is identified by the ordered pair `(carrier_id, service_id)`.
+  Separators inside either string are ordinary identifier characters: for example,
+  `("a/b", "c")` and `("a", "b/c")` name different histories. Duplicate detection and
+  both pinned and effective-dated lookup use the complete pair.
 - `accessorials` is an ordered **list**, not an object, so no language has to agree
   about key order; each entry sets exactly one of `flat_charge_minor` or
   `permille_of_base`. Duplicate `accessorial_id` values are an input error.
@@ -165,6 +169,9 @@ may carry only `tariffs`. Field-level rules:
   `published_at`, `cost_minor`, `minimum_charge_minor`, `fuel_surcharge_permille`,
   `flat_charge_minor`, `permille_of_base` and each zone rate in
   `cost_per_dimensional_kg_minor` may be zero but not negative.
+  Rollback versions follow the same date bounds as snapshot versions, and a catalog
+  request's `resolved_at` must also be non-negative, including when its catalog or
+  version does not exist. These are input errors rather than lookup rejections.
 
 ### Input errors versus rejections
 
@@ -243,6 +250,16 @@ Success:
 `citation` is `null` exactly when nothing matched (the open-by-default ALLOW). A
 `false` `allowed` always carries a citation — the model refuses to construct a
 citation-free rejection.
+
+`equals` and `not_equals` compare JSON values recursively: list order matters,
+object key order does not, and different key sets remain different even when values
+are `null`. Boolean/integer equality follows the reference model (`true == 1`,
+`false == 0`), including inside lists and objects. `in` and `not_in` test list
+elements, string substrings, or object keys; object values are not members. A
+non-string context value cannot be a substring or an object key. A missing context
+field matches neither binary operator, including its negated form. Rust's rule priority
+comparison handles the entire signed 64-bit range without negating its minimum;
+portable JavaScript inputs remain limited by exact `Number` representation.
 
 ### `catalog_version_info`
 
@@ -368,6 +385,16 @@ The `e log e` term is sorting the three id lists; every other bound is a linear 
 the relevant history. These are the bounds of the underlying models; the wrapper adds
 parsing and serialization, both linear in the payload, and nothing else.
 
+The policy rows treat predicate values as bounded. For structured values, multiply
+their predicate work by the comparison/membership cost: recursive equality visits
+the compared values, with an additional logarithmic key lookup per object entry in
+Rust's default ordered maps. PHP and JavaScript use expected constant-time object-key
+lookup; JavaScript also allocates key arrays during object comparison. Python's
+effective-dated model evaluation streams version resolution and winner selection in
+constant auxiliary space, excluding value-comparison recursion and the loaded
+document. Each matching rule's predicates run once; the other ports retain their
+existing rule-pool storage.
+
 ## Limitations
 
 - The document is supplied by the caller. Nothing here fetches, scrapes or embeds any
@@ -380,6 +407,11 @@ parsing and serialization, both linear in the payload, and nothing else.
 - Policy evaluation covers the closed `PolicyScope` / `PolicyOperator` vocabulary.
   An unrecognised scope or operator fails document admission rather than being
   silently ignored — the guarantee `domain/policy/model.py` already makes.
+- PHP's array boundary cannot recover the object/list distinction erased by an
+  associative JSON decoder: `{}` and `[]`, or an object with consecutive numeric
+  keys, can become the same PHP array. Portable object-valued predicates should use
+  nonempty objects with nonnumeric string keys. This limitation does not affect
+  list ordering or ordinary string-key object comparisons.
 - A JSON number must be written without a fractional part. `1` is an integer; `1.0` and
   `1e3` are not, and Python, PHP and Rust refuse them. JavaScript cannot tell the
   difference — `JSON.parse` gives the same `Number` for `1` and `1.0` — so this is the

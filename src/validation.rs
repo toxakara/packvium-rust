@@ -84,6 +84,7 @@ impl IndependentValidator {
                 dimensions: packed.container.inner_dimensions,
             };
             let support_graph = ContactGraph::from_placements(&packed.placements);
+            let collisions = collision_pairs(&packed.placements);
             let mut payload = 0_i64;
             let mut tag_counts = BTreeMap::<String, usize>::new();
             // Without a tag in the container no pair can be incompatible, so the common case
@@ -136,14 +137,16 @@ impl IndependentValidator {
                 {
                     issue(&mut issues, "obstacle_collision", &id);
                 }
-                for other in packed.placements.iter().skip(index + 1) {
-                    if placements_collide(placement, other) && !valid_nesting(placement, other) {
-                        issue(
-                            &mut issues,
-                            "collision",
-                            &format!("{} with {}", id, other.instance.id()),
-                        );
-                    }
+                for &other_index in collisions
+                    .range((index, 0)..=(index, usize::MAX))
+                    .map(|(_, right)| right)
+                {
+                    let other = &packed.placements[other_index];
+                    issue(
+                        &mut issues,
+                        "collision",
+                        &format!("{} with {}", id, other.instance.id()),
+                    );
                 }
                 if compatibility_sensitive
                     && let Some(other) = first_incompatible(&packed.placements, index)
@@ -165,13 +168,27 @@ impl IndependentValidator {
                     .item
                     .minimum_support_ratio
                     .max(request.config.minimum_support_ratio);
+                let support_area = support_graph.support_area(index);
+                let base_area = placement.envelope_dimensions.base_area();
                 if !support_area_sufficient(
                     placement.envelope_origin.z,
-                    support_graph.support_area(index),
-                    placement.envelope_dimensions.base_area(),
+                    support_area,
+                    base_area,
                     required,
                 ) {
                     issue(&mut issues, "support", &id);
+                } else if placement.envelope_origin.z != 0
+                    && required > 0.0
+                    && support_area * 2 <= base_area
+                    && !crate::support_polygon::centre_of_gravity_supported(
+                        placement.envelope_box(),
+                        support_graph
+                            .supporters(index)
+                            .iter()
+                            .map(|edge| packed.placements[edge.index].envelope_box()),
+                    )
+                {
+                    issue(&mut issues, "centre_of_gravity_unsupported", &id);
                 }
                 if !ground_contact_valid_with_graph(packed, index, &support_graph) {
                     issue(&mut issues, "ground_contact_violation", &id);
@@ -221,6 +238,60 @@ impl IndependentValidator {
         validate_fixed_placements(request, containers, &mut issues);
         (issues, seen)
     }
+}
+
+/// Intersecting placement pairs `(left, right)` with `left < right`, found via a z-bucketed
+/// sweep along x (near-linear on spread-out scenes, `O(n^2)` when many boxes share an x
+/// range without touching), matching Python's `_collision_pairs` and PHP's
+/// `collisionPairs`.
+fn collision_pairs(placements: &[Placement]) -> BTreeSet<(usize, usize)> {
+    let mut pairs = BTreeSet::new();
+    if placements.len() < 2 {
+        return pairs;
+    }
+    let cell = placements
+        .iter()
+        .map(|placement| {
+            let box_ = placement.envelope_box();
+            box_.z2() - box_.origin.z
+        })
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut buckets = BTreeMap::<i64, Vec<usize>>::new();
+    for (index, placement) in placements.iter().enumerate() {
+        let box_ = placement.envelope_box();
+        let z0 = box_.origin.z.div_euclid(cell);
+        let z1 = (box_.z2() - 1).div_euclid(cell);
+        buckets.entry(z0).or_default().push(index);
+        if z1 != z0 {
+            buckets.entry(z1).or_default().push(index);
+        }
+    }
+    let mut active = Vec::<(i64, usize)>::new();
+    for indices in buckets.into_values() {
+        let mut ordered = indices
+            .into_iter()
+            .map(|index| {
+                let box_ = placements[index].envelope_box();
+                (box_.origin.x, box_.x2(), index)
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_unstable();
+        active.clear();
+        for (x1, x2, index) in ordered {
+            active.retain(|(right, _)| *right > x1);
+            for &(_, other) in &active {
+                if placements_collide(&placements[index], &placements[other])
+                    && !valid_nesting(&placements[index], &placements[other])
+                {
+                    pairs.insert((index.min(other), index.max(other)));
+                }
+            }
+            active.push((x2, index));
+        }
+    }
+    pairs
 }
 
 /// The first other item in the container, in placement order, that the item at `index`
@@ -712,5 +783,79 @@ mod tests {
                 .iter()
                 .any(|issue| issue.code == "non_stackable")
         );
+    }
+
+    #[test]
+    fn validator_rejects_overhanging_centre_of_gravity_when_area_ratio_is_met() {
+        let mut packed = nested_container(2, None, None);
+        for placement in &mut packed.placements {
+            placement.instance.item.nesting_height = None;
+            placement.instance.item.minimum_support_ratio = 0.25;
+        }
+        packed.container.inner_dimensions.length = Length(100);
+        packed.placements[0].dimensions.length = Length(30);
+        packed.placements[0].envelope_dimensions.length = Length(30);
+        packed.placements[1].position.z = 10;
+        packed.placements[1].envelope_origin.z = 10;
+        packed.placements[1].dimensions.length = Length(100);
+        packed.placements[1].envelope_dimensions.length = Length(100);
+
+        let report = validate_nested(packed);
+
+        assert!(!report.valid);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "centre_of_gravity_unsupported"),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn z_bucketed_collision_sweep_matches_all_pairs_scan() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let base = nested_container(1, None, None);
+        let mut template = base.placements[0].clone();
+        template.instance.item.nesting_height = None;
+
+        for count in [0, 1, 2, 16, 48] {
+            let mut placements = Vec::with_capacity(count);
+            for index in 0..count {
+                let mut next = || {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    (seed >> 33) as i64
+                };
+                let dims = Dimensions {
+                    length: Length(1 + next().rem_euclid(15)),
+                    width: Length(1 + next().rem_euclid(15)),
+                    height: Length(1 + next().rem_euclid(20)),
+                };
+                let origin = Point {
+                    x: next().rem_euclid(30),
+                    y: next().rem_euclid(30),
+                    z: next().rem_euclid(40),
+                };
+                let mut p = template.clone();
+                p.instance.sequence = index + 1;
+                p.position = origin;
+                p.envelope_origin = origin;
+                p.dimensions = dims;
+                p.envelope_dimensions = dims;
+                placements.push(p);
+            }
+            let mut expected = BTreeSet::new();
+            for left in 0..placements.len() {
+                for right in (left + 1)..placements.len() {
+                    if placements_collide(&placements[left], &placements[right])
+                        && !valid_nesting(&placements[left], &placements[right])
+                    {
+                        expected.insert((left, right));
+                    }
+                }
+            }
+            assert_eq!(collision_pairs(&placements), expected);
+        }
     }
 }
