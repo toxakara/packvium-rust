@@ -3,13 +3,14 @@
 //! A caller who sends a malformed request needs to know which value is wrong and why, in a
 //! form a program can branch on, and the four engines must say it identically. So the first
 //! violation is refused as a [`RequestError`] naming a reason from a closed set and the JSON
-//! Pointer of the value, in the order every engine walks: units, output, configuration,
-//! items, containers. The Python reference (`packvium/request_errors.py`) is the source of truth for
+//! Pointer of the value, in the order every engine walks: units, output, currency,
+//! configuration, items, containers. The Python reference (`packvium/request_errors.py`) is the source of truth for
 //! every rule, pointer and text here; a cross-engine suite holds this engine to it.
 
 use crate::canonical_json::{MAX_EXACT_MAGNITUDE, json_integer, json_spelling, spell_names};
 use crate::error::RequestError;
 use crate::fixed::unknown_keys;
+use crate::geometry::Rotation;
 use crate::made_to_measure::MadeToMeasure;
 use crate::units::{MeasureKind, Overflowed, measure_ticks, overflowed_measure};
 use serde_json::{Map, Value};
@@ -37,7 +38,6 @@ const SOLVERS: [&str; 6] = [
     "maximal_spaces",
     "exact_small",
 ];
-const ROTATIONS: [&str; 6] = ["LWH", "LHW", "WLH", "WHL", "HLW", "HWL"];
 const LENGTH_UNITS: [&str; 5] = ["mm", "cm", "m", "in", "ft"];
 const WEIGHT_UNITS: [&str; 5] = ["mg", "g", "kg", "oz", "lb"];
 const GROUND_CONTACT_RULES: [&str; 4] = ["free", "covered", "single", "multiple"];
@@ -103,6 +103,8 @@ pub(crate) fn check_request(data: &Value) -> Checked<&str> {
     let request = object(data, "")?;
     let unit = check_units(request.get("units"))?;
     check_output(request.get("output"))?;
+    optional(request, "currency", "", currency_code)?;
+    let currency = present(request.get("currency")).and_then(Value::as_str);
     check_configuration(request.get("configuration"), unit)?;
     let items = required_list(request, "items", "")?;
     for (index, raw) in items.iter().enumerate() {
@@ -111,7 +113,12 @@ pub(crate) fn check_request(data: &Value) -> Checked<&str> {
     require_unique_ids(items, "items")?;
     let containers = required_list(request, "containers", "")?;
     for (index, raw) in containers.iter().enumerate() {
-        check_container(raw, &join("/containers", &index.to_string()), unit)?;
+        check_container(
+            raw,
+            &join("/containers", &index.to_string()),
+            unit,
+            currency,
+        )?;
     }
     require_unique_ids(containers, "containers")?;
     total_weight(items, containers)?;
@@ -158,7 +165,10 @@ fn check_units(raw: Option<&Value>) -> Checked<&str> {
     let Some(raw) = present(raw) else {
         return Ok("mm");
     };
-    let Some(length) = present(object(raw, "/units")?.get("length")) else {
+    let units = object(raw, "/units")?;
+    // `{"length": "cm", "weight": "kg"}` used to read every bare weight as grams.
+    known_fields(units, "/units", &["length"])?;
+    let Some(length) = present(units.get("length")) else {
         return Ok("mm");
     };
     match length.as_str() {
@@ -278,8 +288,9 @@ fn check_item(raw: &Value, at: &str, unit: &str) -> Checked {
         }
         Ok(())
     })?;
+    let hull = item.get("shape_type").and_then(Value::as_str) == Some("convex_hull");
     optional(item, "allowed_rotations", at, |value, field| {
-        each_one_of(value, field, &ROTATIONS)
+        allowed_rotations(value, field, hull)
     })?;
     optional(item, "ground_contact_rule", at, |value, field| {
         one_of(value, field, &GROUND_CONTACT_RULES)
@@ -289,6 +300,22 @@ fn check_item(raw: &Value, at: &str, unit: &str) -> Checked {
     })?;
     for name in ITEM_BOOLEANS {
         optional(item, name, at, boolean)?;
+    }
+    if let Some(listed) = item.get("allowed_rotations").and_then(Value::as_array) {
+        let upright = item.get("keep_upright").and_then(Value::as_bool) == Some(true);
+        if !listed.iter().any(|code| {
+            !upright
+                || code
+                    .as_str()
+                    .and_then(Rotation::from_code)
+                    .is_some_and(Rotation::is_upright)
+        }) {
+            return Err(RequestError::new(
+                "invalid_value",
+                join(at, "allowed_rotations"),
+                "must allow at least one rotation after keep_upright",
+            ));
+        }
     }
     Ok(())
 }
@@ -337,7 +364,7 @@ fn stacking_group_name(value: &Value, field: &str) -> Checked {
     }
 }
 
-fn check_container(raw: &Value, at: &str, unit: &str) -> Checked {
+fn check_container(raw: &Value, at: &str, unit: &str, currency: Option<&str>) -> Checked {
     let container = object(raw, at)?;
     required_string(container, "id", at)?;
     optional(container, "quantity", at, |value, field| {
@@ -364,16 +391,78 @@ fn check_container(raw: &Value, at: &str, unit: &str) -> Checked {
     })?;
     optional(container, "access_directions", at, access_directions)?;
     optional(container, "tag_limits", at, tag_limits)?;
-    optional(container, "rate_table", at, rate_table)?;
+    optional(container, "rate_table", at, |value, field| {
+        rate_table(value, field, currency)
+    })?;
     optional(container, "obstacles", at, |value, field| {
         obstacles(value, field, unit, inner_ticks(container, unit))
     })?;
     optional(container, "deformable_boundary", at, |value, field| {
-        deformable_boundary(container, value, field, at)
+        deformable_boundary(container, value, field, at, unit)
     })?;
     optional(container, "made_to_measure", at, |value, field| {
         made_to_measure(container, value, field, at, unit)
+    })?;
+    optional(container, "pallet_overhang_limit", at, |value, field| {
+        pallet_overhang_limit(container, value, field, unit)
     })
+}
+
+/// The two axes `pallet_overhang_limit` requires, in the order they are checked.
+const PALLET_OVERHANG_FIELDS: [&str; 2] = ["length", "width"];
+
+/// Both axes, each a non-negative length, then the solving frame
+/// `(L + 2l, W + 2w, H)` held to the ceiling of any box. Run after every other container
+/// field. `O(1)`.
+fn pallet_overhang_limit(
+    container: &Map<String, Value>,
+    raw: &Value,
+    field: &str,
+    unit: &str,
+) -> Checked {
+    let limit = object(raw, field)?;
+    known_fields(limit, field, &PALLET_OVERHANG_FIELDS)?;
+    for axis in PALLET_OVERHANG_FIELDS {
+        let value = required(limit, axis, field)?;
+        measure(value, &join(field, axis), MeasureKind::Length, unit)?;
+    }
+    let overhang = |axis: &str| {
+        limit
+            .get(axis)
+            .and_then(|value| measure_ticks(value, unit, MeasureKind::Length).ok())
+            .unwrap_or(0)
+    };
+    let inner = inner_ticks(container, unit);
+    box_ticks(
+        [
+            inner[0] + 2 * overhang("length"),
+            inner[1] + 2 * overhang("width"),
+            inner[2],
+        ],
+        field,
+    )
+}
+
+/// A box's sides in ticks, held to the admission ceiling as the request spells them: each
+/// side, then what they enclose. `O(1)`.
+fn box_ticks(sides: [i128; 3], at: &str) -> Checked {
+    for (side, ticks) in SIDES.into_iter().zip(sides) {
+        if ticks > i128::from(MAX_LENGTH_TICKS) {
+            return Err(too_long(&join(at, side)));
+        }
+    }
+    if sides
+        .iter()
+        .try_fold(1_i128, |volume, side| volume.checked_mul(*side))
+        .is_none_or(|volume| volume > MAX_VOLUME_TICKS3)
+    {
+        return Err(RequestError::new(
+            "above_maximum",
+            at,
+            "must enclose at most 10^30 cubic ticks",
+        ));
+    }
+    Ok(())
 }
 
 /// Every key the request schema's `made_to_measure` declares; it sets `additionalProperties: false`.
@@ -482,10 +571,11 @@ fn made_to_measure(
     Ok(())
 }
 
-/// The kinds `deformable_boundary` admits.
-const DEFORMABLE_BOUNDARY_KINDS: [&str; 1] = ["flat_bag"];
+/// The kinds `deformable_boundary` admits; `gusseted_bag` since 1.10.
+const DEFORMABLE_BOUNDARY_KINDS: [&str; 2] = ["flat_bag", GUSSETED_BAG];
+const GUSSETED_BAG: &str = "gusseted_bag";
 /// Container fields a flat bag refuses, in reporting order (docs/DEFORMABLE-CONTAINERS.md).
-const BAG_EXCLUSIONS: [&str; 7] = [
+const BAG_EXCLUSIONS: [&str; 8] = [
     "obstacles",
     "axles",
     "access_directions",
@@ -493,21 +583,36 @@ const BAG_EXCLUSIONS: [&str; 7] = [
     "outer_dimensions",
     "void_fill_reserve_ratio",
     "made_to_measure",
+    "pallet_overhang_limit",
 ];
 
+/// The boundary object top to bottom -- kind, unknown keys, the gusset -- then the container
+/// fields a bag refuses. `O(1)`.
 fn deformable_boundary(
     container: &Map<String, Value>,
     raw: &Value,
     field: &str,
     at: &str,
+    unit: &str,
 ) -> Checked {
     let boundary = object(raw, field)?;
-    one_of(
-        required(boundary, "kind", field)?,
-        &join(field, "kind"),
-        &DEFORMABLE_BOUNDARY_KINDS,
-    )?;
-    known_fields(boundary, field, &["kind"])?;
+    let kind = required(boundary, "kind", field)?;
+    one_of(kind, &join(field, "kind"), &DEFORMABLE_BOUNDARY_KINDS)?;
+    let gusseted = kind.as_str() == Some(GUSSETED_BAG);
+    let known: &[&str] = if gusseted {
+        &["kind", "side_gusset_depth"]
+    } else {
+        &["kind"]
+    };
+    known_fields(boundary, field, known)?;
+    if gusseted {
+        side_gusset_depth(
+            container,
+            required(boundary, "side_gusset_depth", field)?,
+            &join(field, "side_gusset_depth"),
+            unit,
+        )?;
+    }
     for name in BAG_EXCLUSIONS {
         if set_beside_a_bag(name, present(container.get(name))) {
             return Err(RequestError::new(
@@ -516,6 +621,32 @@ fn deformable_boundary(
                 "cannot be combined with deformable_boundary",
             ));
         }
+    }
+    Ok(())
+}
+
+/// A length, positive once read in ticks, and no deeper than the bag's inner width (1.10).
+fn side_gusset_depth(
+    container: &Map<String, Value>,
+    value: &Value,
+    field: &str,
+    unit: &str,
+) -> Checked {
+    measure(value, field, MeasureKind::Length, unit)?;
+    let depth = measure_ticks(value, unit, MeasureKind::Length).unwrap_or(0);
+    if depth == 0 {
+        return Err(RequestError::new(
+            "invalid_value",
+            field,
+            "must be positive",
+        ));
+    }
+    if depth > inner_ticks(container, unit)[1] {
+        return Err(RequestError::new(
+            "invalid_value",
+            field,
+            "exceeds inner_dimensions width",
+        ));
     }
     Ok(())
 }
@@ -575,7 +706,7 @@ fn tag_limits(raw: &Value, at: &str) -> Checked {
     Ok(())
 }
 
-fn rate_table(raw: &Value, at: &str) -> Checked {
+fn rate_table(raw: &Value, at: &str, currency: Option<&str>) -> Checked {
     let table = object(raw, at)?;
     for (name, minimum) in [("weight_brackets_g", 1), ("prices_minor", 0)] {
         let Some(values) = present(table.get(name)) else {
@@ -589,7 +720,57 @@ fn rate_table(raw: &Value, at: &str) -> Checked {
     for name in ["minimum_charge_minor", "fuel_surcharge_permille"] {
         optional(table, name, at, |value, field| integer(value, field, 0))?;
     }
-    Ok(())
+    optional(table, "currency", at, |value, field| {
+        rate_table_currency(currency_text(value, field)?, field, currency)
+    })
+}
+
+fn currency_code(value: &Value, field: &str) -> Checked {
+    currency_shape(currency_text(value, field)?, field)
+}
+
+fn currency_text<'a>(value: &'a Value, field: &str) -> Checked<&'a str> {
+    value
+        .as_str()
+        .ok_or_else(|| wrong_type(field, "must be a string"))
+}
+
+/// An ISO 4217 shape, `^[A-Z]{3}$`, with no code list: the engines never convert, so a code
+/// they do not know is still one they can echo. ASCII capitals only. O(1).
+pub(crate) fn currency_shape(code: &str, field: &str) -> Checked {
+    if code.len() == 3 && code.bytes().all(|letter| letter.is_ascii_uppercase()) {
+        return Ok(());
+    }
+    Err(RequestError::new(
+        "invalid_value",
+        field,
+        "must be three capital letters (ISO 4217)",
+    ))
+}
+
+/// A rate table prices in the request's currency or says nothing: a table in another one
+/// would be ranked as though its minor units were the request's. Shared with the typed
+/// request path. O(1).
+pub(crate) fn rate_table_currency(code: &str, field: &str, currency: Option<&str>) -> Checked {
+    currency_shape(code, field)?;
+    let Some(currency) = currency else {
+        return Err(RequestError::new(
+            "missing_field",
+            "/currency",
+            "is required when a rate_table declares a currency",
+        ));
+    };
+    if code == currency {
+        return Ok(());
+    }
+    Err(RequestError::new(
+        "not_allowed",
+        field,
+        format!(
+            "must equal the request currency {}",
+            json_spelling(&Value::from(currency))
+        ),
+    ))
 }
 
 fn obstacles(raw: &Value, at: &str, unit: &str, inner: [i128; 3]) -> Checked {
@@ -752,6 +933,48 @@ fn each_one_of(raw: &Value, at: &str, allowed: &[&str]) -> Checked {
         one_of(value, &join(at, &index.to_string()), allowed)?;
     }
     Ok(())
+}
+
+/// Each code from the item's vocabulary (1.10): all 24 for a hull, the six legacy codes for
+/// anything else, where a signed code is a rule broken rather than an unknown word. The shape
+/// is read as written, so a shape no engine knows is not a hull. O(len(raw)).
+fn allowed_rotations(raw: &Value, at: &str, hull: bool) -> Checked {
+    for (index, value) in list(raw, at)?.iter().enumerate() {
+        if let Some((reason, detail)) = orientation_refusal(value, hull, "") {
+            return Err(RequestError::new(
+                reason,
+                join(at, &index.to_string()),
+                detail,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Why `value` cannot orient an item of this shape, as `(reason, detail)`, or `None` when it
+/// can. `place` names the value inside the detail, the way a fixed placement or a revision
+/// event words its own refusals; empty, the detail is the bare rule. Shared by every field
+/// that names a requested item's orientation. O(1).
+pub(crate) fn orientation_refusal(
+    value: &Value,
+    hull: bool,
+    place: &str,
+) -> Option<(&'static str, String)> {
+    let reason = Rotation::refusal_reason(value.as_str(), hull)?;
+    let rule = if reason == "invalid_value" {
+        Rotation::SIGNED_NEEDS_A_HULL.to_owned()
+    } else {
+        format!(
+            "must be one of {}",
+            spell_names(&Rotation::vocabulary_codes(hull))
+        )
+    };
+    let detail = match (place.is_empty(), reason) {
+        (true, _) => rule,
+        (false, "invalid_value") => format!("{place}: {rule}"),
+        (false, _) => format!("{place} {rule}"),
+    };
+    Some((reason, detail))
 }
 
 fn access_directions(raw: &Value, at: &str) -> Checked {

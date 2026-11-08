@@ -147,6 +147,21 @@ mod tests {
         }
     }
 
+    /// Inputs the admission boundary never produces are refused, not computed into a
+    /// pressure or height that would mean nothing.
+    #[test]
+    fn inputs_outside_the_model_are_refused() {
+        assert_eq!(applied_pressure(1, 0), Err(CompressionOverflow));
+        assert_eq!(applied_pressure(1, -1), Err(CompressionOverflow));
+        for (height, ratio, limit) in [(0, 0, 1), (100, -1, 1), (100, 1_000_001, 1), (100, 0, -1)] {
+            assert_eq!(
+                effective_height(height, ratio, limit, kilopascals(0)),
+                Err(CompressionOverflow),
+                "{height} {ratio} {limit}"
+            );
+        }
+    }
+
     #[test]
     fn the_documented_compression_examples() {
         assert_eq!(effective_height(100, 250_000, 100, kilopascals(0)), Ok(100));

@@ -35,6 +35,7 @@ fn request(items: Vec<Item>, container: Container) -> PackingRequest {
         output_length_unit: "mm".into(),
         output_weight_unit: "g".into(),
         catalog_versions_used: Vec::new(),
+        currency: None,
         fixed_placements: Vec::new(),
         fixed_containers: Vec::new(),
     }
@@ -54,6 +55,7 @@ fn result(containers: Vec<PackedContainer>, unpacked: Vec<UnpackedItem>) -> Pack
         optimality: None,
         objective: "default".into(),
         catalog_versions_used: Vec::new(),
+        currency: None,
     }
 }
 
@@ -303,5 +305,22 @@ fn a_non_stackable_item_with_a_list_reports_only_non_stackable() {
     assert!(
         !issues.contains(&"stacking_group_incompatible".to_owned()),
         "{issues:?}"
+    );
+}
+
+#[test]
+fn a_stack_heavier_than_the_floor_density_allows_is_refused() {
+    let base = item("base");
+    let upper = item("upper");
+    let mut dense = container();
+    // One gram over a whole square metre: a ten-millimetre stack of two grams is far past it.
+    dense.max_stack_density = Some(packvium_core::Weight(packvium_core::Weight::TICKS_PER_G));
+    assert_eq!(
+        judge(
+            vec![base.clone(), upper.clone()],
+            dense,
+            stacked_pair(&base, &upper)
+        ),
+        ["stack_density_exceeded", "stack_density_exceeded"]
     );
 }

@@ -100,12 +100,31 @@ fn main() {
     summarise(
         "as hulls",
         json!({ "units": { "length": "mm" },
-                "items": [wedge("wedge-lower", Some(lower)), wedge("wedge-upper", Some(upper))],
+                "items": [wedge("wedge-lower", Some(lower.clone())), wedge("wedge-upper", Some(upper))],
                 "containers": crate_of("100", "100", "100") }),
     );
 
     // One crate instead of two, for the same goods and the same crate. Nothing changed
     // except the claim that the items are wedges rather than blocks.
+
+    // A hull turns 24 ways, not 6. Two copies of the *same* wedge also fill the cube, but
+    // only if one is turned half a turn about the vertical: that rotation is not one of the
+    // six axis permutations a box needs, so it has a signed code, `-L-W+H`. The 18 signed
+    // codes are accepted only on a `convex_hull` item; on a box they would change nothing.
+    println!("\nconvex_hull -- two copies of one wedge, turned to fit");
+    let twins = |rotations: Value| {
+        let mut twin = wedge("wedge", Some(lower.clone()));
+        twin["quantity"] = json!(2);
+        twin["allowed_rotations"] = rotations;
+        json!({ "units": { "length": "mm" },
+                "items": [twin],
+                "containers": crate_of("100", "100", "100") })
+    };
+    summarise(
+        "six box rotations",
+        twins(json!(["LWH", "WLH", "WHL", "HWL", "HLW", "LHW"])),
+    );
+    summarise("with -L-W+H", twins(json!(["LWH", "-L-W+H"])));
 
     // ----------------------------------------------------------------- compressible
     //
@@ -145,6 +164,30 @@ fn main() {
                     "containers": crate_of("100", "100", "200") }),
         );
     }
+
+    // ---------------------------------------------------------------- gusseted bag
+    //
+    // A poly mailer is not a box either: it is a flat bag whose walls give, so it is
+    // described by `deformable_boundary` on the container, not by the items. A flat bag
+    // admits a load when, across the bag, its width plus its height fits the flat width
+    // (`b + c <= W`); a gusseted bag folds out `side_gusset_depth` more at each side
+    // (`b + c <= W + G`). Four 20 mm books, upright as they come, into a 300 x 150 bag:
+    // flat, two go in; with a 25 mm gusset, three.
+    println!("\ngusseted bag -- the same mailer with and without side gussets");
+    let mailer = |boundary: Value| {
+        json!({ "units": { "length": "mm" },
+                "items": [{ "id": "book", "quantity": 4, "weight": "300 g",
+                            "allowed_rotations": ["LWH"],
+                            "dimensions": { "length": "200", "width": "100", "height": "20" } }],
+                "containers": [{ "id": "mailer", "quantity": 1, "deformable_boundary": boundary,
+                                 "inner_dimensions": { "length": "300", "width": "150",
+                                                       "height": "100" } }] })
+    };
+    summarise("flat bag", mailer(json!({ "kind": "flat_bag" })));
+    summarise(
+        "gusseted, 25 mm",
+        mailer(json!({ "kind": "gusseted_bag", "side_gusset_depth": "25" })),
+    );
 
     // Both shapes are refused rather than approximated wherever the engine cannot honour
     // them exactly -- a hull on a route, a hull under a configured clearance, a

@@ -389,6 +389,7 @@ pub(crate) fn solve_portfolio_with_deadline(
             optimality: None,
             objective: request.config.objective.clone(),
             catalog_versions_used: Vec::new(),
+            currency: None,
         });
     }
     let global_deadline_reached = deadline.expired();
@@ -1550,5 +1551,62 @@ mod tests {
             assert_eq!(sorted[0].item.id, "item_a");
             assert_eq!(sorted[1].item.id, "item_b");
         }
+    }
+
+    fn result_named(solver: &str, score: i128) -> crate::model::PackingResult {
+        crate::model::PackingResult {
+            status: crate::model::PackingStatus::BestFound,
+            containers: Vec::new(),
+            unpacked: Vec::new(),
+            algorithm: crate::model::AlgorithmReport {
+                solver: solver.into(),
+                ..Default::default()
+            },
+            score: vec![score],
+            warnings: Vec::new(),
+            alternatives: Vec::new(),
+            feasibility: None,
+            termination: None,
+            optimality: None,
+            objective: "default".into(),
+            catalog_versions_used: Vec::new(),
+            currency: None,
+        }
+    }
+
+    #[test]
+    fn the_refined_orders_are_the_best_greedy_ones_then_profile_order() {
+        let orders = ["volume", "edge", "base"]
+            .map(|name| (name.to_owned(), Vec::new()))
+            .to_vec();
+        let greedy = [
+            result_named("extreme_points:base:greedy", 2),
+            // Neither an extreme-point greedy start nor a known order: both are passed over.
+            result_named("extreme_points:edge:beam", 0),
+            result_named("maximal_spaces:volume:greedy", 0),
+            result_named("extreme_points:unknown:greedy", 1),
+        ];
+        let names = |count| {
+            super::best_greedy_orders(&greedy, &orders, count)
+                .into_iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(1), ["base"]);
+        // Too few greedy answers to fill the count: the rest follow in profile order.
+        assert_eq!(names(2), ["base", "volume"]);
+        assert_eq!(names(5), ["base", "volume", "edge"]);
+    }
+
+    #[test]
+    fn a_single_start_cut_off_by_the_clock_reports_the_clock_not_the_budget() {
+        let mut result = result_named("grid", 0);
+        result.algorithm.time_limit_reached = true;
+        result.algorithm.effort_limit_reached = true;
+        let finished = super::finalize_single_start(result, false);
+        assert!(finished.algorithm.time_limit_reached);
+        assert!(!finished.algorithm.effort_limit_reached);
+        let termination = finished.termination.expect("termination");
+        assert_eq!(termination.attributes["winning_start_truncated"], true);
     }
 }

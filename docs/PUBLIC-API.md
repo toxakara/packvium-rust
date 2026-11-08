@@ -32,6 +32,15 @@
   pack validly but less densely; any such difference is pinned in
   `conformance/native-quality-budget.json` rather than left to drift.
 
+  **24 rotations for a hull (1.10).** `allowed_rotations` and a placement's `orientation`
+  take 24 codes: the six legacy codes, unchanged and still the default list, then 18 signed
+  codes such as `-L-W+H` -- per output axis a sign and the declared side -- that only a
+  `convex_hull` may list (elsewhere `invalid_request` / `invalid_value` at
+  `/items/<i>/allowed_rotations/<j>`). `keep_upright` keeps the codes whose z entry is `+H`.
+  Python's `Rotation` enum gains the 18 members in canonical table order (`NL_NW_PH =
+  "-L-W+H"`, ...), `Rotation.every()` for all 24 and the `is_signed` / `is_upright`
+  properties; `Rotation.all()` and `Rotation.upright()` keep returning the legacy six and two.
+
   Where they are implemented: a `convex_hull` item's collisions are decided by an exact
   integer separating-axis test rather than by its box, and its occupied volume is the hull's
   own — two complementary wedges share a crate that fits one of their bounding boxes. A
@@ -54,7 +63,8 @@
   statics, rejected as a constraint rather than merely reported), and an
   optional `rate_table` carrier tariff (ascending `weight_brackets_g` paired with
   `prices_minor`, an optional `minimum_charge_minor` floor and an optional
-  `fuel_surcharge_permille`). The rate card is request data rather than a registered
+  `fuel_surcharge_permille`, and since 1.10 an optional `currency`, which must equal the
+  request's). The rate card is request data rather than a registered
   scorer precisely so all four engines can be held to the same price; only the
   `lowest_landed_cost` objective reads it, and a request that omits it behaves exactly
   as it did before the field existed.
@@ -75,6 +85,14 @@
   `billedDimensions()`, Rust `Container::deformable_boundary: Option<DeformableBoundary>` with
   `PackedContainer::achieved_dimensions()` / `billed_dimensions()`, and the TypeScript request
   type.
+- **Gusseted bags (1.10).** `deformable_boundary: {"kind": "gusseted_bag", "side_gusset_depth": G}`
+  is a flat bag whose side gussets open to depth `G`, a length measure in the request's units,
+  required for this kind, positive and at most `inner_dimensions.width`; a `flat_bag` refuses the
+  key as an unknown field. The width girth becomes `b + c <= W + G`; the frame (`b <= W`), the
+  length girth, billing on `achieved_dimensions`, the refused fields, the solver fallbacks and
+  the validator issue `bag_girth_exceeded` are the flat bag's. Bottom gussets are not modelled.
+  Python's `Container` keeps `deformable_boundary: str` (`"gusseted_bag"`) and gains a trailing
+  `side_gusset_depth: Length | None = None`, refused unless the kind is `gusseted_bag`.
 - **Made-to-measure containers.** `made_to_measure` (absent or `null`: a stock
   container) makes the container an on-demand box machine whose largest box is
   `inner_dimensions`: `minimum` and `increment` per axis (required; `minimum` equal to
@@ -87,12 +105,33 @@
   and `tare_weight` (declared tare plus the board, rounded up the same way), both inside every
   objective and `gross_weight`; `achieved_dimensions` reports the extent before rounding.
   `outer_dimensions` or `deformable_boundary` next to it is `invalid_request` / `not_allowed`;
-  `axles`, non-empty `obstacles`, a positive `void_fill_reserve_ratio` or a fixed placement in
-  the container is `unsupported_feature`; a largest box priced above `2^53 - 1` is
+  `axles`, non-empty `obstacles` or a fixed placement in the container is
+  `unsupported_feature`. A positive `void_fill_reserve_ratio` is kept in the box that ships: when
+  the box cut tight to the load would break it, the box is the solving envelope instead.
+  A largest box priced above `2^53 - 1` is
   `invalid_value`. The engines expose it as Python `Container.made_to_measure` (a
   `packvium.MadeToMeasure`, last field), PHP the trailing constructor parameter
   `?MadeToMeasure $madeToMeasure` (`Packvium\Domain\MadeToMeasure`), Rust
   `Container::made_to_measure: Option<MadeToMeasure>`, and the TypeScript request type.
+- **Pallet overhang.** `pallet_overhang_limit: {length, width}` (both required,
+  non-negative lengths, no default; zero forbids overhang) lets a load pass the deck, the
+  container's `inner_dimensions`, by `length` at each end and `width` at each side. Positions
+  are measured from the corner of the overhang zone, so the deck lies at `[length, length + L]`
+  by `[width, width + W]`, fixed placements included. Only the deck bears weight: a floor
+  placement's `support_ratio` is the share of its base on the deck, held to
+  `minimum_support_ratio` and the centre-of-gravity rule like any support. A load the deck
+  holds is never overhung; one that needs the overhang is seated with the least of it. The
+  packed pallet reports its declared `inner_dimensions` and `outer_dimensions` (else inner),
+  `achieved_dimensions` -- the deck grown by the overhang used, at the load's height -- and its
+  `volume_utilization` against the widened frame; it is billed, and handed to an outer nesting
+  level, at the larger of its declared footprint and `achieved_dimensions` per horizontal axis
+  and its declared height. Beside non-empty `access_directions`, `axles`, `made_to_measure`,
+  non-empty `obstacles`, a positive `void_fill_reserve_ratio` or any item with a `stop_index`
+  it is `unsupported_feature` (`container.pallet_overhang_limit+<field>`); beside
+  `deformable_boundary` it is `invalid_request` / `not_allowed`; a frame past the admission
+  ceiling is `above_maximum`. Python `Container.pallet_overhang_limit` (a
+  `packvium.OverhangLimit`, last field); the object APIs refuse the same combinations as
+  `not_allowed`.
 - `PackingConfig`: solver profile, deadline, alternatives, deterministic seed, clearance,
   support threshold (`minimum_support_ratio`, default 0: support is not required, and an
   item may rest on nothing above the floor; set it above 0 to require that share of the
@@ -135,7 +174,18 @@
   search with `invalid_fixed_placement`. Python `Packer.pack(items, containers,
   fixed_placements)` and PHP `Packer::pack($items, $containers, $fixedPlacements)` take
   `FixedPlacement` values; Rust takes them in `PackingRequest.fixed_placements`, and every
-  JSON entry point reads the field; all four engines implement it.
+  JSON entry point reads the field; all four engines implement it. Since 1.10 an entry may
+  restate the result placement's `placement_id`, the canonical JSON of
+  `["<container_type>#<container_instance>", x, y, z, "<item_type>", "<orientation>"]` with the
+  position in ticks; any other string is refused as `invalid_fixed_placement` / `invalid_value` at
+  `/fixed_placements/<i>/placement_id`, and `null` is absent. Python's `FixedPlacement` takes it
+  as a trailing `placement_id: str | None = None`.
+- `currency` (1.10): optional ISO 4217 code, three capital letters, that every money
+  field of the request is in. It is echoed by the result and never priced, converted or
+  ranked by; a `rate_table.currency` must equal it. Python takes it as the trailing
+  `currency=None` of `Packer.pack(items, containers, fixed_placements, currency)` and of
+  `PackingRequest`, and `RateTable` gains a trailing `currency=None`; the object path refuses
+  it with the JSON path's reason and field.
 - `catalog_versions_used`: optional immutable catalog references resolved before
   packing. Each reference has exactly `catalog_id`, positive `version`,
   non-negative `published_at_epoch_ms`, and `content_digest`; catalog IDs are unique.
@@ -163,7 +213,8 @@ request field.
     extension point remains open: closing the object would make a previously valid
     producer fail a validator, which is a breaking change. Every engine emits these fields
     since, on the primary result and on each alternative, for the `default` and
-    `lowest_cost` objectives; a complete result that attains its bound reports `status:
+    `lowest_cost` objectives, and since 1.10.0 also for `maximum_value`,
+    `open_dimension_height` and `maximum_volume`; a complete result that attains its bound reports `status:
     optimal` and `code: proven_optimal`, and nothing else does;
 - legacy `status`: `optimal`, `feasible`, `best_found`, `time_limit`, `infeasible`, or `invalid_result`;
 - packed containers with exact coordinates, dimensions, rotations, and a
@@ -179,6 +230,14 @@ request field.
 - objective score — a five-key lexicographic vector of exact integers, lower is better, computed by the same formula in every implementation — and solver statistics. Under the default objective the keys are `unpacked_count`, `container_count`, `total_cost_minor`, `unused_volume_ppm` (per container `floor((V - used) x 10^6 / V)` of inner volume `V`) and `stack_height_ppm` (per container `floor(top x 10^6 / H)` of inner height `H`); `configuration.objective` selects one of seven orderings (`default`, `lowest_cost`, `shipping_cost`, `lowest_landed_cost`, `open_dimension_height`, `maximum_value`, `maximum_volume`), and the result echoes it in `objective`;
 - the exact `catalog_versions_used` lineage from the request (an empty array when no
   catalog was involved), preserved by Python, PHP, Rust and JavaScript;
+- a `placement_id` on every placement of the answer and every alternative (1.10):
+  the canonical JSON of `[container id, x, y, z, item_type, orientation]` with the position in
+  ticks, for example `["truck#1",0,0,1600000,"crate","LWH"]`, a pure function of the placement;
+  `validate` reports a missing or wrong one as `placement_id_mismatch` and a repeat as
+  `duplicate_placement_id`;
+- the request's `currency`, present exactly when the request declares one, on the answer and
+  every alternative (1.10); `validate` reports a missing, extra or different one as
+  `currency_mismatch`;
 - warnings and top-K alternatives. With `minimum_support_ratio` at its default 0, a result
   with a placement resting on nothing above the floor carries one
   `unsupported_placements: N placement(s) rest on nothing above the container floor; ...`
@@ -246,7 +305,10 @@ Metrics are diagnostics: they never participate in feasibility, ranking or the
 objective vector.
 
 `algorithm.time_limit_reached` and `algorithm.effort_limit_reached` identify distinct,
-mutually exclusive causes. The former is only a wall-clock deadline. The latter means
+mutually exclusive causes. The former is only a wall-clock deadline, read when the start
+ends: it says the deadline had passed by then, not that the clock cut work, so a start that
+finished its search just as the clock passed reads it too, in every engine, as
+`global_deadline_reached`, which requires it, does. The latter means
 the selected start was stopped by one of the request's counted-work boundaries: the search
 had more work to do and the budget refused it. A start that finished having used exactly its
 budget was not stopped, and reports neither flag. No counter in `algorithm.metrics` ends
@@ -645,7 +707,10 @@ otherwise refuse**, and the strongest thing it can do is reserve its own slot. A
 solve cannot honour comes back on `LockedResolve` as unpreserved and names the lock — it is
 an outcome, not an exception — while a lock set that contradicts itself, by overlapping or
 by naming an item the request does not contain, is refused with `LockSetError` before any
-solve runs.
+solve runs. Since 1.10 a lock read by `locks_from_plan` carries its reference's
+`placement_id` (`PlacementLock` gains a trailing `placement_id: str | None = None`), and
+preservation is checked by it rather than by `container_index`, the emitted container order
+a re-solve need not repeat.
 
 Python only, and deliberately so: a lock has no representation in the request schema, since
 that field is held for the next contract freeze, so there is nothing to hand another engine.
@@ -702,14 +767,15 @@ approved operational artifact and its events, and calls no solver or clock.
 
 | Language | Surface |
 | --- | --- |
-| Python | `packvium.revisions.root_revision(request)`, `.derive_revision(parent, approved_artifact, events)`, `.verify_revision_chain(revisions, artifacts=None)`, `.document_digest(document)`, `.canonical_revision_json(document)`; `packvium.revision_outcomes.record_revision(ledger, revision, decision_id, recorded_at)` |
+| Python | `packvium.revisions.root_revision(request)`, `.derive_revision(parent, approved_artifact, events)`, `.apply_events(request, events)`, `.stock_cut_boxes(request, approved_artifact, revision)`, `.verify_revision_chain(revisions, artifacts=None)`, `.document_digest(document)`, `.canonical_revision_json(document)`; `packvium.revision_outcomes.record_revision(ledger, revision, decision_id, recorded_at)` |
 | Rust | `packvium_core::revisions::root_revision_json(request)`, `derive_revision_json(parent, artifact, events)`, `apply_events_json(request, events)`, `verify_revision_chain_json(revisions, artifacts)`, `document_digest_json(document)`, `canonical_revision_json(document)`; SHA-256 from the `sha2` crate, so the WASM package hashes too |
 | JavaScript | `rootRevision`, `deriveRevision`, `applyEvents`, `verifyRevisionChain`, `documentDigest`, `canonicalRevisionJson` from `@packvium/engine`'s `revisions.js`; SHA-256 from `node:crypto` |
 | PHP | `Packvium\Revisions\PlanRevision::root($request)`, `::derive($parent, $approvedArtifact, $events)`, `::verifyChain($revisions, $artifacts)`, `::digest($document)`, `::canonicalJson($document)`, `::parse($json)`. Documents are `stdClass` trees, so `{}` and `[]` keep their digests |
 
 Digests are SHA-256 over the RFC 8785 canonical bytes. The audit reports `revision_number`,
-`parent_mismatch`, `sequence_gap`, `request_mismatch` and `artifact_mismatch` without
-stopping at the first. Refusals use `invalid_revision`, `invalid_event`, `event_conflict`,
+`parent_mismatch`, `sequence_gap`, `request_mismatch`, `artifact_mismatch` and
+`artifact_required` (a revision that stocks a made-to-measure box, audited without its
+artifact) without stopping at the first. Refusals use `invalid_revision`, `invalid_event`, `event_conflict`,
 `invalid_artifact` and the canonical-form codes.
 
 ## Scenario and recommendation API
@@ -746,12 +812,10 @@ credited to the treatment.
 paired cohort is too small. Neither writes to a registry: publishing goes only through
 `approve_catalog` / `approve_policy`, and a proposal is handed no registry to write to.
 
-**Supported, and not yet frozen.** This surface and `packvium.locks` are reached by
-importing the submodule, which puts them outside the frozen API snapshot the packing and
-commerce surfaces are held to. They work, they are tested, and they will not be withdrawn
-inside 1.x — but a parameter may be renamed or a returned value gain a field in a minor
-release, announced in the changelog rather than blocked by a gate. Pin the version if you
-depend on the exact shape.
+**Frozen since 1.10.0.** The six modules `packvium.simulation`, `packvium.recommendations`,
+`packvium.outcomes`, `packvium.holdout`, `packvium.pareto` and `packvium.locks` each declare
+`__all__` and are held to the API snapshot, as the packing and commerce surfaces are. From 1.2.0
+to 1.9.0 they were supported but provisional, so a signature could change in a minor release.
 
 ## JSON API
 
@@ -762,7 +826,6 @@ Python, PHP, Rust and the JavaScript fallback accept the same top-level keys: `u
 `units` holds one key, `length`: the unit of every length written without one, millimetres when
 `units`, or `units.length`, is absent or `null`. There is no request-wide weight unit. A weight
 takes its unit from the measure itself (`"2.5 kg"`, `{"value": "2.5", "unit": "kg"}`), and a
-bare number is grams. `units.weight` is not a field: today every engine ignores it without an
-error, so `{"length": "cm", "weight": "kg"}` still reads a bare weight `2` as 2 g. Write the unit
-on each weight instead. A future release that changes the request schema will refuse unknown
-keys in `units`, as it already refuses them in `configuration`.
+bare number is grams. `units` is closed: since 1.10.0 a key other than `length` is refused as
+`not_allowed` at `/units/<key>` (docs/ERRORS.md), so `{"length": "cm", "weight": "kg"}`, which
+used to read a bare weight `2` as 2 g without a word, is an error. Write the unit on each weight.

@@ -54,6 +54,7 @@ fn constructed_item_and_container_pack_like_json_that_omits_every_optional_field
         output_length_unit: "mm".into(),
         output_weight_unit: "g".into(),
         catalog_versions_used: Vec::new(),
+        currency: None,
         fixed_placements: Vec::new(),
         fixed_containers: Vec::new(),
     };
@@ -62,7 +63,7 @@ fn constructed_item_and_container_pack_like_json_that_omits_every_optional_field
         .to_json("mm", "g", false);
 
     let text = json!({
-        "units": { "length": "mm", "weight": "g" },
+        "units": { "length": "mm" },
         "configuration": { "time_limit_ms": 60000, "effort_budget": { "max_search_nodes": 100000 } },
         "items": [
             { "id": "book", "quantity": 4, "weight": "650",

@@ -8,15 +8,47 @@ use super::num::{abs, add, mul, sub};
 
 pub(crate) type Vertex = [i128; 3];
 
-/// Axis permutation each orientation code applies to (length, width, height).
-pub(crate) const ROTATIONS: [(&str, [usize; 3]); 6] = [
-    ("LWH", [0, 1, 2]),
-    ("LHW", [0, 2, 1]),
-    ("WLH", [1, 0, 2]),
-    ("WHL", [1, 2, 0]),
-    ("HLW", [2, 0, 1]),
-    ("HWL", [2, 1, 0]),
+/// The six legacy orientation codes: every box a cuboid can make, and an item's default list.
+pub(crate) const BOX_ROTATIONS: [&str; 6] = ["LWH", "LHW", "WLH", "WHL", "HLW", "HWL"];
+
+/// Each of the 24 proper rotations, in canonical table order (1.10): the code, the declared
+/// side each container axis takes its extent from, and the sign it carries. Written out rather
+/// than read from the engine's `Rotation`, so this table is a second statement of the contract
+/// and not a copy of the engine's. The legacy codes negate x exactly when their permutation is
+/// odd; a box ignores the signs, a hull does not.
+pub(crate) const ROTATIONS: [(&str, [usize; 3], [i128; 3]); 24] = [
+    ("LWH", [0, 1, 2], [1, 1, 1]),
+    ("LHW", [0, 2, 1], [-1, 1, 1]),
+    ("WLH", [1, 0, 2], [-1, 1, 1]),
+    ("WHL", [1, 2, 0], [1, 1, 1]),
+    ("HLW", [2, 0, 1], [1, 1, 1]),
+    ("HWL", [2, 1, 0], [-1, 1, 1]),
+    ("+L-W-H", [0, 1, 2], [1, -1, -1]),
+    ("-L+W-H", [0, 1, 2], [-1, 1, -1]),
+    ("-L-W+H", [0, 1, 2], [-1, -1, 1]),
+    ("+L-H+W", [0, 2, 1], [1, -1, 1]),
+    ("+L+H-W", [0, 2, 1], [1, 1, -1]),
+    ("-L-H-W", [0, 2, 1], [-1, -1, -1]),
+    ("+W-L+H", [1, 0, 2], [1, -1, 1]),
+    ("+W+L-H", [1, 0, 2], [1, 1, -1]),
+    ("-W-L-H", [1, 0, 2], [-1, -1, -1]),
+    ("+W-H-L", [1, 2, 0], [1, -1, -1]),
+    ("-W+H-L", [1, 2, 0], [-1, 1, -1]),
+    ("-W-H+L", [1, 2, 0], [-1, -1, 1]),
+    ("+H-L-W", [2, 0, 1], [1, -1, -1]),
+    ("-H+L-W", [2, 0, 1], [-1, 1, -1]),
+    ("-H-L+W", [2, 0, 1], [-1, -1, 1]),
+    ("+H-W+L", [2, 1, 0], [1, -1, 1]),
+    ("+H+W-L", [2, 1, 0], [1, 1, -1]),
+    ("-H-W-L", [2, 1, 0], [-1, -1, -1]),
 ];
+
+/// Whether `code` keeps the item's own height vertical and pointing up: z takes `+H`.
+pub(crate) fn is_upright(code: &str) -> bool {
+    ROTATIONS
+        .iter()
+        .any(|(name, axes, signs)| *name == code && axes[2] == 2 && signs[2] == 1)
+}
 
 /// An axis-aligned box. Its far corner and base area are computed once, checked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,17 +173,17 @@ pub(crate) fn primitive_axis(axis: Vertex) -> Res<Vertex> {
     })
 }
 
-/// Reorient a hull the way `ROTATIONS` reorients its box, flipping one axis on an odd
-/// permutation so it stays a proper rotation, then translated so its bounds start at 0.
-pub(crate) fn rotate_hull(vertices: &[Vertex], axes: [usize; 3]) -> Res<Vec<Vertex>> {
-    let inversions = (0..3)
-        .flat_map(|first| (first + 1..3).map(move |second| (first, second)))
-        .filter(|&(first, second)| axes[first] > axes[second])
-        .count();
-    let sign = if inversions % 2 == 1 { -1 } else { 1 };
+/// Reorient a hull by one of the 24 proper rotations, never mirroring it: `v'[i] = s[i] *
+/// v[src[i]]` from `ROTATIONS`, where every code has determinant +1, then translated so its
+/// bounds start at 0.
+pub(crate) fn rotate_hull(
+    vertices: &[Vertex],
+    axes: [usize; 3],
+    signs: [i128; 3],
+) -> Res<Vec<Vertex>> {
     let turned: Vec<Vertex> = vertices
         .iter()
-        .map(|vertex| [sign * vertex[axes[0]], vertex[axes[1]], vertex[axes[2]]])
+        .map(|vertex| std::array::from_fn(|axis| signs[axis] * vertex[axes[axis]]))
         .collect();
     let low: Vec<i128> = (0..3)
         .map(|axis| turned.iter().map(|vertex| vertex[axis]).min().unwrap_or(0))

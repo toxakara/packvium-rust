@@ -1,4 +1,4 @@
-//! Objectives: six ways to be "best", and the scenes where they disagree.
+//! Objectives: seven ways to be "best", and the scenes where they disagree.
 //!
 //!     cargo run --example objectives
 //!
@@ -9,8 +9,13 @@
 //! asserted.
 //!
 //! The score is always a vector of exact integers compared left to right, never a float, and
-//! its first key is always the number of unpacked items: no objective will leave an item
-//! behind to save money. Ratios are parts per million.
+//! its first key is the number of unpacked items -- no objective will leave an item behind to
+//! save money -- except under `maximum_volume`, which ranks the unpacked share of the volume
+//! first. Ratios are parts per million.
+//!
+//! Under every objective but the two carrier ones, a result also states a lower bound on its
+//! score, through the first key where the score misses it. A result that attains its bound is
+//! `proven_optimal`; any other says how far it can be from the best possible answer.
 
 use serde_json::{Value, json};
 
@@ -18,6 +23,15 @@ type Outcome = Result<Value, packvium_core::PackError>;
 
 /// Solve `items` into `containers` under `objective`, with any extra configuration merged in.
 fn solve(objective: &str, extra: Value, items: &Value, containers: Value) -> Outcome {
+    run(request(objective, extra, items, containers))
+}
+
+fn run(request: Value) -> Outcome {
+    let text = packvium_core::pack_json(&request.to_string())?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn request(objective: &str, extra: Value, items: &Value, containers: Value) -> Value {
     let mut configuration = json!({
         "objective": objective,
         // Counted work bounds the search; the time limit is only a safety fuse.
@@ -31,14 +45,12 @@ fn solve(objective: &str, extra: Value, items: &Value, containers: Value) -> Out
     if let (Some(target), Some(extra)) = (configuration.as_object_mut(), extra.as_object()) {
         target.extend(extra.clone());
     }
-    let request = json!({
+    json!({
         "units": { "length": "mm" },
         "configuration": configuration,
         "items": items,
         "containers": containers,
-    });
-    let text = packvium_core::pack_json(&request.to_string())?;
-    Ok(serde_json::from_str(&text)?)
+    })
 }
 
 /// Which container type won, and the score that decided it.
@@ -49,9 +61,24 @@ fn report(label: &str, outcome: Outcome) {
                 .as_str()
                 .unwrap_or("none");
             println!("{label:<18} {chosen:<6} score {}", result["score"]);
+            println!("{:<18} {}", "", optimality(&result));
         }
         Err(refusal) => println!("{label:<18} refused: {} -- {refusal}", refusal.code()),
     }
+}
+
+/// How far the answer can be from the best possible one. A result that attains its stated
+/// lower bound is `proven_optimal`: no packing that obeys the request scores better.
+fn optimality(result: &Value) -> String {
+    let optimality = &result["optimality"];
+    match optimality.get("lower_bound") {
+        Some(bound) => format!("{}, lower bound {bound}", text(&optimality["code"])),
+        None => format!("{}, no bound stated", text(&optimality["code"])),
+    }
+}
+
+fn text(value: &Value) -> &str {
+    value.as_str().unwrap_or_default()
 }
 
 fn container(id: &str, edge: &str, fields: Value) -> Value {
@@ -179,7 +206,69 @@ fn main() {
             let kept = ids(&result["containers"][0]["placements"], "item_type");
             let left = ids(&result["unpacked_items"], "item_type");
             println!("maximum_value      packed {kept:?}, left behind {left:?}");
+            println!("{:<18} {}", "", optimality(&result));
         }
         Err(refusal) => println!("maximum_value      refused: {refusal}"),
     }
+
+    // `maximum_volume` -- load the most cubic metres, even at the cost of more items left
+    // behind. The one crate holds either the long case or three short ones: `default` keeps
+    // the count of unpacked items lowest, `maximum_volume` keeps the unpacked volume lowest.
+    let loads = json!([
+        { "id": "long", "quantity": 1, "weight": "1 kg",
+          "dimensions": { "length": "200", "width": "100", "height": "100" } },
+        { "id": "short", "quantity": 3, "weight": "1 kg",
+          "dimensions": { "length": "100", "width": "100", "height": "50" } }
+    ]);
+    let one_crate = || {
+        json!([{ "id": "crate", "quantity": 1, "max_payload": "20 kg",
+                 "inner_dimensions": { "length": "200", "width": "100", "height": "100" } }])
+    };
+    for objective in ["default", "maximum_volume"] {
+        match solve(objective, json!({}), &loads, one_crate()) {
+            Ok(result) => println!(
+                "{objective:<18} left behind {} item(s), score {}",
+                result["unpacked_items"].as_array().map_or(0, Vec::len),
+                result["score"]
+            ),
+            Err(refusal) => println!("{objective:<18} refused: {refusal}"),
+        }
+    }
+
+    // A price is a number in some currency. Declaring it is optional; when the request does,
+    // every rate card must agree with it, and the result carries it back, so a stored answer
+    // never loses what its money is in. It never changes the search or the score.
+    let priced = |currency: &str| {
+        let card = |id: &str, edge: &str, prices: [i64; 2]| {
+            container(
+                id,
+                edge,
+                json!({ "rate_table": { "currency": currency,
+                                        "weight_brackets_g": [6000, 20000],
+                                        "prices_minor": prices } }),
+            )
+        };
+        let mut request = request(
+            "lowest_landed_cost",
+            dimensional(),
+            &widgets,
+            json!([
+                card("snug", "300", [2400, 3100]),
+                card("roomy", "400", [900, 1500])
+            ]),
+        );
+        request["currency"] = json!("EUR");
+        run(request)
+    };
+    match priced("EUR") {
+        Ok(result) => println!(
+            "{:<18} {} score {}, prices in {}",
+            "  (in EUR)",
+            text(&result["containers"][0]["container_type"]),
+            result["score"],
+            text(&result["currency"])
+        ),
+        Err(refusal) => println!("  (in EUR)         refused: {refusal}"),
+    }
+    report("  (card in USD)", priced("USD"));
 }

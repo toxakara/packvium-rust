@@ -6,7 +6,7 @@ mod support;
 
 use packvium_core::{
     ALL_DIRECTIONS, Aabb, Dimensions, Length, LoadingDependencyGraph, Point, SequenceError,
-    UnloadingDependencyGraph, placement_reachability, replay_removal_order,
+    UnloadingDependencyGraph, Weight, placement_reachability, replay_removal_order,
     safe_loading_order_for_placements, safe_removal_order_with_evidence,
     verify_loading_prefix_business_rules,
 };
@@ -195,4 +195,36 @@ fn a_placement_order_refuses_geometry_and_business_rule_violations() {
             ..
         })
     ));
+}
+
+#[test]
+fn an_empty_scene_has_no_prefix_to_break() {
+    assert_eq!(
+        verify_loading_prefix_business_rules(&[], &[], &container()),
+        Ok(())
+    );
+}
+
+/// A floor box nothing rests on is judged by its own density alone, and one inside the
+/// limit loads; the same box past a tighter limit is refused at its step.
+#[test]
+fn a_floor_box_within_the_stack_density_limit_loads() {
+    let heavy = item("heavy");
+    let placements = [placed(&heavy, 1, 0, 0)];
+    let mut roomy = container();
+    roomy.max_stack_density = Some(Weight(i64::MAX));
+    assert_eq!(
+        verify_loading_prefix_business_rules(&placements, &[0], &roomy),
+        Ok(())
+    );
+    let mut tight = container();
+    tight.max_stack_density = Some(Weight(0));
+    assert_eq!(
+        verify_loading_prefix_business_rules(&placements, &[0], &tight),
+        Err(SequenceError::Replay {
+            index: 0,
+            step: 0,
+            reason: "stack_density_exceeded"
+        })
+    );
 }

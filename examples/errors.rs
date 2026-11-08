@@ -144,9 +144,14 @@ fn main() {
     case("two fixed placements in the same spot", &fixed);
 
     println!("\n== Other refusals: each has its own code ==");
+    let mut pallet_on_axles = with(
+        "/containers/0/pallet_overhang_limit",
+        json!({"length": "50", "width": "50"}),
+    );
+    pallet_on_axles["containers"][0]["axles"] = json!([]);
     case(
-        "a field this engine deliberately does not implement",
-        &with("/containers/0/pallet_overhang_limit", json!("10")),
+        "a combination this engine deliberately does not implement",
+        &pallet_on_axles,
     );
     case("JSON, but a string instead of an object", &json!("items"));
     println!("\nthe bytes themselves are not JSON");

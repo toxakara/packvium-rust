@@ -226,17 +226,22 @@ fn a_fixed_placement_refusal_keeps_its_message_and_gains_reason_and_field() {
 }
 
 #[test]
-fn a_parse_failure_the_rules_do_not_name_is_an_invalid_value_without_a_field() {
+fn an_empty_rotation_list_names_the_request_rule_it_breaks() {
     let mut request = base();
-    // A model rule the schema does not state: an item needs at least one rotation. (An
-    // unknown shape type was this case until made it a `not_allowed` rule.)
     request["items"][0]["allowed_rotations"] = json!([]);
     let error = refused(&request);
     assert_eq!(
         (error.code(), error.reason(), error.field()),
-        ("invalid_request", "invalid_value", "")
+        (
+            "invalid_request",
+            "invalid_value",
+            "/items/0/allowed_rotations"
+        )
     );
-    assert!(error.detail().contains("no allowed rotations"), "{error}");
+    assert_eq!(
+        error.detail(),
+        "must allow at least one rotation after keep_upright"
+    );
 }
 
 #[test]
@@ -278,9 +283,11 @@ fn an_unknown_objective_or_access_direction_is_refused_with_not_allowed_and_poin
 fn an_unsupported_feature_and_a_solver_precondition_are_not_relabelled() {
     let mut request = base();
     request["containers"][0]["pallet_overhang_limit"] = json!(10);
+    request["containers"][0]["axles"] = json!([]);
     assert!(matches!(
         pack_json(&request.to_string()),
-        Err(PackError::UnsupportedFeature(_))
+        Err(PackError::UnsupportedFeature(message))
+            if message.contains("container.pallet_overhang_limit+axles")
     ));
     let mut request = base();
     request["configuration"]["objective"] = json!("lowest_landed_cost");
@@ -797,4 +804,15 @@ fn every_item_weight_times_its_quantity_and_the_heaviest_tare_fit_the_ceiling() 
     assert!(pack_json(&request.to_string()).is_ok());
     request["containers"][0]["tare_weight"] = json!({ "value": "2", "unit": "ticks" });
     assert_eq!(refused(&request).field(), "/items");
+}
+
+/// A whole JSON number past `i64::MAX` is still a number every engine reads, and past
+/// 2^53 - 1 its ticks are past the length ceiling in any unit.
+#[test]
+fn a_length_past_i64_is_too_long_rather_than_unreadable() {
+    let mut request = base();
+    request["items"][0]["dimensions"]["length"] = json!(u64::MAX);
+    let error = refused(&request);
+    assert_eq!(error.reason(), "above_maximum");
+    assert_eq!(error.field(), "/items/0/dimensions/length");
 }

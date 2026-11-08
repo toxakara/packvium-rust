@@ -468,6 +468,18 @@ mod tests {
     }
 
     #[test]
+    fn half_even_rounding_refuses_a_denominator_that_is_not_positive() {
+        assert_eq!(round_half_even(5, 2).unwrap(), 2);
+        assert_eq!(round_half_even(7, 2).unwrap(), 4);
+        for denominator in [0, -2] {
+            assert!(matches!(
+                round_half_even(5, denominator),
+                Err(PackError::InvalidNumber(message)) if message == "zero denominator"
+            ));
+        }
+    }
+
+    #[test]
     fn every_spelling_of_a_vast_length_is_past_the_ceiling() {
         for text in [
             VAST.to_owned(),

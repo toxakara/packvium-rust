@@ -29,12 +29,19 @@ fn two_items_in_one_place_are_a_collision_named_as_the_reference_names_it() {
     let first = result["containers"][0]["placements"][0]["position"].clone();
     result["containers"][0]["placements"][1]["position"] = first;
     let issues = validate_json(REQUEST, &result.to_string()).unwrap();
+    // The moved placement still quotes the id of where it was (1.10).
     assert_eq!(
         issues,
-        vec![ResultIssue {
-            code: "collision".to_owned(),
-            detail: "cube#1 with cube#2 in box#1".to_owned(),
-        }]
+        vec![
+            ResultIssue {
+                code: "collision".to_owned(),
+                detail: "cube#1 with cube#2 in box#1".to_owned(),
+            },
+            ResultIssue {
+                code: "placement_id_mismatch".to_owned(),
+                detail: r#"cube#2 in box#1: reported ["box#1",160000,0,0,"cube","LWH"], expected ["box#1",0,0,0,"cube","LWH"]"#.to_owned(),
+            },
+        ]
     );
 }
 
@@ -297,4 +304,26 @@ fn an_issue_on_a_container_without_an_id_is_refused() {
         .remove("id");
     let refusal = validate_json(REQUEST, &result.to_string()).unwrap_err();
     assert_eq!(refusal.kind, RefusalKind::Shape);
+}
+
+#[test]
+fn an_empty_effective_rotation_list_is_a_validator_contract_refusal() {
+    let result = packed().to_string();
+    for (codes, upright) in [
+        (serde_json::json!(["+L-W-H"]), true),
+        (serde_json::json!(["LHW"]), true),
+        (serde_json::json!([]), true),
+        (serde_json::json!([]), false),
+    ] {
+        let mut request: Value = serde_json::from_str(REQUEST).unwrap();
+        request["items"][0]["shape_type"] = serde_json::json!("convex_hull");
+        request["items"][0]["allowed_rotations"] = codes;
+        request["items"][0]["keep_upright"] = serde_json::json!(upright);
+        let refusal = validate_json(&request.to_string(), &result).unwrap_err();
+        assert_eq!(refusal.kind, RefusalKind::Contract);
+        assert_eq!(
+            refusal.message,
+            "items[0].allowed_rotations must allow at least one rotation after keep_upright"
+        );
+    }
 }

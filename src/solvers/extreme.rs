@@ -6,6 +6,7 @@ use crate::geometry::{self, Aabb, Dimensions, Point, Rotation, ShapeType};
 use crate::hull::{self, HullShape};
 use crate::made_to_measure::sides_of;
 use crate::model::*;
+use crate::pallet_overhang::{deck_alone, floor_support, moved};
 use crate::solver::{CandidateScorer, PlacementConstraint, SolverContext};
 use crate::spatial_index::SpatialIndex;
 use crate::support_polygon::centre_of_gravity_supported;
@@ -27,10 +28,11 @@ pub struct Candidate {
     pub score: i128,
 }
 
-type CandidateOrderKey = (i128, i64, i64, i64, i64, i64, i64, &'static str);
+type CandidateOrderKey = (i128, i64, i64, i64, i64, i64, i64, usize);
 
 /// Lower ranks first: scorer sum, then the envelope's far corner `z2`, `y2`, `x2`, then
-/// its origin `z`, `y`, `x` and the rotation name. Compared as a tuple, never folded into
+/// its origin `z`, `y`, `x` and the rotation's table index -- the canonical order (1.10),
+/// never its spelling, which would rank `+H-W+L` before `LWH`. Compared as a tuple, never folded into
 /// one weighted integer: in ticks a long container's `x2` outweighs a 1 mm step in `y2`
 /// under any fixed weights.
 fn candidate_order_key(candidate: &Candidate) -> CandidateOrderKey {
@@ -44,7 +46,7 @@ fn candidate_order_key(candidate: &Candidate) -> CandidateOrderKey {
         origin.z,
         origin.y,
         origin.x,
-        candidate.rotation.as_str(),
+        candidate.rotation.index(),
     )
 }
 
@@ -500,7 +502,7 @@ pub fn find_candidates_at_points(
             let shape = exact_hull
                 .then_some(item.item.hull_vertices.as_ref())
                 .flatten()
-                .and_then(|vertices| hull::shape_for(vertices, hull::source_axes(rotation)));
+                .and_then(|vertices| hull::shape_for(vertices, rotation));
             (rotation, physical, envelope, shape)
         })
         .collect::<Vec<_>>();
@@ -579,6 +581,9 @@ pub fn find_candidates_at_points(
         )
     });
     let flat_bag = state.packed.container.is_flat_bag();
+    // W + G is summed once per call, so each candidate's girth check stays O(1) (1.10).
+    let girth_length = state.packed.container.inner_dimensions.length.0;
+    let girth_width = state.packed.container.girth_width_limit();
     let axle_base = AxleBase::new(&state.packed.container, &state.packed.placements);
     let mut candidates = CandidateAccumulator::new(limit);
     for (point_index, point) in points.into_iter().enumerate() {
@@ -601,13 +606,15 @@ pub fn find_candidates_at_points(
             if !boundary.contains(envelope_box) {
                 continue;
             }
-            // A flat bag also needs a + c <= L and b + c <= W over the running extents grown
-            // by the candidate: O(1), and the extents only grow, so no verdict flips.
+            // A bag also needs a + c <= L and b + c <= W + G over the running extents grown
+            // by the candidate (G is a gusseted bag's side gusset, 0 for a flat one):
+            // O(1), and the extents only grow, so no verdict flips.
             if flat_bag
-                && !state
-                    .packed
-                    .container
-                    .girth_admits(grown_extent(state.extent, envelope_box))
+                && !girth_within(
+                    grown_extent(state.extent, envelope_box),
+                    girth_length,
+                    girth_width,
+                )
             {
                 continue;
             }
@@ -694,7 +701,10 @@ pub fn find_candidates_at_points(
             let nested_support = tentative
                 .as_ref()
                 .map(|placement| placement_support_view(&state.packed.placements, placement));
+            let deck = state.packed.container.deck;
             let (support_area, support_ratio) = match nested_support.as_ref() {
+                // A pallet's floor bears weight on its deck alone.
+                _ if point.z == 0 && deck.is_some() => floor_support(deck, envelope_box),
                 Some(support) => (support.area, support.ratio),
                 None if point.z == 0 => (envelope.base_area(), 1.0),
                 None => {
@@ -712,6 +722,11 @@ pub fn find_candidates_at_points(
                 envelope.base_area(),
                 required_support,
             ) {
+                continue;
+            }
+            if point.z == 0
+                && deck.is_some_and(|deck| deck.refusal(envelope_box, required_support).is_some())
+            {
                 continue;
             }
             // Area alone is not stability. At or below half the base the
@@ -985,6 +1000,7 @@ pub fn pack_order(
         optimality: None,
         objective: request.config.objective.clone(),
         catalog_versions_used: Vec::new(),
+        currency: None,
     }
 }
 
@@ -1012,6 +1028,11 @@ where
         &mut SolverMetrics,
     ) -> (ContainerState, Vec<ItemInstance>),
 {
+    if container.deck.is_some() && container.preloaded.is_empty() {
+        return pallet_trial(
+            container, sequence, remaining, request, deadline, metrics, &mut fill,
+        );
+    }
     let Some(machine) = container.made_to_measure else {
         let (state, next) = fill(container.clone(), sequence, remaining, metrics);
         return (state, next, 1);
@@ -1040,7 +1061,12 @@ where
         if state.packed.placements.is_empty() {
             last = Some((state, next));
         } else {
-            let state = fabricated(container, state);
+            let tight = fabricated(container, state.clone(), None);
+            let state = if keeps_reserve(&tight) {
+                tight
+            } else {
+                fabricated(container, state, Some(rung))
+            };
             if next.is_empty() {
                 return (state, next, trials);
             }
@@ -1063,14 +1089,105 @@ where
     }
 }
 
+/// Pack the deck alone first and use the overhang only when it places more.
+///
+/// Every search starts at its frame's origin, the corner of the overhang zone, so a frame
+/// solve overhangs even a load the deck holds, and is billed for it. The deck rung is the
+/// container as declared; its trial moves onto the frame by the overhang zone. A frame trial
+/// that wins is seated with the least overhang its support allows. At most two solves, each
+/// `O(p)` to move. A frame holding fixed items skips the rung, since they may already
+/// overhang.
+fn pallet_trial<F>(
+    frame: &Container,
+    sequence: usize,
+    remaining: &[ItemInstance],
+    request: &PackingRequest,
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+    fill: &mut F,
+) -> (ContainerState, Vec<ItemInstance>, usize)
+where
+    F: FnMut(
+        Container,
+        usize,
+        &[ItemInstance],
+        &mut SolverMetrics,
+    ) -> (ContainerState, Vec<ItemInstance>),
+{
+    let deck = frame.deck.expect("a pallet trial packs a solving frame");
+    let (on_deck, deck_left) = fill(deck_alone(frame), sequence, remaining, metrics);
+    if deck_left.is_empty() || deadline.expired() || deadline.effort_stops(request, metrics) {
+        return (moved_trial(frame, &on_deck, deck.x, deck.y), deck_left, 1);
+    }
+    let (framed, frame_left) = fill(frame.clone(), sequence, remaining, metrics);
+    if framed.packed.placements.len() > on_deck.packed.placements.len() {
+        return (seated(frame, framed, request), frame_left, 2);
+    }
+    (moved_trial(frame, &on_deck, deck.x, deck.y), deck_left, 2)
+}
+
+/// A trial's whole load moved by `(dx, dy)` on the frame, rebuilt so the state's points and
+/// index describe the frame. `O(p)` commits.
+fn moved_trial(frame: &Container, trial: &ContainerState, dx: i64, dy: i64) -> ContainerState {
+    let mut container = frame.clone();
+    container.preloaded = trial
+        .packed
+        .placements
+        .iter()
+        .map(|placement| moved(frame, placement, dx, dy))
+        .collect();
+    ContainerState::new(container, trial.packed.sequence)
+}
+
+/// A frame trial moved to the least overhang, kept where the search left it if the move
+/// would leave a floor placement short of deck support. `O(p)`.
+fn seated(frame: &Container, trial: ContainerState, request: &PackingRequest) -> ContainerState {
+    let deck = frame.deck.expect("only a solving frame is seated");
+    let (dx, dy) = deck.centring_offset(&trial.packed.placements);
+    if (dx, dy) == (0, 0) {
+        return trial;
+    }
+    let seated = moved_trial(frame, &trial, dx, dy);
+    let supported = seated.packed.placements.iter().all(|placement| {
+        let required = placement
+            .instance
+            .item
+            .minimum_support_ratio
+            .max(request.config.minimum_support_ratio);
+        placement.envelope_origin.z != 0
+            || deck.refusal(placement.envelope_box(), required).is_none()
+    });
+    if supported { seated } else { trial }
+}
+
 /// A rung trial as the box cut for it: the achieved extent of its placements, envelope far
-/// faces with clearance, rounded up onto the machine grid (D14). `O(p)`.
-fn fabricated(declared: &Container, mut state: ContainerState) -> ContainerState {
-    let achieved = envelope_extent(&state.packed.placements);
+/// faces with clearance, rounded up onto the machine grid (D14); or, given `rung`, the rung
+/// itself, which is already on the grid. `O(p)`.
+fn fabricated(
+    declared: &Container,
+    mut state: ContainerState,
+    rung: Option<[i64; 3]>,
+) -> ContainerState {
+    let achieved = rung.unwrap_or_else(|| envelope_extent(&state.packed.placements));
     state.packed.container = declared
         .fabricate(achieved)
         .expect("only a made-to-measure container is fabricated");
     state
+}
+
+/// Whether a fabricated box keeps its void-fill reserve. The reserve is a share of
+/// the box that ships, so a box cut tight to its load can break a reserve the rung kept: the
+/// trial then cuts the rung itself, on the grid by construction and solved under its reserve.
+/// `O(1)`.
+fn keeps_reserve(state: &ContainerState) -> bool {
+    let container = &state.packed.container;
+    container.void_fill_reserve_ppm == 0
+        || state.used_volume <= container.inner_dimensions.volume() - reserved_volume(container)
+}
+
+/// The volume a container's void-fill reserve holds back, the solvers' one reserve rule.
+pub(crate) fn reserved_volume(container: &Container) -> i128 {
+    container.inner_dimensions.volume() * container.void_fill_reserve_ppm / 1_000_000
 }
 
 /// Containers opened so far, what is left to place, and each type's inventory and count.
@@ -2525,9 +2642,7 @@ fn exceeds_void_fill_reserve(
     item: &ItemInstance,
     candidate: &Candidate,
 ) -> bool {
-    let reserve = state.packed.container.inner_dimensions.volume()
-        * state.packed.container.void_fill_reserve_ppm
-        / 1_000_000;
+    let reserve = reserved_volume(&state.packed.container);
     if reserve == 0 {
         return false;
     }
@@ -3405,10 +3520,11 @@ fn best_beam_nodes(
 pub(crate) const SCORE_SCALE: i128 = 1_000_000;
 
 pub(crate) fn dimensional_weight_ticks(container: &Container, config: &PackingConfig) -> i128 {
+    // An empty pallet is billed at its declared footprint, never its solving frame.
     dimensional_weight_of(
         container
             .outer_dimensions
-            .unwrap_or(container.inner_dimensions),
+            .unwrap_or_else(|| container.declared_inner()),
         config,
     )
 }
@@ -4226,6 +4342,8 @@ mod tests {
             preloaded: Vec::new(),
             deformable_boundary: None,
             made_to_measure: None,
+            pallet_overhang_limit: None,
+            deck: None,
         }
     }
 
@@ -4246,6 +4364,7 @@ mod tests {
             output_length_unit: "ticks".into(),
             output_weight_unit: "ticks".into(),
             catalog_versions_used: Vec::new(),
+            currency: None,
             fixed_placements: Vec::new(),
             fixed_containers: Vec::new(),
         }
@@ -5051,6 +5170,214 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ranked_candidates_are_equal_by_rank_and_arrival_alone() {
+        let ranked = |ordinal, support_ratio| {
+            let candidate = candidate(0, Point::ZERO, Rotation::Lwh, support_ratio);
+            RankedCandidate {
+                key: candidate_order_key(&candidate),
+                ordinal,
+                candidate,
+            }
+        };
+        // The payload is not part of the identity: the heap orders by key and ordinal only.
+        assert!(ranked(0, 1.0) == ranked(0, 0.5));
+        assert!(ranked(0, 1.0) != ranked(1, 1.0));
+    }
+
+    fn cube_instance(id: &str, side: i64, sequence: usize) -> ItemInstance {
+        let mut cube = item(id);
+        cube.dimensions = dimensions(side, side, side);
+        cube.allowed_rotations = vec![Rotation::Lwh];
+        ItemInstance {
+            item: cube,
+            sequence,
+        }
+    }
+
+    fn cube_at(side: i64, origin: Point) -> Candidate {
+        Candidate {
+            envelope_origin: origin,
+            position: origin,
+            rotation: Rotation::Lwh,
+            dimensions: dimensions(side, side, side),
+            envelope_dimensions: dimensions(side, side, side),
+            support_ratio: 1.0,
+            score: 0,
+        }
+    }
+
+    #[test]
+    fn the_cartesian_point_set_stops_at_its_limit_in_layer_order() {
+        let mut state = ContainerState::new(container(), 1);
+        for step in 0..8 {
+            let corner = step * 10;
+            apply_candidate(
+                &mut state,
+                cube_instance("cube", 10, step as usize + 1),
+                &cube_at(
+                    10,
+                    Point {
+                        x: corner,
+                        y: corner,
+                        z: corner,
+                    },
+                ),
+            );
+        }
+        // Nine coordinates per axis: far more combinations than the limit admits.
+        let points = candidate_points(&state, 65, PointSet::Cartesian);
+        assert_eq!(points.len(), 65);
+        assert!(points.iter().all(|point| point.z == 0));
+        assert!(!points.contains(&Point::ZERO), "the first cube covers it");
+        assert!(
+            points
+                .windows(2)
+                .all(|pair| (pair[0].y, pair[0].x) < (pair[1].y, pair[1].x))
+        );
+    }
+
+    #[test]
+    fn a_container_at_its_item_cap_offers_no_candidate() {
+        let mut capped = container();
+        capped.max_items = Some(1);
+        let next = cube_instance("cube", 10, 2);
+        let request = request(&next.item, &capped, None);
+        let deadline = Deadline::new(60_000);
+        let mut state = ContainerState::new(capped, 1);
+        let offered = |state: &ContainerState| {
+            find_candidates(
+                state,
+                &next,
+                &request,
+                &[],
+                &[],
+                usize::MAX,
+                PointSet::Sparse,
+                &deadline,
+                &mut SolverMetrics::default(),
+            )
+            .len()
+        };
+        assert!(offered(&state) > 0);
+        apply_candidate(
+            &mut state,
+            cube_instance("cube", 10, 1),
+            &cube_at(10, Point::ZERO),
+        );
+        assert_eq!(offered(&state), 0);
+    }
+
+    #[test]
+    fn the_container_plan_bound_skips_volume_for_nesting_items_and_payload_for_zero_capacity() {
+        let mut nesting = cube_instance("cup", 1_000, 1);
+        nesting.item.nesting_height = Some(Length(100));
+        nesting.item.weight = Weight(5);
+        let mut crate_ = container();
+        crate_.quantity = Some(3);
+        let plan = |remaining: Vec<ItemInstance>| OpenedContainers {
+            packed: Vec::new(),
+            remaining,
+            inventory: BTreeMap::from([(crate_.id.clone(), Some(3))]),
+            sequences: BTreeMap::new(),
+        };
+        let cups = vec![nesting.clone(), nesting.clone(), nesting.clone()];
+        // Three whole-crate cups nest into one crate, so volume proves nothing about them.
+        let request_for = |container: &Container| request(&nesting.item, container, None);
+        assert_eq!(
+            additional_container_lower_bound(&plan(cups.clone()), &request_for(&crate_)),
+            0
+        );
+        let mut weighed = crate_.clone();
+        weighed.max_payload = Some(Weight(10));
+        assert_eq!(
+            additional_container_lower_bound(&plan(cups.clone()), &request_for(&weighed)),
+            2
+        );
+        // A payload of zero is no capacity to divide by: it adds no bound at all.
+        weighed.max_payload = Some(Weight(0));
+        assert_eq!(
+            additional_container_lower_bound(&plan(cups), &request_for(&weighed)),
+            0
+        );
+    }
+
+    fn body_at(
+        origin: Point,
+        size: (i64, i64),
+        max_stacked_items: Option<usize>,
+    ) -> LoadBody<'static> {
+        static NO_GROUPS: BTreeSet<String> = BTreeSet::new();
+        LoadBody {
+            envelope: Aabb {
+                origin,
+                dimensions: dimensions(size.0, size.1, 10),
+            },
+            footprint: i128::from(size.0 * size.1),
+            weight: 1_000,
+            stackable: true,
+            max_top_load: None,
+            max_stacked_items,
+            max_compression_pressure_kpa: None,
+            stacking_group: None,
+            accepts_stacking_groups: &NO_GROUPS,
+        }
+    }
+
+    #[test]
+    fn a_candidate_on_two_boxes_sharing_one_base_counts_that_base_once() {
+        // A diamond: the candidate rests on two boxes that both rest on one base, so the
+        // walk down from the candidate reaches the base twice.
+        for (limit, expected) in [(Some(3), true), (Some(2), false)] {
+            let scene = [
+                body_at(Point::ZERO, (20, 10), limit),
+                body_at(Point { x: 0, y: 0, z: 10 }, (10, 10), None),
+                body_at(Point { x: 10, y: 0, z: 10 }, (10, 10), None),
+            ];
+            let mut state = ContainerState::new(container(), 1);
+            for (sequence, body) in scene.iter().enumerate() {
+                let origin = body.envelope.origin;
+                let mut placed = cube_at(10, origin);
+                placed.dimensions = body.envelope.dimensions;
+                placed.envelope_dimensions = body.envelope.dimensions;
+                apply_candidate(&mut state, body_item(body, sequence), &placed);
+            }
+            let sweep = LoadSweep::new(&state, 30);
+            let candidate = body_at(Point { x: 0, y: 0, z: 20 }, (20, 10), None);
+            assert_eq!(sweep.allows(candidate), expected, "limit {limit:?}");
+            assert_eq!(rebuilt_verdict(&scene, candidate, None), expected);
+        }
+    }
+
+    #[test]
+    fn an_overloaded_scene_keeps_its_uncompressed_volume() {
+        let mut state = ContainerState::new(container(), 1);
+        let mut base = cube_instance("base", 10, 1);
+        base.item.max_top_load = Some(Weight(1));
+        apply_candidate(&mut state, base, &cube_at(10, Point::ZERO));
+        let mut heavy = cube_instance("heavy", 10, 2);
+        heavy.item.weight = Weight(1_000);
+        let on_top = cube_at(10, Point { x: 0, y: 0, z: 10 });
+        let placement = Placement {
+            instance: heavy,
+            position: on_top.position,
+            rotation: on_top.rotation,
+            dimensions: on_top.dimensions,
+            envelope_origin: on_top.envelope_origin,
+            envelope_dimensions: on_top.envelope_dimensions,
+            support_ratio: 1.0,
+            top_load: Weight(0),
+            fixed: false,
+        };
+        assert!(
+            calculate_top_loads(&[state.packed.placements[0].clone(), placement.clone()]).is_none()
+        );
+        assert_eq!(
+            used_volume_with_current_loads(&state.packed, placement),
+            2_000
+        );
     }
 }
 

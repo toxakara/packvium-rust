@@ -137,6 +137,7 @@ pub fn pack_maximal_order(
         optimality: None,
         objective: request.config.objective.clone(),
         catalog_versions_used: Vec::new(),
+        currency: None,
     }
 }
 
@@ -458,6 +459,26 @@ fn choose_container(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_space_the_box_does_not_touch_is_returned_whole() {
+        let side = |value| Dimensions {
+            length: Length(value),
+            width: Length(value),
+            height: Length(value),
+        };
+        let space = Space(Aabb {
+            origin: Point::ZERO,
+            dimensions: side(10),
+        });
+        let apart = Aabb {
+            origin: Point { x: 10, y: 0, z: 0 },
+            dimensions: side(5),
+        };
+        let parts = subtract(space, apart);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0, space.0);
+    }
 
     #[test]
     fn free_space_partitions_are_counted() {

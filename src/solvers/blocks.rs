@@ -146,6 +146,8 @@ fn pack_blocks(
         .iter()
         .map(|container| (container.id.clone(), container.quantity))
         .collect::<BTreeMap<_, _>>();
+    // Numbered per container type, as every other solver and engine does (`small#1`, `large#1`).
+    let mut opened = BTreeMap::<String, usize>::new();
     let maximum = request.config.max_containers.unwrap_or_else(|| {
         request
             .containers
@@ -171,7 +173,7 @@ fn pack_blocks(
             }
             let (candidate, next, reached) = pack_one(
                 container,
-                packed.len() + 1,
+                opened.get(&container.id).copied().unwrap_or(0) + 1,
                 &remaining,
                 request,
                 modes,
@@ -225,6 +227,7 @@ fn pack_blocks(
         if let Some(Some(quantity)) = inventory.get_mut(&id) {
             *quantity = quantity.saturating_sub(1);
         }
+        *opened.entry(id).or_default() += 1;
         packed.push(candidate);
         remaining = next;
     }
@@ -275,6 +278,7 @@ fn pack_blocks(
         optimality: None,
         objective: request.config.objective.clone(),
         catalog_versions_used: Vec::new(),
+        currency: None,
     }
 }
 
@@ -294,6 +298,9 @@ fn supports(request: &PackingRequest, constraints: &[Arc<dyn PlacementConstraint
                 // The block loader has no rung chain; the per-item search cuts the box
                 //.
                 && container.made_to_measure.is_none()
+                // A block stands on the whole floor; a pallet bears weight on its deck
+                // alone, which the per-item search reads.
+                && container.deck.is_none()
         })
         && request.items.iter().all(|item| {
             item.group.is_none()
@@ -978,6 +985,7 @@ mod tests {
                 output_length_unit: "mm".into(),
                 output_weight_unit: "g".into(),
                 catalog_versions_used: Vec::new(),
+                currency: None,
                 fixed_placements: Vec::new(),
                 fixed_containers: Vec::new(),
             };

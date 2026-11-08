@@ -153,7 +153,7 @@ fn utf16_order(left: &str, right: &str) -> Ordering {
     left.encode_utf16().cmp(right.encode_utf16())
 }
 
-fn write_string(text: &str, out: &mut String) {
+pub(crate) fn write_string(text: &str, out: &mut String) {
     out.push('"');
     for character in text.chars() {
         match character {

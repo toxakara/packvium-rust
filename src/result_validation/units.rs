@@ -62,6 +62,19 @@ pub(crate) fn length_unit(request: &Json) -> Res<&'static str> {
             "units must be an object".to_owned(),
         ));
     }
+    // A key other than `length`, the first in code-point order (UTF-8 byte order).
+    if let Some(unknown) = units
+        .as_dict()
+        .into_iter()
+        .flatten()
+        .map(|(name, _)| name)
+        .filter(|name| *name != "length")
+        .min()
+    {
+        return Err(MalformedResult::contract(format!(
+            "units.{unknown} is not a known field"
+        )));
+    }
     let key = match units.get_null("length")? {
         Json::Null => return Ok("mm"),
         Json::Str(text) => text
@@ -205,5 +218,43 @@ mod tests {
         assert_eq!(ticks(Json::str_of("10 CM")), 1_600_000);
         assert_eq!(ticks(Json::str_of("0.00003125")), 0); // exactly half a tick rounds to even
         assert_eq!(ticks(Json::str_of("0.00009375")), 2);
+        let measure = |unit: Option<&str>| {
+            let mut pairs = vec![("value".to_owned(), Json::str_of("10"))];
+            pairs.extend(unit.map(|unit| ("unit".to_owned(), Json::str_of(unit))));
+            Json::Dict(pairs)
+        };
+        assert_eq!(ticks(measure(Some("cm"))), 1_600_000);
+        assert_eq!(ticks(measure(None)), 160_000);
+    }
+
+    fn request_with_units(pairs: &[(&str, Json)]) -> Json {
+        let units = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.clone()))
+            .collect();
+        Json::Dict(vec![("units".to_owned(), Json::Dict(units))])
+    }
+
+    /// `units` is closed; the first unknown key in code-point order is named before
+    /// `length` is read. U+FFFD sorts before U+1F600 by code point, after it in UTF-16.
+    #[test]
+    fn a_units_key_other_than_length_is_a_contract_break() {
+        let refused =
+            |pairs: &[(&str, Json)]| length_unit(&request_with_units(pairs)).unwrap_err().message;
+        assert_eq!(
+            refused(&[
+                ("length", Json::str_of("furlong")),
+                ("weight", Json::str_of("kg"))
+            ]),
+            "units.weight is not a known field"
+        );
+        assert_eq!(
+            refused(&[("\u{1F600}", Json::Int(1)), ("\u{FFFD}", Json::Int(1))]),
+            "units.\u{FFFD} is not a known field"
+        );
+        assert_eq!(
+            length_unit(&request_with_units(&[("length", Json::str_of("cm"))])).unwrap(),
+            "cm"
+        );
     }
 }

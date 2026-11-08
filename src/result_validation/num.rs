@@ -420,7 +420,75 @@ mod tests {
     }
 
     #[test]
+    fn arithmetic_past_i128_is_refused_as_a_shape_error_not_wrapped() {
+        let refusal = add(i128::MAX, 1).unwrap_err();
+        assert_eq!(refusal.kind, crate::RefusalKind::Shape);
+        assert_eq!(
+            refusal.message,
+            "arithmetic overflow: a value is beyond what this validator computes exactly"
+        );
+        // The 256-bit product is held, but a quotient past 128 bits is still refused.
+        assert_eq!(
+            mul_div(i128::MAX, i128::MAX, 1).unwrap_err().message,
+            refusal.message
+        );
+    }
+
+    #[test]
+    fn a_zero_divisor_is_refused_by_name() {
+        for refusal in [floor_div(1, 0).unwrap_err(), mul_div(1, 1, 0).unwrap_err()] {
+            assert_eq!(refusal.kind, crate::RefusalKind::Shape);
+            assert_eq!(refusal.message, "division by zero");
+        }
+    }
+
+    #[test]
+    fn a_negative_denominator_moves_its_sign_to_the_numerator() {
+        assert_eq!(
+            Ratio::new(3, -6).unwrap(),
+            Ratio {
+                numerator: -1,
+                denominator: 2
+            }
+        );
+    }
+
+    #[test]
+    fn negative_ratios_order_and_convert_by_their_sign() {
+        let minus_half = Ratio::new(-1, 2).unwrap();
+        assert_eq!(minus_half.to_f64(), -0.5);
+        assert_eq!(
+            minus_half.compare(Ratio::new(1, 3).unwrap()).unwrap(),
+            Ordering::Less
+        );
+        assert_eq!(
+            minus_half.compare(Ratio::new(-1, 3).unwrap()).unwrap(),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn fraction_text_past_i128_or_with_a_bare_marker_is_refused() {
+        // 39 digits that reach i128::MAX + 1 only once the decimal digit is added.
+        assert!(parse_fraction("17014118346046923173168730371588410572.8").is_err());
+        assert_eq!(
+            parse_fraction("17014118346046923173168730371588410572.7")
+                .unwrap()
+                .numerator,
+            i128::MAX
+        );
+        for bad in ["1/", "1/2x", "1e", "1e+", "2E-"] {
+            assert_eq!(
+                parse_fraction(bad).unwrap_err().message,
+                format!("Invalid literal for Fraction: {bad:?}")
+            );
+        }
+    }
+
+    #[test]
     fn float_conversion_is_correctly_rounded() {
+        // 2^54 - 1 rounds up to a 54-bit mantissa, which renormalises to 2^54.
+        assert_eq!(Ratio::from_int((1 << 54) - 1).to_f64(), 2f64.powi(54));
         assert_eq!(Ratio::new(5, 2_000_000).unwrap().to_f64(), 2.5e-6);
         assert_eq!(Ratio::new(1, 3).unwrap().to_f64(), 1.0 / 3.0);
         // 2^60 + 1 is not a double; the nearest one is 2^60, and the sticky bit decides a tie.

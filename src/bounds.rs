@@ -21,18 +21,18 @@
 //!
 //! ## Complexity
 //!
-//! Volumes and weights are carried as runs -- each distinct value with how many instances
-//! carry it -- formed per item type, so a quantity of a million costs one entry rather than a
-//! million cloned instances. `O(t log t + c log c)` time and `O(t + c)` space for `t` item
-//! types and `c` container types: one sort of the volume runs, one of the weight runs, one of
-//! the container types by cost. With every quantity 1 that is the document's
+//! Volumes, weights and values are carried as runs -- each distinct value with how many
+//! instances carry it -- formed per item type, so a quantity of a million costs one entry rather
+//! than a million cloned instances. `O(t log t + c log c)` time and `O(t + c)` space for `t`
+//! item types and `c` container types: one sort each of the volume, weight and value runs, one
+//! of the container types by cost. With every quantity 1 that is the document's
 //! `O(n log n + c log c)`. No geometry is touched and no candidate position is generated,
 //! which is why it is computed once per pack, before any solver runs.
 
 use crate::geometry::ShapeType;
 use crate::model::{Container, Item, ItemInstance, PackingRequest};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BinaryHeap};
 
 /// Parts per million, the scale keys 3 and 4 of the objective are carried at.
 pub const PPM: i128 = 1_000_000;
@@ -121,6 +121,8 @@ pub struct Instance {
     pub weight: i128,
     /// Whether this instance can occupy less room than its declared dimensions.
     pub shrinks: bool,
+    /// `Item.value`, zero when undeclared; read only by the `maximum_value` term.
+    pub value: i128,
 }
 
 /// One container type, with `None` wherever the request declares no limit.
@@ -179,12 +181,27 @@ pub fn occupies_less_than_its_box(item: &Item) -> bool {
         )
 }
 
-/// Where each covered objective reads the five bounds: the position in the default-order
-/// vector of each of the objective's own score keys. Any other objective has no bound.
-fn objective_order(objective: &str) -> Option<[usize; 5]> {
+/// One key of an objective's bound: a position in the default-order vector, or the one key
+/// only that objective ranks by (OPTIMALITY-GAP.md § 1.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Key {
+    Bound(usize),
+    ValueForgone,
+    AchievedHeight,
+    UnpackedVolumePpm,
+}
+
+/// Where each covered objective reads its bounds, key by key in its own score order.
+/// `shipping_cost` and `lowest_landed_cost` have none: a vector compared against a score that
+/// ranks other quantities means nothing.
+fn objective_order(objective: &str) -> Option<[Key; 5]> {
+    use Key::{AchievedHeight, Bound, UnpackedVolumePpm, ValueForgone};
     match objective {
-        "default" => Some([0, 1, 2, 3, 4]),
-        "lowest_cost" => Some([0, 2, 1, 3, 4]),
+        "default" => Some([Bound(0), Bound(1), Bound(2), Bound(3), Bound(4)]),
+        "lowest_cost" => Some([Bound(0), Bound(2), Bound(1), Bound(3), Bound(4)]),
+        "maximum_value" => Some([Bound(0), ValueForgone, Bound(1), Bound(2), Bound(3)]),
+        "open_dimension_height" => Some([Bound(0), AchievedHeight, Bound(1), Bound(2), Bound(3)]),
+        "maximum_volume" => Some([UnpackedVolumePpm, Bound(0), Bound(1), Bound(2), Bound(3)]),
         _ => None,
     }
 }
@@ -197,7 +214,8 @@ fn objective_order(objective: &str) -> Option<[usize; 5]> {
 /// be taken from the machine maximum while the score uses the fabricated box), and for a
 /// request past a declared ceiling, which withholds the bound and nothing else
 /// (OPTIMALITY-GAP.md § 1.5). Computed from the request alone, independently of the solver
-/// and deadline; emission also checks the result's score and the portable gap ceiling.
+/// and deadline; emission also checks the result's score and the portable gap ceiling. An
+/// objective's own key past `MAX_BOUND_VALUE` withholds that objective's bound only.
 pub fn for_request(request: &PackingRequest) -> Option<Vec<i128>> {
     let order = objective_order(&request.config.objective)?;
     if request
@@ -207,25 +225,85 @@ pub fn for_request(request: &PackingRequest) -> Option<Vec<i128>> {
     {
         return None;
     }
-    let vector = from_items(&request.items, &request.containers)
-        .ok()?
-        .as_vector();
-    Some(order.iter().map(|&position| vector[position]).collect())
+    Inputs::of_items(&request.items, &request.containers)
+        .objective_vector(&order)
+        .ok()
 }
 
 /// Every bound for one request, from its item types and container types.
 pub fn from_items(items: &[Item], containers: &[Container]) -> Result<Bounds, BoundOverflow> {
-    let counted = || {
-        items
+    Inputs::of_items(items, containers).bounds()
+}
+
+/// What every bound reads, as runs. Volumes and weights are sorted for the five bounds; values
+/// are left unsorted, because `maximum_value` needs only the `L0` smallest of them.
+struct Inputs {
+    volumes: Runs,
+    weights: Runs,
+    values: Vec<(i128, i128)>,
+    shrinks: bool,
+    types: Vec<ContainerType>,
+}
+
+impl Inputs {
+    fn of_items(items: &[Item], containers: &[Container]) -> Self {
+        let counted = || {
+            items
+                .iter()
+                .map(|item| (item, item.quantity as i128))
+                .filter(|&(_, count)| count > 0)
+        };
+        let value = |item: &Item| item.value.map_or(0, |value| value as i128);
+        Self {
+            volumes: runs(counted().map(|(item, count)| (item.dimensions.volume(), count))),
+            weights: runs(counted().map(|(item, count)| (i128::from(item.weight.0), count))),
+            values: counted()
+                .map(|(item, count)| (value(item), count))
+                .collect(),
+            shrinks: counted().any(|(item, _)| occupies_less_than_its_box(item)),
+            types: containers.iter().map(ContainerType::of).collect(),
+        }
+    }
+
+    fn of_reduced(instances: &[Instance], containers: &[ContainerType]) -> Self {
+        Self {
+            volumes: runs(instances.iter().map(|instance| (instance.volume, 1))),
+            weights: runs(instances.iter().map(|instance| (instance.weight, 1))),
+            values: instances
+                .iter()
+                .map(|instance| (instance.value, 1))
+                .collect(),
+            shrinks: instances.iter().any(|instance| instance.shrinks),
+            types: containers.to_vec(),
+        }
+    }
+
+    fn bounds(&self) -> Result<Bounds, BoundOverflow> {
+        from_runs(&self.volumes, &self.weights, self.shrinks, &self.types)
+    }
+
+    /// The bound in a covered objective's score order, refused where the predicate refuses
+    /// the five bounds or the objective's own key passes `MAX_BOUND_VALUE`.
+    fn objective_vector(&self, order: &[Key; 5]) -> Result<Vec<i128>, BoundOverflow> {
+        let bounds = self.bounds()?;
+        let vector = bounds.as_vector();
+        order
             .iter()
-            .map(|item| (item, item.quantity as i128))
-            .filter(|&(_, count)| count > 0)
-    };
-    let volumes = runs(counted().map(|(item, count)| (item.dimensions.volume(), count)));
-    let weights = runs(counted().map(|(item, count)| (i128::from(item.weight.0), count)));
-    let shrinks = counted().any(|(item, _)| occupies_less_than_its_box(item));
-    let types: Vec<ContainerType> = containers.iter().map(ContainerType::of).collect();
-    from_runs(&volumes, &weights, shrinks, &types)
+            .map(|&key| match key {
+                Key::Bound(position) => Ok(vector[position]),
+                Key::ValueForgone => value_forgone_bound(&self.values, bounds.unpacked_count),
+                Key::AchievedHeight => achieved_height_bound(
+                    &self.volumes,
+                    self.shrinks,
+                    run_count(&self.volumes) - bounds.unpacked_count,
+                    &self.types,
+                ),
+                Key::UnpackedVolumePpm => {
+                    unpacked_volume_bound(&self.volumes, self.shrinks, &self.types)
+                }
+            })
+            .collect()
+    }
 }
 
 /// Every bound for one request, from the engine's own instances.
@@ -239,6 +317,7 @@ pub fn compute(
             volume: instance.item.dimensions.volume(),
             weight: i128::from(instance.item.weight.0),
             shrinks: occupies_less_than_its_box(&instance.item),
+            value: instance.item.value.map_or(0, |value| value as i128),
         })
         .collect();
     let types: Vec<ContainerType> = containers.iter().map(ContainerType::of).collect();
@@ -256,10 +335,7 @@ pub fn from_reduced(
     instances: &[Instance],
     containers: &[ContainerType],
 ) -> Result<Bounds, BoundOverflow> {
-    let volumes = runs(instances.iter().map(|instance| (instance.volume, 1)));
-    let weights = runs(instances.iter().map(|instance| (instance.weight, 1)));
-    let shrinks = instances.iter().any(|instance| instance.shrinks);
-    from_runs(&volumes, &weights, shrinks, containers)
+    Inputs::of_reduced(instances, containers).bounds()
 }
 
 /// The one refusal predicate of docs/OPTIMALITY-CERTIFICATES.md, then the five formulas.
@@ -281,7 +357,7 @@ fn from_runs(
     let volume_capacity = capacity_total(containers, |c| Some(c.usable))?;
     let payload_capacity = capacity_total(containers, |c| c.payload)?;
     let slot_capacity = capacity_total(containers, |c| c.max_items)?;
-    let count: i128 = volumes.iter().map(|&(_, run)| run).sum();
+    let count = run_count(volumes);
 
     let mut placeable = count;
     if !shrinks {
@@ -303,6 +379,10 @@ fn from_runs(
         unused_volume_ppm: guard_output(unused, "unused volume")?,
         stack_height_ppm: guard_output(height, "stack height")?,
     })
+}
+
+fn run_count(runs: &[(i128, i128)]) -> i128 {
+    runs.iter().map(|&(_, count)| count).sum()
 }
 
 /// `Σ value · count` over the runs, refusing a product or sum that would wrap `i128`; a sum
@@ -452,6 +532,99 @@ fn stack_height_bound(
     }
     let required = ceil_div(smallest(volumes, placed), widest);
     (required * PPM / tallest - (opened - 1)).max(0)
+}
+
+/// `maximum_value`'s second key: whichever `unpacked` instances are left behind, their value
+/// is at least that of the `unpacked` least valuable.
+///
+/// No sort: a max-heap keeps only the runs the `unpacked` smallest values reach, `O(t log k)`
+/// for the `k` runs kept, so the five bounds' sorts stay the only superlinear cost (finding
+/// F6). The largest kept run is taken only as far as `unpacked` reaches. Values are
+/// non-negative, so a sum past the portable ceiling -- or one wide enough to wrap -- withholds
+/// this objective's bound.
+fn value_forgone_bound(values: &[(i128, i128)], unpacked: i128) -> Result<i128, BoundOverflow> {
+    let mut kept: BinaryHeap<(i128, i128)> = BinaryHeap::new();
+    let mut held: i128 = 0;
+    for &run in values {
+        if unpacked <= 0 {
+            break;
+        }
+        kept.push(run);
+        held += run.1;
+        while let Some(&(_, count)) = kept.peek()
+            && held - count >= unpacked
+        {
+            kept.pop();
+            held -= count;
+        }
+    }
+    let mut total: i128 = 0;
+    if let Some((value, count)) = kept.pop() {
+        total = value
+            .checked_mul(count - (held - unpacked))
+            .ok_or_else(|| wrapped("value forgone"))?;
+    }
+    for (value, count) in kept {
+        total = value
+            .checked_mul(count)
+            .and_then(|product| total.checked_add(product))
+            .ok_or_else(|| wrapped("value forgone"))?;
+    }
+    guard_output(total, "value forgone")
+}
+
+/// `open_dimension_height`'s second key, the summed tops in ticks.
+///
+/// A container holding volume `v` on floor `A` stands at least `v / A` tall, because its
+/// placements are disjoint boxes inside `A × top`; summed over the opened containers that is
+/// at least the placed volume over the widest floor, and the score is an integer. An instance
+/// that occupies less than its box breaks the disjoint-boxes step, so the term is dropped.
+fn achieved_height_bound(
+    volumes: &[(i128, i128)],
+    shrinks: bool,
+    placed: i128,
+    containers: &[ContainerType],
+) -> Result<i128, BoundOverflow> {
+    let widest = containers
+        .iter()
+        .map(|c| c.base_area)
+        .filter(|&a| a > 0)
+        .max();
+    let Some(widest) = widest else {
+        return Ok(0);
+    };
+    if shrinks || placed <= 0 {
+        return Ok(0);
+    }
+    guard_output(
+        ceil_div(smallest(volumes, placed), widest),
+        "achieved height",
+    )
+}
+
+/// `maximum_volume`'s first key: the volume no inventory can hold, as the score's own
+/// rounded-up share of the requested volume.
+///
+/// The packed volume is at most the summed usable capacity -- the total `L0` already formed
+/// and guarded -- so at least the rest is left behind whatever the geometry does. Unlimited
+/// inventory holds everything, and an instance that occupies less than its box stops nominal
+/// volumes summing, so both give 0. The result is at most `PPM`, inside every ceiling.
+fn unpacked_volume_bound(
+    volumes: &[(i128, i128)],
+    shrinks: bool,
+    containers: &[ContainerType],
+) -> Result<i128, BoundOverflow> {
+    if shrinks {
+        return Ok(0);
+    }
+    let requested = run_total(volumes, "instance volume")?;
+    let Some(capacity) = capacity_total(containers, |c| Some(c.usable))? else {
+        return Ok(0);
+    };
+    if requested == 0 {
+        return Ok(0);
+    }
+    Ok(ceil_div((requested - capacity).max(0) * PPM, requested))
 }
 
 /// The largest declared limit, or `None` if any type declares none.
@@ -617,7 +790,7 @@ mod tests {
             return;
         };
         let document: serde_json::Value = serde_json::from_str(&text).expect("valid scene");
-        assert_eq!(document["format"], "packvium-objective-bounds/v1");
+        assert_eq!(document["format"], "packvium-objective-bounds/v2");
         let cases = document["cases"].as_array().expect("scene cases");
         assert!(
             cases.len() > 300,
@@ -641,6 +814,7 @@ mod tests {
                 "bounds diverge from Python on {}",
                 case["fixture"]
             );
+            assert_objectives_match(case, &instances, &containers);
         }
 
         // The edges are written from the oracle: the fixed-placement rule and every edge of
@@ -660,6 +834,30 @@ mod tests {
                     .collect::<Vec<_>>()
             });
             assert_eq!(computed.ok(), expected, "edge {:?}", edge["name"]);
+            assert_objectives_match(edge, &instances, &containers);
+        }
+    }
+
+    /// Every covered objective's vector, `null` where a ceiling withholds it.
+    fn assert_objectives_match(
+        case: &serde_json::Value,
+        instances: &[Instance],
+        containers: &[ContainerType],
+    ) {
+        let objectives = case["objectives"].as_object().expect("objectives");
+        assert_eq!(objectives.len(), 5, "every covered objective is recorded");
+        for (objective, vector) in objectives {
+            let order = objective_order(objective).expect("a covered objective");
+            let computed = Inputs::of_reduced(instances, containers)
+                .objective_vector(&order)
+                .ok();
+            let expected = vector.as_array().map(|values| {
+                values
+                    .iter()
+                    .map(|value| i128::from(value.as_i64().expect("integer bound")))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(computed, expected, "{objective} diverges on {case}");
         }
     }
 
@@ -680,6 +878,7 @@ mod tests {
                 volume: decimal(&raw["volume"]),
                 weight: raw["weight"].as_i64().expect("weight ticks").into(),
                 shrinks: raw["shrinks"].as_bool().expect("shrink flag"),
+                value: raw["value"].as_i64().expect("value").into(),
             })
             .collect();
         let containers = case["containers"]
@@ -727,8 +926,8 @@ mod tests {
         assert_eq!(statement(&[0, 1, 99, 0, 0], &bound), None);
     }
 
-    /// The request-level entry point: `lowest_cost` reads the permuted vector, an uncovered
-    /// objective and a made-to-measure container read none.
+    /// The request-level entry point: `lowest_cost` reads the permuted vector, the three
+    /// objectives with a key of their own add it, and an uncovered objective reads none.
     #[test]
     fn a_request_states_its_bound_in_its_objective_order() {
         use crate::geometry::Dimensions;
@@ -757,15 +956,144 @@ mod tests {
             output_length_unit: "mm".into(),
             output_weight_unit: "g".into(),
             catalog_versions_used: Vec::new(),
+            currency: None,
             fixed_placements: Vec::new(),
             fixed_containers: Vec::new(),
         };
         request.containers[0].cost_minor = 3;
         assert_eq!(for_request(&request), Some(vec![0, 1, 3, 500_000, 500_000]));
+        assert_eq!(
+            from_items(&request.items, &request.containers).map(|bound| bound.as_vector()),
+            Ok([0, 1, 3, 500_000, 500_000])
+        );
         request.config.objective = "lowest_cost".into();
         assert_eq!(for_request(&request), Some(vec![0, 3, 1, 500_000, 500_000]));
         request.config.objective = "maximum_value".into();
-        assert_eq!(for_request(&request), None);
+        assert_eq!(for_request(&request), Some(vec![0, 0, 1, 3, 500_000]));
+        request.config.objective = "open_dimension_height".into();
+        assert_eq!(for_request(&request), Some(vec![0, 5, 1, 3, 500_000]));
+        request.config.objective = "maximum_volume".into();
+        assert_eq!(for_request(&request), Some(vec![0, 0, 1, 3, 500_000]));
+        for uncovered in ["shipping_cost", "lowest_landed_cost"] {
+            request.config.objective = uncovered.into();
+            assert_eq!(for_request(&request), None, "{uncovered}");
+        }
+    }
+
+    /// The oracle's hand-checked objective-only keys, each in its own worked
+    /// request, plus the branches the scene happens not to reach.
+    #[test]
+    fn each_objective_reads_its_own_key() {
+        let one_slot = ContainerType {
+            usable: 1000,
+            inner: 1000,
+            base_area: 100,
+            height: 10,
+            payload: None,
+            max_items: None,
+            quantity: Some(1),
+            cost_minor: 0,
+        };
+        let instance = |value: i128| Instance {
+            volume: 600,
+            weight: 0,
+            shrinks: false,
+            value,
+        };
+        let stated = |instances: &[Instance], containers: &[ContainerType], objective: &str| {
+            Inputs::of_reduced(instances, containers)
+                .objective_vector(&objective_order(objective).expect("covered"))
+                .ok()
+        };
+        // One of three 600-volume items fits: the two cheapest forgo 10 + 50, the one placed
+        // stands at least 600 / 100 tall, and 800 of 1800 is 444444.4 ppm, rounded up.
+        let three = [instance(50), instance(10), instance(90)];
+        assert_eq!(
+            stated(&three, &[one_slot], "maximum_value"),
+            Some(vec![2, 60, 1, 0, 400_000])
+        );
+        assert_eq!(
+            stated(&three, &[one_slot], "open_dimension_height"),
+            Some(vec![2, 6, 1, 0, 400_000])
+        );
+        assert_eq!(
+            stated(&three, &[one_slot], "maximum_volume"),
+            Some(vec![444_445, 2, 1, 0, 400_000])
+        );
+
+        // Value past the portable ceiling, or wide enough to wrap, withholds maximum_value
+        // alone.
+        for wide in [MAX_BOUND_VALUE, i128::MAX] {
+            let past = [instance(wide), instance(1), instance(wide)];
+            assert_eq!(stated(&past, &[one_slot], "maximum_value"), None);
+            assert!(stated(&past, &[one_slot], "maximum_volume").is_some());
+        }
+
+        // A summed top past the portable ceiling withholds open_dimension_height alone.
+        let tall = Instance {
+            volume: (MAX_BOUND_VALUE + 1) * 100,
+            ..instance(0)
+        };
+        let unlimited = ContainerType {
+            usable: tall.volume,
+            inner: tall.volume,
+            // Tall enough that key 4 stays inside the ceiling the summed top passes.
+            height: tall.volume,
+            quantity: None,
+            ..one_slot
+        };
+        assert_eq!(stated(&[tall], &[unlimited], "open_dimension_height"), None);
+        assert_eq!(
+            stated(&[tall], &[unlimited], "maximum_volume"),
+            Some(vec![0, 0, 1, 0, 0])
+        );
+
+        // No floor, nothing placed, nothing requested, or no container: each term abstains.
+        let floorless = ContainerType {
+            base_area: 0,
+            ..one_slot
+        };
+        assert_eq!(
+            stated(&three, &[floorless], "open_dimension_height").unwrap()[1],
+            0
+        );
+        let tiny = ContainerType {
+            usable: 1,
+            ..one_slot
+        };
+        assert_eq!(
+            stated(&three, &[tiny], "open_dimension_height").unwrap()[1],
+            0
+        );
+        let empty = Instance {
+            volume: 0,
+            ..instance(0)
+        };
+        assert_eq!(
+            stated(&[empty], &[one_slot], "maximum_volume").unwrap()[0],
+            0
+        );
+        assert_eq!(stated(&three, &[], "maximum_volume").unwrap()[0], 1_000_000);
+
+        // Runs out of order, the last kept one taken only part-way: 1 + 1 + 5 + 5.
+        let runs = [(5, 3), (1, 2), (9, 1)];
+        assert_eq!(value_forgone_bound(&runs, 4), Ok(12));
+        assert_eq!(value_forgone_bound(&runs, 6), Ok(26));
+        assert_eq!(value_forgone_bound(&runs, 0), Ok(0));
+
+        // An instance smaller than its box drops both volume terms.
+        let nested = [Instance {
+            shrinks: true,
+            ..instance(3)
+        }; 3];
+        assert_eq!(
+            stated(&nested, &[one_slot], "open_dimension_height"),
+            Some(vec![0, 0, 1, 0, 0])
+        );
+        assert_eq!(
+            stated(&nested, &[one_slot], "maximum_volume"),
+            Some(vec![0, 0, 1, 0, 0])
+        );
     }
 
     /// The five cases the document works by hand.
@@ -779,6 +1107,7 @@ mod tests {
             volume,
             weight,
             shrinks,
+            value: 0,
         };
         let container = |inner: i128,
                          base_area: i128,
@@ -874,6 +1203,7 @@ mod tests {
             volume: MAX_BOUND_SUM / 4,
             weight: 1,
             shrinks: false,
+            value: 0,
         };
         assert!(
             from_reduced(&[inside; 3], &[container]).is_ok(),
@@ -884,6 +1214,7 @@ mod tests {
             volume: MAX_BOUND_SUM / 2,
             weight: 1,
             shrinks: false,
+            value: 0,
         };
         let refusal = from_reduced(&[over; 3], &[container])
             .expect_err("one and a half times the ceiling is past it");
@@ -895,6 +1226,7 @@ mod tests {
             volume: i128::MAX / 2,
             weight: 1,
             shrinks: false,
+            value: 0,
         };
         assert!(from_reduced(&[enormous; 4], &[container]).is_err());
     }
@@ -907,11 +1239,13 @@ mod tests {
                 volume: 1,
                 weight: 1,
                 shrinks: false,
+                value: 0,
             },
             Instance {
                 volume: 1,
                 weight: 1,
                 shrinks: false,
+                value: 0,
             },
         ];
         let container = ContainerType {
@@ -946,6 +1280,7 @@ mod tests {
             volume: 1,
             weight: 1,
             shrinks: false,
+            value: 0,
         };
         let of = |inner: i128, base_area: i128, height: i128| ContainerType {
             usable: 1000,
@@ -991,6 +1326,7 @@ mod tests {
             volume: 1,
             weight: 1,
             shrinks: false,
+            value: 0,
         };
         let empty = ContainerType {
             usable: 0,

@@ -1047,6 +1047,8 @@ mod tests {
             preloaded: Vec::new(),
             deformable_boundary: None,
             made_to_measure: None,
+            pallet_overhang_limit: None,
+            deck: None,
         }
     }
 
@@ -1280,6 +1282,28 @@ mod tests {
                 index: -1,
                 step: -1,
                 reason: "order is not a permutation of every placement index exactly once",
+            }
+        );
+    }
+
+    #[test]
+    fn out_of_z_order_floor_box_sliding_under_elevated_box_deactivates_isolated_floor_shortcut() {
+        let fragile_floor =
+            business_rule_item("floor-fragile", 5, 1_000, Some(1_000), None, true, None);
+        let heavy_upper = business_rule_item("upper", 5, 5_000, None, None, true, None);
+        let placements = vec![
+            stacked_placement(fragile_floor, 0, 0, 0),
+            stacked_placement(heavy_upper, 0, 0, 5),
+        ];
+        let container = business_rule_container(10, 20, None);
+        let error =
+            verify_loading_prefix_business_rules(&placements, &[1, 0], &container).unwrap_err();
+        assert_eq!(
+            error,
+            SequenceError::Replay {
+                index: 0,
+                step: 1,
+                reason: "top_load",
             }
         );
     }

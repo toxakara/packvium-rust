@@ -36,13 +36,32 @@ pub(crate) struct BoundContainer {
     pub(crate) quantity: Option<i128>,
 }
 
-/// Where each covered objective reads `(L0, L1, L2, L3, L4)` in its own score order.
-fn order_of(objective: &Json) -> Option<[usize; 5]> {
-    match objective {
-        Json::Str(name) if name == "default" => Some([0, 1, 2, 3, 4]),
-        Json::Str(name) if name == "lowest_cost" => Some([0, 2, 1, 3, 4]),
-        _ => None,
-    }
+/// One key of a stated bound: a position in `(L0, L1, L2, L3, L4)`, or the one key only that
+/// objective ranks by.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Bound(usize),
+    ValueForgone,
+    AchievedHeight,
+    UnpackedVolumePpm,
+}
+
+/// Where each covered objective reads its bound in its own score order, with the objective's
+/// name for the withholding reason. Any other objective has no bound.
+fn order_of(objective: &Json) -> Option<(&str, [Key; 5])> {
+    use Key::{AchievedHeight, Bound, UnpackedVolumePpm, ValueForgone};
+    let Json::Str(name) = objective else {
+        return None;
+    };
+    let order = match name.as_str() {
+        "default" => [Bound(0), Bound(1), Bound(2), Bound(3), Bound(4)],
+        "lowest_cost" => [Bound(0), Bound(2), Bound(1), Bound(3), Bound(4)],
+        "maximum_value" => [Bound(0), ValueForgone, Bound(1), Bound(2), Bound(3)],
+        "open_dimension_height" => [Bound(0), AchievedHeight, Bound(1), Bound(2), Bound(3)],
+        "maximum_volume" => [UnpackedVolumePpm, Bound(0), Bound(1), Bound(2), Bound(3)],
+        _ => return None,
+    };
+    Some((name, order))
 }
 
 fn run_count(runs: &[(i128, i128)]) -> i128 {
@@ -258,6 +277,81 @@ pub(crate) fn lower_bound(
     })
 }
 
+/// Every item type's `value`, 0 when unset, as runs sorted by value.
+fn value_runs(items: &Ordered<ItemSpec>) -> Res<Runs> {
+    let mut values = Vec::new();
+    for spec in items.values() {
+        let value = if spec.value.truthy() {
+            spec.value.int("value")?
+        } else {
+            0
+        };
+        values.push((value, spec.quantity.int("quantity")?));
+    }
+    values.sort_by_key(|run| run.0);
+    Ok(values)
+}
+
+/// `maximum_value`'s second key: the `unpacked` least valuable instances. Saturates, so a sum
+/// past `i128` is past the result ceiling, as the reference finds it.
+fn value_forgone(values: &[(i128, i128)], mut unpacked: i128) -> i128 {
+    let mut total: i128 = 0;
+    for &(value, available) in values {
+        if unpacked <= 0 {
+            break;
+        }
+        let taken = available.min(unpacked);
+        total = total.saturating_add(value.saturating_mul(taken));
+        unpacked -= taken;
+    }
+    total
+}
+
+/// The key only one objective ranks by, each conditional on `L0` like the five: the
+/// least value forgone and the least summed top of a packing leaving `unpacked` behind, and
+/// the least unpacked share of requested volume any packing scores. Volumes and capacity are
+/// inside the ceiling `lower_bound` admitted. O(t log t + c).
+fn objective_term(
+    key: Key,
+    values: &[(i128, i128)],
+    volumes: &[(i128, i128)],
+    shrinks: bool,
+    containers: &[BoundContainer],
+    unpacked: i128,
+) -> Res<i128> {
+    if matches!(key, Key::ValueForgone) {
+        return Ok(value_forgone(values, unpacked));
+    }
+    if shrinks {
+        return Ok(0);
+    }
+    if matches!(key, Key::AchievedHeight) {
+        let placed = run_count(volumes) - unpacked;
+        let widest = containers
+            .iter()
+            .map(|c| c.base_area)
+            .filter(|a| *a > 0)
+            .max();
+        return match widest {
+            Some(widest) if placed > 0 => ceil_div(smallest(volumes, placed)?, widest),
+            _ => Ok(0),
+        };
+    }
+    let requested = run_sum(volumes);
+    let quantities: Vec<Option<i128>> = containers.iter().map(|c| c.quantity).collect();
+    let usable: Vec<Option<i128>> = containers.iter().map(|c| Some(c.usable)).collect();
+    let Some(capacity) = capacity_total(&usable, &quantities) else {
+        return Ok(0);
+    };
+    if requested == 0 {
+        return Ok(0);
+    }
+    ceil_div(
+        mul(sub(requested, capacity)?.max(0), SCORE_SCALE)?,
+        requested,
+    )
+}
+
 /// The bound's inputs: every instance, fixed ones included, and every declared container type.
 type Inputs = (Runs, Runs, bool, Vec<BoundContainer>);
 
@@ -300,6 +394,24 @@ fn inputs(items: &Ordered<ItemSpec>, containers: &Ordered<ContainerSpec>) -> Res
     Ok((volumes, weights, shrinks, types))
 }
 
+/// `bound` read in `order`, each objective-only key computed from the same inputs.
+fn stated_vector(
+    order: &[Key; 5],
+    bound: &[i128; 5],
+    values: &[(i128, i128)],
+    volumes: &[(i128, i128)],
+    shrinks: bool,
+    containers: &[BoundContainer],
+) -> Res<Vec<i128>> {
+    order
+        .iter()
+        .map(|&key| match key {
+            Key::Bound(position) => Ok(bound[position]),
+            _ => objective_term(key, values, volumes, shrinks, containers, bound[0]),
+        })
+        .collect()
+}
+
 /// The bound in the objective's score order, or `None` with the reason none is stated (§ 1.5).
 fn stated(
     request: &Json,
@@ -312,7 +424,7 @@ fn stated(
     let name = request
         .get_or("configuration", &empty)?
         .get_or("objective", &default)?;
-    let Some(order) = order_of(name) else {
+    let Some((objective, order)) = order_of(name) else {
         return Ok((None, format!("objective {} has no bound", py_repr(name))));
     };
     if containers
@@ -327,13 +439,23 @@ fn stated(
         }
     }
     let (volumes, weights, shrinks, types) = inputs(items, containers)?;
-    Ok(match lower_bound(&volumes, &weights, shrinks, &types)? {
-        None => (None, "the request is past a declared ceiling".to_owned()),
-        Some(bound) => (
-            Some(order.iter().map(|position| bound[*position]).collect()),
-            String::new(),
-        ),
-    })
+    let Some(bound) = lower_bound(&volumes, &weights, shrinks, &types)? else {
+        return Ok((None, "the request is past a declared ceiling".to_owned()));
+    };
+    // Read only where ranked, so a malformed `value` never touches another objective's bound.
+    let values = if order.contains(&Key::ValueForgone) {
+        value_runs(items)?
+    } else {
+        Vec::new()
+    };
+    let vector = stated_vector(&order, &bound, &values, &volumes, shrinks, &types)?;
+    if vector.iter().any(|value| *value > MAX_BOUND_VALUE) {
+        return Ok((
+            None,
+            format!("the {objective} key is past the portable ceiling"),
+        ));
+    }
+    Ok((Some(vector), String::new()))
 }
 
 /// The first position where `score` leaves `bound`, and whether it is above it.
@@ -636,6 +758,27 @@ mod tests {
                 .as_array()
                 .map(|values| values.iter().map(integer).collect());
             assert_eq!(computed.map(|bound| bound.to_vec()), expected, "{case}");
+            let objectives = case["objectives"].as_object().expect("objectives");
+            assert_eq!(objectives.len(), 5, "every covered objective is recorded");
+            for (objective, vector) in objectives {
+                let (_, order) = order_of(&Json::str_of(objective)).expect("a covered objective");
+                let stated = computed.and_then(|bound| {
+                    let vector = stated_vector(
+                        &order,
+                        &bound,
+                        &runs(instances, "value"),
+                        &runs(instances, "volume"),
+                        shrinks,
+                        &containers,
+                    )
+                    .expect("no overflow");
+                    (!vector.iter().any(|value| *value > MAX_BOUND_VALUE)).then_some(vector)
+                });
+                let expected: Option<Vec<i128>> = vector
+                    .as_array()
+                    .map(|values| values.iter().map(integer).collect());
+                assert_eq!(stated, expected, "{objective} on {case}");
+            }
             compared += 1;
         }
         assert!(compared > 400);
@@ -856,6 +999,113 @@ mod tests {
             ]
         );
     }
+    /// Three cubes, one box: two are left behind whatever the objective.
+    fn one_of_three(objective: &str, values: [i64; 3]) -> String {
+        let items: Vec<serde_json::Value> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                serde_json::json!({"id": format!("cube{index}"), "quantity": 1, "value": value,
+                    "dimensions": {"length": "10", "width": "10", "height": "10"}})
+            })
+            .collect();
+        serde_json::json!({
+            "items": items,
+            "containers": [{"id": "box", "quantity": 1,
+                "inner_dimensions": {"length": "10", "width": "10", "height": "10"}}],
+            "configuration": {"objective": objective},
+        })
+        .to_string()
+    }
+
+    /// The engine's own statement for each objective with a key of its own is the
+    /// one the validator recomputes, and forging that key is a mismatch.
+    #[test]
+    fn each_objective_with_its_own_key_is_recomputed() {
+        for (objective, own_key) in [
+            ("maximum_value", 1),
+            ("open_dimension_height", 1),
+            ("maximum_volume", 0),
+        ] {
+            // A zero value is read as an unset one.
+            let request = one_of_three(objective, [5, 0, 9]);
+            let mut result = packed(&request);
+            assert!(
+                !result["optimality"]["lower_bound"].is_null(),
+                "{objective}"
+            );
+            assert_eq!(
+                issues(&request, &result),
+                Vec::<Issue>::new(),
+                "{objective}"
+            );
+            let forged = &mut result["optimality"]["lower_bound"][own_key];
+            *forged = serde_json::json!(forged.as_i64().expect("an integer") + 1);
+            assert!(
+                issues(&request, &result)
+                    .iter()
+                    .any(|issue| issue.code == "optimality_bound_mismatch"),
+                "{objective}"
+            );
+        }
+    }
+
+    /// A value sum past the portable ceiling withholds `maximum_value`'s bound, and nothing
+    /// else: the default objective over the same request still states one.
+    #[test]
+    fn a_value_past_the_portable_ceiling_withholds_only_maximum_value() {
+        let past = [9_007_199_254_740_991, 1, 9_007_199_254_740_991];
+        let request = one_of_three("maximum_value", past);
+        let mut result = packed(&request);
+        assert!(result["optimality"]["lower_bound"].is_null());
+        assert_eq!(issues(&request, &result), Vec::<Issue>::new());
+        result["optimality"]["lower_bound"] = serde_json::json!([2]);
+        let details: Vec<String> = issues(&request, &result)
+            .into_iter()
+            .map(|issue| issue.detail)
+            .collect();
+        assert_eq!(
+            details,
+            [
+                "lower_bound is reported where no bound is stated: the maximum_value key is past the portable ceiling"
+            ]
+        );
+        let default = one_of_three("default", past);
+        assert!(!packed(&default)["optimality"]["lower_bound"].is_null());
+    }
+
+    /// Branches the scene does not reach: no floor, nothing placed, nothing requested.
+    #[test]
+    fn an_objective_term_abstains_without_a_floor_a_placement_or_a_volume() {
+        let container = BoundContainer {
+            inner_volume: 1000,
+            base_area: 0,
+            height: 10,
+            usable: 1000,
+            cost_minor: 0,
+            payload: None,
+            max_items: None,
+            quantity: Some(1),
+        };
+        let term = |key: Key, volumes: &[(i128, i128)], unpacked: i128| {
+            objective_term(
+                key,
+                &[],
+                volumes,
+                false,
+                std::slice::from_ref(&container),
+                unpacked,
+            )
+            .unwrap()
+        };
+        assert_eq!(term(Key::AchievedHeight, &[(600, 1)], 0), 0);
+        assert_eq!(term(Key::AchievedHeight, &[(600, 1)], 1), 0);
+        assert_eq!(term(Key::UnpackedVolumePpm, &[(0, 1)], 0), 0);
+        assert_eq!(term(Key::UnpackedVolumePpm, &[(1600, 1)], 1), 375_000);
+        assert_eq!(value_forgone(&[(1, 2), (i128::MAX, 2)], 3), i128::MAX);
+        assert!(order_of(&Json::Null).is_none());
+    }
+
     #[test]
     fn unrepresentable_gaps_are_withheld_and_rejected_when_forged() {
         for cheap_cost in [0i64, 1] {

@@ -27,6 +27,24 @@ fn algorithm(result: &Json) -> Res<&Json> {
     Ok(algorithm)
 }
 
+/// The result echoes the request's currency, and states none the request did not declare.
+/// A null is the field left out, on either side. O(1).
+pub(crate) fn check_currency(request: &Json, result: &Json, issues: &mut Vec<Issue>) -> Res<()> {
+    let requested = request.get_null("currency")?;
+    let reported = result.get_null("currency")?;
+    if !reported.py_eq(requested) {
+        issues.push(Issue::new(
+            "currency_mismatch",
+            format!(
+                "reported {}, requested {}",
+                py_repr(reported),
+                py_repr(requested)
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn check_algorithm_metrics(result: &Json, issues: &mut Vec<Issue>) -> Res<()> {
     let algorithm = algorithm(result)?;
     let metrics = algorithm.get_null("metrics")?;

@@ -72,6 +72,8 @@ pub fn container() -> Container {
         preloaded: Vec::new(),
         deformable_boundary: None,
         made_to_measure: None,
+        pallet_overhang_limit: None,
+        deck: None,
     }
 }
 

@@ -7,7 +7,7 @@ use packvium_core::artifacts::build_artifact_json;
 use packvium_core::pack_json;
 use packvium_core::revisions::{
     FORMAT, RevisionErrorCode, apply_events_json, canonical_revision_json, derive_revision_json,
-    document_digest_json, root_revision_json, verify_revision_chain_json,
+    document_digest_json, root_revision_json, stock_cut_boxes_json, verify_revision_chain_json,
 };
 use serde_json::{Value, json};
 
@@ -785,5 +785,276 @@ fn a_parent_mismatch_spells_what_it_found_and_expected() {
         details[1].starts_with("parent null, expected sha256:"),
         "{}",
         details[1]
+    );
+}
+
+/// A fixed placement no engine can spell keeps the lock index from being built, and the
+/// lock is then compared entry by entry: it passes the earlier, different entry and is
+/// refused at the unspellable one, as the reference refuses it, rather than appended.
+#[test]
+fn a_lock_after_an_unspellable_fixed_entry_is_refused_by_that_entry() {
+    let mut fixed = request();
+    fixed["fixed_placements"] = json!([
+        {"item_type": "cube", "container_type": "box",
+         "position": {"x": "100", "z": "0"}, "orientation": "LWH"},
+        {"item_type": "cube", "container_type": "box",
+         "position": {"x": "0", "z": "100"}, "orientation": "LWH", "note": 1e300},
+    ]);
+    let (code, message) = said(apply_events_json(
+        &fixed.to_string(),
+        &json!([locked("placement_locked", 1)]).to_string(),
+    ));
+    assert_eq!(code, "number_out_of_range");
+    assert!(
+        message.contains("beyond what every engine holds exactly"),
+        "{message}"
+    );
+}
+
+// ---------------------------------------------------------------- cut to measure
+
+fn cut_request(quantity: Value, fixed: Value) -> Value {
+    let mut machine = json!({"id": "machine", "cost_minor": 40, "tare_weight": "50",
+        "inner_dimensions": {"length": "310", "width": "310", "height": "610"},
+        "made_to_measure": {"minimum": {"length": "60", "width": "60", "height": "60"},
+            "increment": {"length": "25", "width": "25", "height": "25"},
+            "cost_per_square_metre_minor": 1000, "tare_per_square_metre": "500",
+            "outer_allowance": {"length": "3", "width": "3", "height": "3"}}});
+    if !quantity.is_null() {
+        machine["quantity"] = quantity;
+    }
+    json!({"units": {"length": "mm"}, "items": [], "fixed_placements": fixed,
+           "containers": [machine, {"id": "carton",
+               "inner_dimensions": {"length": "10", "width": "10", "height": "10"}}]})
+}
+
+fn cut_artifact() -> Value {
+    let sides = |l: &str| json!({"inner_dimensions": {"length": l, "width": "4800000", "height": "9600000"}});
+    json!({"work_order": {"containers": [{"container_type": "machine"}, {"container_type": "carton"},
+                                          {"container_type": "machine"}]},
+           "geometry": {"containers": [sides("4800000"), sides("1"), sides("5200000")]}})
+}
+
+fn fixed_in(instance: Value) -> Value {
+    let mut entry = json!({"item_type": "cube", "container_type": "machine",
+                           "position": {"x": "0", "y": "0", "z": "0"}, "orientation": "LWH"});
+    if !instance.is_null() {
+        entry["container_instance"] = instance;
+    }
+    entry
+}
+
+fn stocked(
+    request: &Value,
+    artifact: &Value,
+) -> Result<Value, packvium_core::revisions::RevisionError> {
+    stock_cut_boxes_json(&request.to_string(), &artifact.to_string(), 2).map(|text| parse(&text))
+}
+
+#[test]
+fn a_cut_box_holding_fixed_items_becomes_a_priced_stock_container() {
+    let request = cut_request(
+        json!(3),
+        json!([
+            fixed_in(Value::Null),
+            fixed_in(json!(2)),
+            fixed_in(json!(1))
+        ]),
+    );
+    let derived = stocked(&request, &cut_artifact()).expect("the boxes are stocked");
+    let ids: Vec<&str> = derived["containers"]
+        .as_array()
+        .expect("containers")
+        .iter()
+        .map(|container| container["id"].as_str().expect("an id"))
+        .collect();
+    assert_eq!(ids, ["machine", "machine@2#1", "machine@2#2", "carton"]);
+    assert_eq!(derived["containers"][0]["quantity"], json!(1));
+    let first = &derived["containers"][1];
+    assert!(first.get("made_to_measure").is_none());
+    assert_eq!(first["quantity"], json!(1));
+    assert_eq!(
+        first["inner_dimensions"]["length"],
+        json!({"value": "4800000", "unit": "ticks"})
+    );
+    // 3 mm of allowance is 48000 ticks.
+    assert_eq!(
+        first["outer_dimensions"]["height"],
+        json!({"value": "9648000", "unit": "ticks"})
+    );
+    // 300 x 300 x 600 mm: 0.9 m^2 of board, 900 minor units and 450 g of tare on top.
+    assert_eq!(first["cost_minor"], json!(940));
+    assert_eq!(
+        first["tare_weight"],
+        json!({"value": "4000000000", "unit": "ticks"})
+    );
+    assert_eq!(
+        derived["containers"][2]["inner_dimensions"]["length"]["value"],
+        "5200000"
+    );
+    let types: Vec<(&str, &Value)> = derived["fixed_placements"]
+        .as_array()
+        .expect("fixed")
+        .iter()
+        .map(|entry| {
+            (
+                entry["container_type"].as_str().expect("a type"),
+                &entry["container_instance"],
+            )
+        })
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("machine@2#1", &json!(1)),
+            ("machine@2#2", &json!(1)),
+            ("machine@2#1", &json!(1))
+        ]
+    );
+    // A machine whose quantity the boxes use up is dropped; one with none stated stays.
+    let used_up = stocked(
+        &cut_request(json!(2), json!([fixed_in(json!(1)), fixed_in(json!(2))])),
+        &cut_artifact(),
+    )
+    .expect("the boxes are stocked");
+    assert_eq!(used_up["containers"][0]["id"], "machine@2#1");
+    // A container without a string id is kept where it is.
+    let mut odd = cut_request(json!(3), json!([fixed_in(json!(1))]));
+    odd["containers"][1]["id"] = json!(7);
+    let odd = stocked(&odd, &cut_artifact()).expect("the box is stocked");
+    assert_eq!(odd["containers"][2]["id"], json!(7));
+    let unlimited = stocked(
+        &cut_request(Value::Null, json!([fixed_in(json!(1))])),
+        &cut_artifact(),
+    )
+    .expect("the box is stocked");
+    assert!(unlimited["containers"][0].get("quantity").is_none());
+}
+
+#[test]
+fn a_request_without_a_cut_box_is_returned_as_it_is() {
+    for request in [
+        cut_request(json!(1), json!([])),
+        cut_request(json!(1), json!("none")),
+        json!({"containers": "none", "fixed_placements": [fixed_in(Value::Null)]}),
+    ] {
+        assert_eq!(stocked(&request, &json!({})).expect("unchanged"), request);
+    }
+}
+
+#[test]
+fn a_cut_box_the_artifact_cannot_describe_is_refused() {
+    let said = |request: Value, artifact: Value| {
+        let error = stocked(&request, &artifact).expect_err("refused");
+        (error.code(), error.message().to_owned())
+    };
+    assert_eq!(
+        said(
+            cut_request(json!(3), json!([fixed_in(json!(3))])),
+            cut_artifact()
+        ),
+        (
+            "invalid_artifact",
+            "the approved plan holds no machine instance 3".to_owned()
+        )
+    );
+    assert_eq!(
+        said(
+            cut_request(json!(3), json!([fixed_in(json!("1"))])),
+            cut_artifact()
+        ),
+        (
+            "invalid_artifact",
+            "the approved plan holds no machine instance null".to_owned()
+        )
+    );
+    let mut bad = cut_artifact();
+    bad["geometry"]["containers"][0]["inner_dimensions"]["width"] = json!("4.8");
+    assert_eq!(
+        said(cut_request(json!(3), json!([fixed_in(json!(1))])), bad),
+        (
+            "invalid_artifact",
+            "a cut box's width is not a tick count".to_owned()
+        )
+    );
+    let mut clash = cut_request(json!(3), json!([fixed_in(json!(1))]));
+    clash["containers"][1]["id"] = json!("machine@2#1");
+    assert_eq!(
+        said(clash, cut_artifact()),
+        (
+            "event_conflict",
+            "a container is already named \"machine@2#1\"".to_owned()
+        )
+    );
+    let mut unmeasured = cut_request(json!(3), json!([fixed_in(json!(1))]));
+    unmeasured["containers"][0]["made_to_measure"]["outer_allowance"]["width"] = json!("wide");
+    assert_eq!(said(unmeasured, cut_artifact()).0, "invalid_revision");
+    let mut unweighed = cut_request(json!(3), json!([fixed_in(json!(1))]));
+    unweighed["containers"][0]["tare_weight"] = json!("heavy");
+    assert_eq!(said(unweighed, cut_artifact()).0, "invalid_revision");
+    assert_eq!(
+        said(
+            cut_request(json!(3), json!([fixed_in(json!(0))])),
+            cut_artifact()
+        )
+        .1,
+        "the approved plan holds no machine instance 0"
+    );
+}
+
+#[test]
+fn the_cut_to_measure_history_derives_and_audits_byte_for_byte() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../../conformance/revisions/histories.json");
+    if !path.is_file() {
+        assert!(
+            !path.parent().unwrap().is_dir(),
+            "{} is missing",
+            path.display()
+        );
+        eprintln!(
+            "skipping shared cut-box history comparison: the corpus lives in the workspace only"
+        );
+        return;
+    }
+    let corpus = parse(&std::fs::read_to_string(path).expect("the corpus exists"));
+    let history = corpus["histories"]
+        .as_array()
+        .expect("histories")
+        .iter()
+        .find(|history| history["name"] == "cut-to-measure")
+        .expect("the cut-to-measure history");
+    // The committed chain holds each revision's canonical text.
+    let texts: Vec<&str> = history["chain"]
+        .as_array()
+        .expect("a chain")
+        .iter()
+        .map(|text| text.as_str().expect("canonical text"))
+        .collect();
+    let chain: Vec<Value> = texts.iter().map(|text| parse(text)).collect();
+    let mut parent = root_revision_json(&history["request"].to_string()).expect("a root");
+    assert_eq!(parent, texts[0]);
+    let mut artifacts = vec![Value::Null];
+    for (index, step) in history["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .enumerate()
+    {
+        parent = derive_revision_json(
+            &parent,
+            &step["artifact"].to_string(),
+            &step["events"].to_string(),
+        )
+        .expect("the step derives");
+        assert_eq!(parent, texts[index + 1]);
+        artifacts.push(step["artifact"].clone());
+    }
+    assert!(codes(&chain, Some(&artifacts)).is_empty());
+    // Without the approved artifact the cut sizes cannot be checked.
+    let without = codes(&chain, None);
+    assert!(
+        without.contains(&"artifact_required".to_owned()),
+        "{without:?}"
     );
 }

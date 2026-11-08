@@ -6,6 +6,7 @@ use crate::geometry::{ALL_DIRECTIONS, Aabb, Dimensions, Point, Rotation, ShapeTy
 use crate::hull::{self, Vertex};
 use crate::made_to_measure::{MAX_EXACT_INTEGER, MadeToMeasure, sides_of};
 use crate::model::*;
+use crate::pallet_overhang::{OverhangLimit, solving_frame};
 use crate::policy::{PolicyConstraint, PolicyRuleSet};
 use crate::rebalance::rebalance_weight;
 use crate::request_errors;
@@ -63,6 +64,8 @@ pub fn rebalance_json(
     let request_value: Value = serde_json::from_str(request_input)?;
     let request = request_from_json(&request_value)?;
     validate_request(&request)?;
+    // A result's coordinates are in each pallet's solving frame.
+    let request = with_solving_frames(&request);
     let result_value: Value = serde_json::from_str(result_input)?;
     let original = parse_rebalance_result(&request, &result_value)?;
     // A packing the tariff cannot price is refused here for the same reason
@@ -393,6 +396,7 @@ fn parse_rebalance_result(request: &PackingRequest, value: &Value) -> PackResult
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default(),
+        currency: optional_text(root.get("currency")),
     })
 }
 
@@ -412,6 +416,17 @@ pub fn pack_request_with_policy(
     policy: &PolicyRuleSet,
 ) -> PackResult<PackingResult> {
     validate_request(request)?;
+    let framed;
+    let request = if request
+        .containers
+        .iter()
+        .any(|container| container.pallet_overhang_limit.is_some())
+    {
+        framed = with_solving_frames(request);
+        &framed
+    } else {
+        request
+    };
     // Once per pack, from the request alone and before the first solver runs, so computing
     // the bound never depends on which solver won or how much of the deadline was left
     // (OPTIMALITY-GAP.md F3).
@@ -432,6 +447,7 @@ pub fn pack_request_with_policy(
     cite_support_rejections(&mut result, request, &registry.constraints);
     cite_limit_rejections(&mut result, request);
     result.catalog_versions_used = request.catalog_versions_used.clone();
+    echo_currency(&mut result, request.currency.as_deref());
     // Independent validation re-derives every guarantee from per-item placements.
     // A container built by GridSolver's compact fast path carries a
     // `lattice_summary` instead; expand it into the identical placements the O(n)
@@ -480,6 +496,15 @@ pub fn pack_request_with_policy(
     warn_unsupported_placements(&mut result, request.config.minimum_support_ratio);
     state_optimality(&mut result, objective_bound.as_deref());
     Ok(result)
+}
+
+/// The request's currency on the result and on every alternative, as the reference states
+/// it on each packing it returns. Never scored. `O(alternatives)`.
+fn echo_currency(result: &mut PackingResult, currency: Option<&str>) {
+    result.currency = currency.map(str::to_owned);
+    for alternative in &mut result.alternatives {
+        alternative.currency = result.currency.clone();
+    }
 }
 
 /// States the request's bound on a result and, by the same rule, on each alternative
@@ -772,12 +797,10 @@ const UNSUPPORTED_ITEM_FIELDS: &[&str] = &[];
 /// because the next reserved value will need it, and because `reject_unsupported` takes its
 /// lists as parameters precisely so it remains testable when they are empty.
 const UNSUPPORTED_SHAPE_TYPES: &[&str] = &[];
-// `pallet_overhang_limit` was reserved in the schema by at the 1.1.0 contract freeze
-// and is refused everywhere until an engine implements it from a request: a field a caller
-// can set and the solver ignores is worse than a refusal.
 // `access_directions` left this list in, which wired the reserved field through to
-// the stop-accessibility rule in all four engines at once.
-const UNSUPPORTED_CONTAINER_FIELDS: &[&str] = &["pallet_overhang_limit"];
+// the stop-accessibility rule in all four engines at once, and `pallet_overhang_limit` in
+//, which did the same for the pallet deck.
+const UNSUPPORTED_CONTAINER_FIELDS: &[&str] = &[];
 
 fn reject_unsupported(object: &Map<String, Value>) -> PackResult<()> {
     reject_listed_fields(
@@ -855,6 +878,7 @@ fn reject_listed_fields(
         }
     }
     found.extend(made_to_measure_combinations(object));
+    found.extend(pallet_overhang_combinations(object));
     if found.is_empty() {
         return Ok(());
     }
@@ -900,13 +924,6 @@ fn made_to_measure_combinations(object: &Map<String, Value>) -> Vec<String> {
         {
             found.push("container.made_to_measure+obstacles".to_string());
         }
-        if container
-            .get("void_fill_reserve_ratio")
-            .and_then(Value::as_f64)
-            .is_some_and(|ratio| ratio > 0.0)
-        {
-            found.push("container.made_to_measure+void_fill_reserve_ratio".to_string());
-        }
     }
     if entries("fixed_placements").iter().any(|entry| {
         entry
@@ -915,6 +932,64 @@ fn made_to_measure_combinations(object: &Map<String, Value>) -> Vec<String> {
             .is_some_and(|name| measured.contains(name))
     }) {
         found.push("fixed_placements+container.made_to_measure".to_string());
+    }
+    found
+}
+
+/// The combinations a pallet with an overhang limit refuses: obstacles and axles
+/// sit in the declared frame the widened frame moves, doors and route corridors need a wall
+/// the overhang crosses, a reserve is a share of a volume the limit leaves undefined, and a
+/// box cut to measure has no deck. A flat bag beside it is a request error instead. Checked
+/// on the raw request. `O(items + containers)`.
+fn pallet_overhang_combinations(object: &Map<String, Value>) -> Vec<String> {
+    let entries = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(Value::as_object)
+            .collect::<Vec<_>>()
+    };
+    let non_empty = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_array)
+            .is_some_and(|list| !list.is_empty())
+    };
+    let set = |value: Option<&Value>| value.is_some_and(|value| !value.is_null());
+    let mut found = Vec::new();
+    let mut pallets = false;
+    for container in entries("containers") {
+        if !set(container.get("pallet_overhang_limit")) {
+            continue;
+        }
+        pallets = true;
+        let reserve = container
+            .get("void_fill_reserve_ratio")
+            .and_then(Value::as_f64)
+            .is_some_and(|ratio| ratio > 0.0);
+        for (name, present) in [
+            (
+                "access_directions",
+                non_empty(container.get("access_directions")),
+            ),
+            ("axles", set(container.get("axles"))),
+            ("made_to_measure", set(container.get("made_to_measure"))),
+            ("obstacles", non_empty(container.get("obstacles"))),
+            ("void_fill_reserve_ratio", reserve),
+        ] {
+            if present {
+                found.push(format!("container.pallet_overhang_limit+{name}"));
+            }
+        }
+    }
+    if pallets
+        && entries("items")
+            .iter()
+            .any(|item| set(item.get("stop_index")))
+    {
+        found.push("container.pallet_overhang_limit+item.stop_index".to_string());
     }
     found
 }
@@ -1054,11 +1129,15 @@ fn parse_request(object: &Map<String, Value>) -> PackResult<PackingRequest> {
         .map(|value| parse_container(value, length_unit))
         .collect::<PackResult<Vec<_>>>()?;
     let catalog_versions_used = parse_catalog_versions(object.get("catalog_versions_used"))?;
-    let fixed_placements =
-        fixed::require_fixed_placement_shapes(object.get("fixed_placements"), length_unit)?
-            .iter()
-            .map(|value| parse_fixed_placement(value, length_unit))
-            .collect::<PackResult<Vec<_>>>()?;
+    let currency = optional_text(object.get("currency"));
+    let fixed_placements = fixed::require_fixed_placement_shapes(
+        object.get("fixed_placements"),
+        length_unit,
+        &fixed::hull_item_types(object.get("items")),
+    )?
+    .iter()
+    .map(|value| parse_fixed_placement(value, length_unit))
+    .collect::<PackResult<Vec<_>>>()?;
     Ok(PackingRequest {
         items,
         containers,
@@ -1066,6 +1145,7 @@ fn parse_request(object: &Map<String, Value>) -> PackResult<PackingRequest> {
         output_length_unit,
         output_weight_unit,
         catalog_versions_used,
+        currency,
         fixed_placements,
         fixed_containers: Vec::new(),
     })
@@ -1363,7 +1443,7 @@ fn parse_item(value: &Value, unit: &str) -> PackResult<Item> {
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        rotations.retain(|rotation| Rotation::UPRIGHT.contains(rotation));
+        rotations.retain(|rotation| rotation.is_upright());
     }
     if rotations.is_empty() {
         return Err(PackError::InvalidInput(format!(
@@ -1639,9 +1719,27 @@ fn parse_container(value: &Value, unit: &str) -> PackResult<Container> {
         rate_table: parse_rate_table(map.get("rate_table"))?,
         access_directions: parse_access_directions(map.get("access_directions"))?,
         preloaded: Vec::new(),
-        deformable_boundary: parse_deformable_boundary(map.get("deformable_boundary"))?,
+        deformable_boundary: parse_deformable_boundary(map.get("deformable_boundary"), unit)?,
         made_to_measure: parse_made_to_measure(map.get("made_to_measure"), unit)?,
+        pallet_overhang_limit: parse_pallet_overhang_limit(map.get("pallet_overhang_limit"), unit)?,
+        deck: None,
     })
+}
+
+/// `container.pallet_overhang_limit`. `request_errors` has already refused every
+/// malformed value and every frame past the box ceiling.
+fn parse_pallet_overhang_limit(
+    value: Option<&Value>,
+    unit: &str,
+) -> PackResult<Option<OverhangLimit>> {
+    let Some(map) = value.and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let axis = |name: &str| Length::parse(map.get(name).unwrap_or(&Value::Null), unit);
+    Ok(Some(OverhangLimit {
+        length: axis("length")?,
+        width: axis("width")?,
+    }))
 }
 
 /// `container.made_to_measure`. `request_errors` has already refused every
@@ -1673,15 +1771,25 @@ fn parse_made_to_measure(value: Option<&Value>, unit: &str) -> PackResult<Option
 }
 
 /// `container.deformable_boundary`. `request_errors` has already refused every
-/// malformed shape and every excluded neighbour, so only the kind is read here.
-fn parse_deformable_boundary(value: Option<&Value>) -> PackResult<Option<DeformableBoundary>> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(boundary) if boundary.get("kind").and_then(Value::as_str) == Some("flat_bag") => {
-            Ok(Some(DeformableBoundary::FlatBag))
-        }
-        Some(_) => Err(PackError::InvalidInput(
-            "container.deformable_boundary.kind must be flat_bag".into(),
+/// malformed shape and every excluded neighbour, so only the kind and a gusseted bag's
+/// side gusset depth (1.10) are read here.
+fn parse_deformable_boundary(
+    value: Option<&Value>,
+    unit: &str,
+) -> PackResult<Option<DeformableBoundary>> {
+    let Some(boundary) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    match boundary.get("kind").and_then(Value::as_str) {
+        Some("flat_bag") => Ok(Some(DeformableBoundary::FlatBag)),
+        Some("gusseted_bag") => Ok(Some(DeformableBoundary::GussetedBag {
+            side_gusset_depth: Length::parse(
+                boundary.get("side_gusset_depth").unwrap_or(&Value::Null),
+                unit,
+            )?,
+        })),
+        _ => Err(PackError::InvalidInput(
+            "container.deformable_boundary.kind must be flat_bag or gusseted_bag".into(),
         )),
     }
 }
@@ -1756,6 +1864,7 @@ fn parse_rate_table(value: Option<&Value>) -> PackResult<Option<RateTable>> {
         prices_minor: integers("prices_minor", 0)?,
         minimum_charge_minor: optional("minimum_charge_minor")?,
         fuel_surcharge_permille: optional("fuel_surcharge_permille")?,
+        currency: optional_text(map.get("currency")),
     };
     if table.weight_brackets_g.is_empty() {
         return Err(PackError::InvalidInput(
@@ -1903,6 +2012,10 @@ fn parse_fixed_placement(value: &Value, unit: &str) -> PackResult<FixedPlacement
             .ok_or_else(|| {
                 PackError::InvalidInput("fixed placement orientation is invalid".into())
             })?,
+        placement_id: map
+            .get("placement_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -1971,7 +2084,91 @@ fn admit_machine(container: &Container, machine: MadeToMeasure) -> PackResult<()
     Ok(())
 }
 
+/// A library caller's gusseted bag, held to the JSON path's rule (1.10): a side gusset that
+/// is positive and no deeper than the bag is wide, since a deeper fold would have no flat
+/// sheet left to fold from. A flat bag and a missing depth cannot be spelled in this type.
+/// `O(1)`.
+fn admit_gusset(container: &Container, boundary: DeformableBoundary) -> PackResult<()> {
+    let DeformableBoundary::GussetedBag { side_gusset_depth } = boundary else {
+        return Ok(());
+    };
+    let depth = side_gusset_depth.0;
+    let refuse = |detail: &str| {
+        Err(PackError::InvalidInput(format!(
+            "container {} side_gusset_depth {detail}",
+            container.id
+        )))
+    };
+    if depth <= 0 {
+        return refuse("must be positive");
+    }
+    if depth > container.inner_dimensions.width.0 {
+        return refuse("exceeds inner_dimensions width");
+    }
+    Ok(())
+}
+
+/// A library caller's pallet, held to the rules the JSON path applies: no field that reads
+/// the declared frame or a wall the widened frame moves, in Python's order, a non-negative
+/// overhang, and a frame whose sides stay exact integers. `O(1)`.
+fn admit_pallet(container: &Container, limit: OverhangLimit) -> PackResult<()> {
+    // A flat bag refuses the limit as the last of its own exclusions, before the pallet's.
+    if container.is_flat_bag() {
+        return Err(PackError::InvalidInput(format!(
+            "container {}: pallet_overhang_limit cannot be combined with deformable_boundary",
+            container.id
+        )));
+    }
+    let refused = [
+        ("obstacles", !container.obstacles.is_empty()),
+        ("axles", container.axles.is_some()),
+        ("access_directions", !container.access_directions.is_empty()),
+        (
+            "void_fill_reserve_ratio",
+            container.void_fill_reserve_ppm > 0,
+        ),
+        ("made_to_measure", container.made_to_measure.is_some()),
+    ]
+    .into_iter()
+    .find_map(|(name, present)| present.then_some(name));
+    if let Some(name) = refused {
+        return Err(PackError::InvalidInput(format!(
+            "container {}: {name} cannot be combined with pallet_overhang_limit",
+            container.id
+        )));
+    }
+    let inner = container.inner_dimensions;
+    for (overhang, side) in [
+        (limit.length.0, inner.length.0),
+        (limit.width.0, inner.width.0),
+    ] {
+        if overhang < 0 {
+            return Err(PackError::InvalidInput(format!(
+                "container {} pallet_overhang_limit cannot be negative",
+                container.id
+            )));
+        }
+        if i128::from(side) + 2 * i128::from(overhang) > MAX_EXACT_INTEGER {
+            return Err(PackError::InvalidInput(format!(
+                "container {} pallet_overhang_limit widens the frame past {MAX_EXACT_INTEGER} ticks",
+                container.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The request every solver packs: each pallet replaced by its solving frame, so
+/// no solver, bound or validator needs to know the limit exists. `O(c)` beside the clone.
+fn with_solving_frames(request: &PackingRequest) -> PackingRequest {
+    PackingRequest {
+        containers: request.containers.iter().map(solving_frame).collect(),
+        ..request.clone()
+    }
+}
+
 fn validate_request(request: &PackingRequest) -> PackResult<()> {
+    refuse_foreign_currencies(request)?;
     if request.items.is_empty() || request.containers.is_empty() {
         return Err(PackError::InvalidInput(
             "items and containers are required".into(),
@@ -2010,6 +2207,16 @@ fn validate_request(request: &PackingRequest) -> PackResult<()> {
                 item.id
             )));
         }
+        if item.shape_type != ShapeType::ConvexHull
+            && item
+                .allowed_rotations
+                .iter()
+                .any(|rotation| rotation.is_signed())
+        {
+            return Err(
+                RequestError::new("invalid_value", "", Rotation::SIGNED_NEEDS_A_HULL).into(),
+            );
+        }
         if let Some(rule) = item.ground_contact_rule.as_deref()
             && !matches!(rule, "free" | "covered" | "single" | "multiple")
         {
@@ -2047,8 +2254,14 @@ fn validate_request(request: &PackingRequest) -> PackResult<()> {
                 container.id
             )));
         }
+        if let Some(boundary) = container.deformable_boundary {
+            admit_gusset(container, boundary)?;
+        }
         if let Some(machine) = container.made_to_measure {
             admit_machine(container, machine)?;
+        }
+        if let Some(limit) = container.pallet_overhang_limit {
+            admit_pallet(container, limit)?;
         }
         for obstacle in &container.obstacles {
             if obstacle.boxes().any(|box_| !boundary.contains(box_)) {
@@ -2059,7 +2272,55 @@ fn validate_request(request: &PackingRequest) -> PackResult<()> {
             }
         }
     }
+    refuse_routes_beside_pallets(request)
+}
+
+/// The JSON path's currency rules for a typed request, at the same pointers (F1): the
+/// request's code in ISO 4217 shape, then each rate table's in the same shape and equal to
+/// it. `O(containers)`.
+fn refuse_foreign_currencies(request: &PackingRequest) -> PackResult<()> {
+    let currency = request.currency.as_deref();
+    if let Some(code) = currency {
+        request_errors::currency_shape(code, "/currency")?;
+    }
+    for (index, container) in request.containers.iter().enumerate() {
+        let Some(code) = container
+            .rate_table
+            .as_ref()
+            .and_then(|table| table.currency.as_deref())
+        else {
+            continue;
+        };
+        let field = format!("/containers/{index}/rate_table/currency");
+        request_errors::rate_table_currency(code, &field, currency)?;
+    }
     Ok(())
+}
+
+/// A routed item beside a pallet that allows overhang: the JSON path refuses it as
+/// `container.pallet_overhang_limit+item.stop_index`, this one at the first routed item, as
+/// Python's object path does. `O(items + containers)`.
+fn refuse_routes_beside_pallets(request: &PackingRequest) -> PackResult<()> {
+    if request
+        .containers
+        .iter()
+        .all(|container| container.pallet_overhang_limit.is_none())
+    {
+        return Ok(());
+    }
+    match request
+        .items
+        .iter()
+        .position(|item| item.stop_index.is_some())
+    {
+        Some(index) => Err(RequestError::new(
+            "not_allowed",
+            format!("/items/{index}/stop_index"),
+            "cannot be combined with pallet_overhang_limit",
+        )
+        .into()),
+        None => Ok(()),
+    }
 }
 
 fn parse_optional_length(value: Option<&Value>, unit: &str) -> PackResult<Length> {
@@ -2085,6 +2346,11 @@ fn parse_ratio_ppm(value: Option<&Value>) -> PackResult<i128> {
         ));
     }
     Ok((ratio * 1_000_000.0 + 0.5) as i128)
+}
+
+/// A text field the rule table already admitted, or `None` when it is absent.
+fn optional_text(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).map(str::to_owned)
 }
 
 fn str_field(map: &Map<String, Value>, key: &str) -> PackResult<String> {
@@ -2244,14 +2510,41 @@ fn object_map(value: Option<&Value>) -> BTreeMap<String, Value> {
 }
 
 fn parse_rotation(value: &str) -> Option<Rotation> {
-    match value {
-        "LWH" => Some(Rotation::Lwh),
-        "LHW" => Some(Rotation::Lhw),
-        "WLH" => Some(Rotation::Wlh),
-        "WHL" => Some(Rotation::Whl),
-        "HLW" => Some(Rotation::Hlw),
-        "HWL" => Some(Rotation::Hwl),
-        _ => None,
+    Rotation::from_code(value)
+}
+
+#[cfg(test)]
+mod currency_tests {
+    use super::{PackingRequest, pack_request, request_from_json};
+    use serde_json::json;
+
+    /// A typed rate table is held to the request's currency as the JSON one is (F1); only
+    /// the crate can build one, so the typed branch is pinned here.
+    #[test]
+    fn a_typed_rate_table_in_another_currency_is_refused_at_its_pointer() {
+        let mut request = request_from_json(&json!({
+            "currency": "USD",
+            "items": [{ "id": "cube", "dimensions": { "length": "1", "width": "1", "height": "1" } }],
+            "containers": [{ "id": "box",
+                             "inner_dimensions": { "length": "2", "width": "2", "height": "2" },
+                             "rate_table": { "weight_brackets_g": [5000], "prices_minor": [900] } }]
+        }))
+        .expect("admitted");
+        let table = request.containers[0].rate_table.as_mut().expect("a table");
+        table.currency = Some("EUR".into());
+        let refusal = |request: &PackingRequest| pack_request(request).err().map(|e| e.to_string());
+        assert_eq!(
+            refusal(&request).as_deref(),
+            Some(
+                "invalid_request: /containers/0/rate_table/currency: \
+                 must equal the request currency \"USD\""
+            )
+        );
+        request.currency = None;
+        assert_eq!(
+            refusal(&request).as_deref(),
+            Some("invalid_request: /currency: is required when a rate_table declares a currency")
+        );
     }
 }
 
@@ -2769,6 +3062,26 @@ mod result_contract_tests {
         assert_eq!(value["objective"], "default");
         assert_eq!(value["containers"][0]["void_fill_reserve_ticks3"], "0");
     }
+
+    /// Attainment is the only route to `optimal` (OPTIMALITY-GAP.md section 1.3): a status a
+    /// solver set without the bound's proof is not carried through, on the result and on
+    /// every alternative. No built-in solver claims it, so the guard is reached directly.
+    #[test]
+    fn an_unproven_optimal_status_is_not_carried_through() {
+        use super::{PackingStatus, state_optimality};
+        let request = r#"{"items":[{"id":"a","dimensions":{"length":"10","width":"10","height":"10"}}],"containers":[{"id":"c","inner_dimensions":{"length":"20","width":"20","height":"20"}}]}"#;
+        let mut result = super::pack_request(
+            &super::request_from_json(&serde_json::from_str(request).unwrap()).unwrap(),
+        )
+        .unwrap();
+        result.status = PackingStatus::Optimal;
+        let mut alternative = result.clone();
+        alternative.alternatives.clear();
+        result.alternatives = vec![alternative];
+        state_optimality(&mut result, None);
+        assert_eq!(result.status, PackingStatus::Feasible);
+        assert_eq!(result.alternatives[0].status, PackingStatus::Feasible);
+    }
 }
 
 /// The model builders re-check what `request_errors` already refused, so a library caller
@@ -2989,6 +3302,33 @@ mod model_builder_tests {
                 None,
             ))
             .contains("cannot be negative")
+        );
+    }
+
+    /// The builders behind the admission table refuse what the table already refuses, so a
+    /// caller that reaches them directly cannot slip a mistyped field through.
+    #[test]
+    fn stacking_lists_and_boundary_kinds_outside_their_domain_are_refused() {
+        assert!(
+            item(json!({"accepts_stacking_groups": [1]}))
+                .contains("item.accepts_stacking_groups must contain strings")
+        );
+        assert!(
+            item(json!({"accepts_stacking_groups": "pallets"}))
+                .contains("item.accepts_stacking_groups must be an array")
+        );
+        for boundary in [json!({"kind": "envelope"}), json!({}), json!("flat_bag")] {
+            assert!(
+                container(json!({ "deformable_boundary": boundary })).contains(
+                    "container.deformable_boundary.kind must be flat_bag or gusseted_bag"
+                ),
+                "{boundary}"
+            );
+        }
+        // A gusseted bag whose depth is not a length is refused by the parser too (1.10).
+        assert!(
+            !container(json!({"deformable_boundary": {"kind": "gusseted_bag"}})).is_empty(),
+            "a gusseted bag without a depth was parsed"
         );
     }
 
@@ -3344,5 +3684,101 @@ mod model_builder_tests {
     #[test]
     fn the_unsupported_field_guard_skips_entries_that_are_not_objects() {
         assert!(reject_unsupported(&object(json!({"items": [1], "containers": [2]}))).is_ok());
+    }
+}
+
+/// The model builders' half of the 24 rotations (1.10): what `parse_item` and
+/// `parse_fixed_placement` make of a code once `request_errors` has admitted it, and the
+/// typed path's refusal of a signed code on a box. The JSON rule table is pinned by
+/// `tests/signed_rotations.rs`; these reach the builders directly.
+#[cfg(test)]
+mod signed_rotation_tests {
+    use super::*;
+    use serde_json::json;
+
+    const WEDGE: &str = r#"[{"x":"0","y":"0","z":"0"},{"x":"10","y":"0","z":"0"},
+        {"x":"0","y":"10","z":"0"},{"x":"0","y":"0","z":"10"}]"#;
+
+    fn hull(rotations: Value, keep_upright: bool) -> PackResult<Item> {
+        let value = json!({
+            "id": "wedge",
+            "dimensions": {"length": "10", "width": "10", "height": "10"},
+            "shape_type": "convex_hull",
+            "hull_vertices": serde_json::from_str::<Value>(WEDGE).unwrap(),
+            "allowed_rotations": rotations,
+            "keep_upright": keep_upright,
+        });
+        parse_item(&value, "mm")
+    }
+
+    #[test]
+    fn a_hull_keeps_every_code_it_lists_in_the_order_it_lists_them() {
+        let listed = ["-H-W-L", "LWH", "+W-L+H"];
+        let item = hull(json!(listed), false).expect("a hull may name signed codes");
+        let codes: Vec<&str> = item.allowed_rotations.iter().map(|r| r.as_str()).collect();
+        assert_eq!(codes, listed);
+        assert_eq!(item.shape_type, ShapeType::ConvexHull);
+    }
+
+    #[test]
+    fn keep_upright_narrows_an_explicit_signed_list_to_plus_h() {
+        let every: Vec<&str> = Rotation::EVERY.iter().map(|r| r.as_str()).collect();
+        let item = hull(json!(every), true).expect("upright codes remain");
+        assert_eq!(
+            item.allowed_rotations,
+            vec![
+                Rotation::Lwh,
+                Rotation::Wlh,
+                Rotation::NlNwPh,
+                Rotation::PwNlPh
+            ]
+        );
+        let refused = hull(json!(["-L-W-H", "+L-W-H"]), true);
+        let message = refused.expect_err("nothing upright is left").to_string();
+        assert!(message.contains("has no allowed rotations"), "{message}");
+    }
+
+    #[test]
+    fn a_fixed_placement_reads_a_signed_code() {
+        let placement = json!({
+            "item_type": "wedge",
+            "container_type": "crate",
+            "orientation": "-L-W+H",
+        });
+        let parsed = parse_fixed_placement(&placement, "mm").expect("a signed code parses");
+        assert_eq!(parsed.rotation, Rotation::NlNwPh);
+        assert_eq!(parsed.rotation.signs(), [-1, -1, 1]);
+        assert_eq!(parse_rotation("+L+W-H"), None, "a reflection is not a code");
+    }
+
+    #[test]
+    fn the_typed_path_refuses_a_signed_code_on_a_box_and_admits_it_on_a_hull() {
+        let mut item = hull(json!(["LWH", "-L-W+H"]), false).expect("a hull");
+        let container = Container::new(
+            "crate",
+            Dimensions {
+                length: Length(20 * Length::TICKS_PER_MM),
+                width: Length(20 * Length::TICKS_PER_MM),
+                height: Length(20 * Length::TICKS_PER_MM),
+            },
+        );
+        let mut request = request_from_json(&json!({
+            "items": [{"id": "a", "dimensions": {"length": "1", "width": "1", "height": "1"}}],
+            "containers": [{"id": "c", "inner_dimensions": {"length": "1", "width": "1", "height": "1"}}],
+        }))
+        .expect("a valid request");
+        request.items = vec![item.clone()];
+        request.containers = vec![container];
+        assert!(validate_request(&request).is_ok(), "a hull may name it");
+        item.shape_type = ShapeType::RigidCuboid;
+        item.hull_vertices = None;
+        request.items = vec![item];
+        let refused = validate_request(&request).expect_err("a box may not");
+        let PackError::InvalidRequest(error) = refused else {
+            panic!("refused, but not as a request error: {refused}");
+        };
+        assert_eq!(error.reason(), "invalid_value");
+        assert_eq!(error.field(), "");
+        assert!(error.to_string().ends_with(Rotation::SIGNED_NEEDS_A_HULL));
     }
 }

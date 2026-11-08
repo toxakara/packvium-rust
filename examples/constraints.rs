@@ -222,6 +222,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &crate_,
     )?;
 
+    // ------------------------------------------------------------ pallet overhang
+    //
+    // Not every rule takes something away. `pallet_overhang_limit` lets a load pass a
+    // pallet's deck by up to the stated length at each end and width at each side. Only the
+    // deck bears weight, so a placement reports the share of its base the deck carries as
+    // `support_ratio`, and the pallet reports how big the load really is as
+    // `achieved_dimensions`. A crate 50 mm longer and wider than a 1200 x 800 deck:
+    println!("\npallet_overhang_limit -- a crate a little larger than the deck");
+    let crate_on_deck = with(
+        item("crate", "1250", "850", "400", "10 kg"),
+        json!({ "allowed_rotations": ["LWH"] }),
+    );
+    for (label, limit) in [
+        ("no overhang      ", Value::Null),
+        (
+            "50 mm each side  ",
+            json!({ "length": "50", "width": "50" }),
+        ),
+    ] {
+        let mut pallet = json!({ "id": "pallet", "max_payload": "1000 kg",
+            "inner_dimensions": { "length": "1200", "width": "800", "height": "1000" } });
+        if !limit.is_null() {
+            pallet["pallet_overhang_limit"] = limit;
+        }
+        let result = pack(json!([crate_on_deck.clone()]), json!([pallet]))?;
+        let placed = list(&result["containers"])
+            .iter()
+            .flat_map(|container| list(&container["placements"]))
+            .collect::<Vec<_>>();
+        println!(
+            "  {label}: {} placed, {} refused",
+            placed.len(),
+            list(&result["unpacked_items"]).len()
+        );
+        print_refusals(&result);
+        if let (Some(placement), Some(container)) =
+            (placed.first(), list(&result["containers"]).first())
+        {
+            let size = &container["achieved_dimensions"];
+            println!(
+                "      on the deck: {} of its base; load {} x {} mm",
+                text(&placement["support_ratio"]),
+                text(&size["length"]["value"]),
+                text(&size["width"]["value"])
+            );
+        }
+    }
+
     // Every reason printed above is a fact about the request, not a solver failure --
     // which is why it can be turned into a sentence a customer is allowed to read.
     Ok(())

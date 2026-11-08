@@ -13,6 +13,11 @@
 //! independent otherwise -- a carton already taped shut is not repacked to make a better
 //! pallet -- and the chain stops at the first level that cannot pack everything.
 //!
+//! `pack_nested` keeps the best answer at each level, which is not always the best plan:
+//! the cheapest carton set can be one the pallet cannot take. `pack_nested_with(&request, k)`
+//! carries the `k` best chains from level to level and lets the outermost level choose; a
+//! width of 1 is exactly `pack_nested`. The second half of this example shows the difference.
+//!
 //! This is also the typed side of the API: `Item`, `Container` and `PackingRequest` are
 //! plain structs with public fields, and `pack_request` returns a `PackingResult` whose
 //! placements and weights are exact integers.
@@ -20,6 +25,7 @@
 use packvium_core::{
     Container, Dimensions, EffortBudget, Item, Length, NestedLevel, NestedPackingRequest,
     PackResult, PackingConfig, PackingRequest, SolverProfile, Weight, pack_nested,
+    pack_nested_with,
 };
 use serde_json::json;
 
@@ -89,6 +95,7 @@ fn request(items: Vec<Item>, containers: Vec<Container>) -> PackingRequest {
         output_length_unit: "mm".into(),
         output_weight_unit: "kg".into(),
         catalog_versions_used: Vec::new(),
+        currency: None,
         fixed_placements: Vec::new(),
         fixed_containers: Vec::new(),
     }
@@ -178,5 +185,67 @@ fn main() -> PackResult<()> {
         pallets.containers.len(),
         pallets.packed_item_count() == cartons.containers.len()
     );
+
+    level_beam()
+}
+
+/// Two cubes, a carton that holds both and one that holds one, and a pallet that is a
+/// 100 x 100 mm tower. One long carton is the better carton level, and a carton is handed up
+/// standing as it was packed, so the long one cannot go up the tower. Kept greedy, the chain
+/// ends there; with two chains, the pallet level picks the two single cartons instead.
+fn level_beam() -> PackResult<()> {
+    let cube = dimensions("100", "100", "100")?;
+    let carton = |id: &str, length_mm: &str| -> PackResult<Container> {
+        Ok(container(ContainerSpec {
+            id,
+            inner: dimensions(length_mm, "100", "100")?,
+            outer: None,
+            tare: weight("0")?,
+            max_payload: weight("10000")?,
+            cost_minor: 0,
+        }))
+    };
+    let tower = container(ContainerSpec {
+        id: "tower",
+        inner: dimensions("100", "100", "200")?,
+        outer: None,
+        tare: weight("0")?,
+        max_payload: weight("10000")?,
+        cost_minor: 0,
+    });
+    let plan = NestedPackingRequest {
+        levels: vec![
+            NestedLevel {
+                name: "carton".into(),
+                request: request(
+                    vec![item("cube", cube, weight("500")?, 2)],
+                    vec![carton("long", "200")?, carton("single", "100")?],
+                ),
+            },
+            NestedLevel {
+                name: "pallet".into(),
+                request: request(Vec::new(), vec![tower]),
+            },
+        ],
+        beam_width: 1,
+    };
+
+    println!();
+    for width in [1, 2] {
+        let result = pack_nested_with(&plan, width)?;
+        let cartons: Vec<String> = result.levels[0]
+            .1
+            .containers
+            .iter()
+            .map(|packed| packed.id())
+            .collect();
+        let on_pallet = result
+            .levels
+            .get(1)
+            .is_some_and(|(_, pallet)| pallet.complete());
+        println!(
+            "level beam {width}: cartons {cartons:?}, every carton on the pallet: {on_pallet}"
+        );
+    }
     Ok(())
 }
