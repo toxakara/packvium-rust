@@ -1,12 +1,13 @@
 //! How a result is written out, for the statuses and shapes a default solve does not
 //! produce: the closed-form lattice centre of mass, every status spelling and its derived
-//! facts, a score past the `i64` range, and a hand-built result with no solver name.
+//! facts, a score past the `i64` range, a hand-built result with no solver name, and
+//! container ids numbered per type by the lattice and block solvers.
 
 mod support;
 
 use packvium_core::{
-    AlgorithmReport, ItemInstance, PackedContainer, PackingResult, PackingStatus, StartRecord,
-    UnpackedItem, aggregate_termination, pack_json,
+    AlgorithmReport, ItemInstance, PackedContainer, PackingResult, PackingStatus, ResultFact,
+    StartRecord, UnpackedItem, aggregate_termination, pack_json,
 };
 use serde_json::{Value, json};
 use support::{container, item, placed};
@@ -64,6 +65,7 @@ fn hand_built(status: PackingStatus) -> PackingResult {
         optimality: None,
         objective: "default".into(),
         catalog_versions_used: Vec::new(),
+        currency: None,
     }
 }
 
@@ -180,4 +182,92 @@ fn the_written_text_is_the_tree_written_out_byte_for_byte() {
     assert_eq!(tree["alternatives"].as_array().map(Vec::len), Some(2));
     assert_eq!(tree["alternatives"][0]["alternatives"], json!([]));
     assert_eq!(tree["containers"][1]["placements"][0]["fixed"], json!(true));
+}
+
+fn container_ids(request: &Value) -> Vec<String> {
+    let result: Value =
+        serde_json::from_str(&pack_json(&request.to_string()).expect("the request packs"))
+            .expect("result JSON");
+    result["containers"]
+        .as_array()
+        .expect("containers")
+        .iter()
+        .map(|container| container["id"].as_str().expect("id").to_owned())
+        .collect()
+}
+
+#[test]
+fn the_grid_lattice_numbers_containers_per_type() {
+    let request = json!({
+        "items": [{ "id": "cube", "quantity": 6, "weight": "1000",
+                    "dimensions": { "length": "100", "width": "100", "height": "100" } }],
+        "containers": [
+            { "id": "quad", "inner_dimensions": { "length": "200", "width": "200", "height": "100" } },
+            { "id": "pair", "inner_dimensions": { "length": "200", "width": "100", "height": "100" } }
+        ],
+        "configuration": { "solver_profile": "balanced", "time_limit_ms": 60000 }
+    });
+
+    assert_eq!(container_ids(&request), ["quad#1", "pair#1"]);
+}
+
+#[test]
+fn the_block_loader_numbers_containers_per_type() {
+    // The block loader opens nine `small` boxes before any `large`, which it once numbered
+    // from ten.
+    let request = json!({
+        "units": { "length": "cm" },
+        "configuration": {
+            "objective": "lowest_landed_cost",
+            "effort_budget": { "max_candidates_evaluated": 20000, "max_placement_attempts": 20000,
+                               "max_search_nodes": 20000 },
+            "time_limit_ms": 300000,
+            "dimensional_weight_length_unit": "cm", "dimensional_weight_weight_unit": "kg",
+            "dimensional_weight_divisor": 5000
+        },
+        "items": [
+            { "id": "product-21", "quantity": 10, "weight": "1.4 kg",
+              "dimensions": { "length": "22", "width": "18", "height": "25" } },
+            { "id": "product-22", "quantity": 20, "weight": "0.25 kg",
+              "dimensions": { "length": "9", "width": "9", "height": "10" } },
+            { "id": "product-11", "quantity": 20, "weight": "0.35 kg",
+              "dimensions": { "length": "10", "width": "8", "height": "9" } }
+        ],
+        "containers": [
+            { "id": "small", "inner_dimensions": { "length": "25", "width": "20", "height": "15" },
+              "cost_minor": 40,
+              "rate_table": { "weight_brackets_g": [1000, 2000, 5000, 10000],
+                              "prices_minor": [495, 695, 995, 1495] } },
+            { "id": "large", "inner_dimensions": { "length": "40", "width": "30", "height": "30" },
+              "outer_dimensions": { "length": "41", "width": "31", "height": "31" },
+              "cost_minor": 90,
+              "rate_table": { "weight_brackets_g": [3000, 20000], "prices_minor": [1200, 1900],
+                              "minimum_charge_minor": 1000, "fuel_surcharge_permille": 85 } }
+        ]
+    });
+
+    let ids = container_ids(&request);
+
+    assert_eq!(
+        ids.iter()
+            .filter(|id| id.starts_with("large#"))
+            .collect::<Vec<_>>(),
+        ["large#1", "large#2", "large#3", "large#4", "large#5"]
+    );
+}
+
+/// A fact read back from a result needs a code to be one; everything beside the code is its
+/// attributes, kept as written.
+#[test]
+fn a_result_fact_is_read_back_only_with_a_code() {
+    assert_eq!(ResultFact::from_json(&json!({"code": ""})), None);
+    assert_eq!(ResultFact::from_json(&json!({"reason": "x"})), None);
+    assert_eq!(ResultFact::from_json(&json!("all_items_packed")), None);
+    let fact = ResultFact::from_json(&json!({"code": "gap_bounded", "gap": [0, 1]}))
+        .expect("a fact with a code");
+    assert_eq!(fact.code, "gap_bounded");
+    assert_eq!(
+        fact.attributes,
+        std::collections::BTreeMap::from([("gap".to_owned(), json!([0, 1]))])
+    );
 }

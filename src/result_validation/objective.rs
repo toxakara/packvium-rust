@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use super::container::{SCORE_SCALE, achieved_extent, unused_ppm};
+use super::container::{SCORE_SCALE, billed_size, unused_ppm};
 use super::json::{EMPTY_LIST, Json, Ordered, Res, sort_py};
 use super::num::{add, ceil_div, floor_div, mul, mul_div, sum};
 use super::pyfmt::{int_list, int_tuple, py_repr, py_str};
@@ -144,11 +144,7 @@ fn objective(
                 .get_or("gross_weight", &empty)?
                 .get_or("ticks", &Json::Int(0))?
                 .py_int("gross_weight")?;
-            let billed_size = if spec.flat_bag {
-                achieved_extent(packed, inputs.clearance)?
-            } else {
-                spec.outer.unwrap_or(spec.inner)
-            };
+            let billed_size = billed_size(packed, spec, inputs.clearance)?;
             let dimensional = dimensional_weight(
                 billed_size,
                 divisor,

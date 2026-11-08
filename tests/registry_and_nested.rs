@@ -19,7 +19,7 @@ use packvium_core::{
     Candidate, CandidateScorer, ConstraintDecision, Container, Dimensions, Item, ItemInstance,
     ItemOrderStrategy, Length, NestedLevel, NestedPackingRequest, PackResult, PackingConfig,
     PackingRequest, PackingResult, PlacementConstraint, Rotation, Solver, SolverContext,
-    SolverRegistry, Weight, pack_nested, pack_request,
+    SolverRegistry, Weight, pack_nested, pack_nested_with, pack_request,
 };
 
 const MM: i64 = Length::TICKS_PER_MM;
@@ -85,6 +85,8 @@ fn container(id: &str, side_mm: i64) -> Container {
         preloaded: Vec::new(),
         deformable_boundary: None,
         made_to_measure: None,
+        pallet_overhang_limit: None,
+        deck: None,
     }
 }
 
@@ -96,6 +98,7 @@ fn request(items: Vec<Item>, containers: Vec<Container>) -> PackingRequest {
         output_length_unit: "mm".into(),
         output_weight_unit: "kg".into(),
         catalog_versions_used: Vec::new(),
+        currency: None,
         fixed_placements: Vec::new(),
         fixed_containers: Vec::new(),
     }
@@ -103,6 +106,161 @@ fn request(items: Vec<Item>, containers: Vec<Container>) -> PackingRequest {
 
 fn one_fitting_item() -> PackingRequest {
     request(vec![item("a", 10)], vec![container("box", 100)])
+}
+
+#[test]
+fn nested_single_container_offers_preserve_fixed_placements() {
+    let mut level = request(
+        vec![item("cube", 10)],
+        vec![container("locked", 10), container("other", 10)],
+    );
+    level.fixed_placements.push(packvium_core::FixedPlacement {
+        item_id: "cube".into(),
+        container_id: "locked".into(),
+        container_instance: 1,
+        position: packvium_core::Point::default(),
+        rotation: Rotation::Lwh,
+        placement_id: None,
+    });
+    let nested = NestedPackingRequest {
+        levels: vec![NestedLevel {
+            name: "carton".into(),
+            request: level,
+        }],
+        beam_width: 0,
+    };
+    let packed =
+        pack_nested_with(&nested, 2).expect("unlocked offers cannot invalidate a fixed placement");
+    let result = &packed.levels[0].1;
+    assert!(result.complete());
+    assert_eq!(result.containers.len(), 1);
+    assert_eq!(result.containers[0].id(), "locked#1");
+    assert_eq!(result.containers[0].placements[0].instance.item.id, "cube");
+}
+
+#[test]
+fn nested_fixed_placements_in_several_types_keep_the_whole_offer() {
+    let mut level = request(
+        vec![item("a", 10), item("b", 10)],
+        vec![container("first", 10), container("second", 10)],
+    );
+    for (item_id, container_id) in [("a", "first"), ("b", "second")] {
+        level.fixed_placements.push(packvium_core::FixedPlacement {
+            item_id: item_id.into(),
+            container_id: container_id.into(),
+            container_instance: 1,
+            position: packvium_core::Point::default(),
+            rotation: Rotation::Lwh,
+            placement_id: None,
+        });
+    }
+    let nested = NestedPackingRequest {
+        levels: vec![NestedLevel {
+            name: "carton".into(),
+            request: level,
+        }],
+        beam_width: 0,
+    };
+    let packed = pack_nested_with(&nested, 3).expect("the complete offer keeps both locks");
+    let result = &packed.levels[0].1;
+    assert!(result.complete());
+    assert_eq!(
+        result.containers.iter().map(|c| c.id()).collect::<Vec<_>>(),
+        ["first#1", "second#1"]
+    );
+}
+
+#[test]
+fn nested_invalid_fixed_placements_still_fail_the_whole_offer() {
+    let mut level = one_fitting_item();
+    level.containers.push(container("other", 100));
+    level.fixed_placements.push(packvium_core::FixedPlacement {
+        item_id: "a".into(),
+        container_id: "missing".into(),
+        container_instance: 1,
+        position: packvium_core::Point::default(),
+        rotation: Rotation::Lwh,
+        placement_id: None,
+    });
+    let nested = NestedPackingRequest {
+        levels: vec![NestedLevel {
+            name: "carton".into(),
+            request: level,
+        }],
+        beam_width: 0,
+    };
+    let error =
+        pack_nested_with(&nested, 2).expect_err("an invalid original request must still fail");
+    assert!(error.to_string().contains("unknown container type"));
+}
+
+#[test]
+fn nested_upper_locks_keep_a_compatible_handoff_branch() {
+    let mut cubes = item("cube", 10);
+    cubes.quantity = 2;
+    let mut long = container("long", 10);
+    long.inner_dimensions.length = Length(20 * MM);
+    let mut pallet = container("pallet", 10);
+    pallet.inner_dimensions.length = Length(20 * MM);
+    let mut upper = request(vec![], vec![pallet]);
+    upper.fixed_placements.push(packvium_core::FixedPlacement {
+        item_id: "single#1".into(),
+        container_id: "pallet".into(),
+        container_instance: 1,
+        position: packvium_core::Point::default(),
+        rotation: Rotation::Lwh,
+        placement_id: None,
+    });
+    let mut nested = NestedPackingRequest {
+        levels: vec![
+            NestedLevel {
+                name: "carton".into(),
+                request: request(vec![cubes], vec![long, container("single", 10)]),
+            },
+            NestedLevel {
+                name: "pallet".into(),
+                request: upper,
+            },
+        ],
+        beam_width: 0,
+    };
+    let packed =
+        pack_nested_with(&nested, 2).expect("a compatible sibling can honour the upper lock");
+    assert!(packed.levels.iter().all(|(_, result)| result.complete()));
+    assert_eq!(
+        packed.levels[0]
+            .1
+            .containers
+            .iter()
+            .map(|c| c.id())
+            .collect::<Vec<_>>(),
+        ["single#1", "single#2"]
+    );
+    assert_eq!(
+        packed.levels[1].1.containers[0]
+            .placements
+            .iter()
+            .map(|p| p.instance.item.id.as_str())
+            .collect::<Vec<_>>(),
+        ["single#1", "single#2"]
+    );
+    let error =
+        pack_nested_with(&nested, 1).expect_err("the greedy chain retains its original refusal");
+    assert!(error.to_string().contains("unknown item type \"single#1\""));
+    let fixed = nested.levels[1].request.fixed_placements[0].clone();
+    nested.levels[1].request.fixed_placements.push(fixed);
+    let error =
+        pack_nested_with(&nested, 2).expect_err("one handed-up item cannot fulfil two locks");
+    assert!(error.to_string().contains("unknown item type \"single#1\""));
+    nested.levels[1].request.fixed_placements.pop();
+    nested.levels[1].request.fixed_placements[0].item_id = "missing#1".into();
+    let error =
+        pack_nested_with(&nested, 2).expect_err("no handoff satisfies a lock on a missing item");
+    assert!(
+        error
+            .to_string()
+            .contains("unknown item type \"missing#1\"")
+    );
 }
 
 // --------------------------------------------------------------------- pack_nested
@@ -288,6 +446,197 @@ fn a_level_with_its_own_items_still_runs_after_an_incomplete_one() {
     assert_eq!(result.levels.len(), 2);
     assert!(!result.levels[0].1.complete());
     assert!(result.levels[1].1.complete());
+}
+
+// ------------------------------------------------------------- level beam
+
+fn sized_box(id: &str, length_mm: i64, width_mm: i64, height_mm: i64) -> Container {
+    Container {
+        inner_dimensions: Dimensions {
+            length: Length(length_mm * MM),
+            width: Length(width_mm * MM),
+            height: Length(height_mm * MM),
+        },
+        ..container(id, 0)
+    }
+}
+
+fn cubes(quantity: usize) -> Item {
+    Item {
+        quantity,
+        ..item("cube", 100)
+    }
+}
+
+/// The cheapest carton holds both cubes and cannot stand on the only pallet: an upright
+/// 200 mm carton is too long for a 100 x 100 mm tower.
+fn dead_end() -> NestedPackingRequest {
+    NestedPackingRequest {
+        levels: vec![
+            NestedLevel {
+                name: "carton".into(),
+                request: request(
+                    vec![cubes(2)],
+                    vec![
+                        sized_box("long", 200, 100, 100),
+                        sized_box("single", 100, 100, 100),
+                    ],
+                ),
+            },
+            NestedLevel {
+                name: "pallet".into(),
+                request: request(vec![], vec![sized_box("tower", 100, 100, 200)]),
+            },
+        ],
+        beam_width: 0,
+    }
+}
+
+fn completeness(result: &packvium_core::NestedPackingResult) -> Vec<bool> {
+    result
+        .levels
+        .iter()
+        .map(|(_, packed)| packed.complete())
+        .collect()
+}
+
+#[test]
+fn a_level_beam_width_of_one_is_the_greedy_chain() {
+    let shape =
+        |result: packvium_core::NestedPackingResult| -> Vec<(bool, Vec<String>, Vec<i128>)> {
+            result
+                .levels
+                .into_iter()
+                .map(|(_, packed)| {
+                    let ids = packed.containers.iter().map(|c| c.id()).collect();
+                    (packed.complete(), ids, packed.score)
+                })
+                .collect()
+        };
+    let greedy = pack_nested(&dead_end()).expect("the levels pack");
+    let width_one = pack_nested_with(&dead_end(), 1).expect("the levels pack");
+
+    assert_eq!(completeness(&greedy), [true, false]);
+    assert_eq!(shape(width_one), shape(greedy));
+}
+
+#[test]
+fn a_wider_beam_finds_the_carton_set_that_fits_the_pallet() {
+    let beam = pack_nested_with(&dead_end(), 2).expect("the levels pack");
+
+    assert_eq!(completeness(&beam), [true, true]);
+    let cartons: Vec<&str> = beam.levels[0]
+        .1
+        .containers
+        .iter()
+        .map(|packed| packed.container.id.as_str())
+        .collect();
+    assert_eq!(cartons, ["single", "single"]);
+}
+
+#[test]
+fn handoffs_that_are_the_same_containers_occupy_one_beam_slot() {
+    // Packing against every carton and against `long` alone both hand up one `long#1`;
+    // counting that twice would fill a width of two and drop the chain that fits.
+    let result = pack_nested_with(&dead_end(), 2).expect("the levels pack");
+
+    assert_eq!(result.levels.len(), 2);
+    assert!(result.levels.iter().all(|(_, packed)| packed.complete()));
+}
+
+#[test]
+fn no_levels_is_an_empty_answer_at_any_width() {
+    let nested = NestedPackingRequest {
+        levels: Vec::new(),
+        beam_width: 0,
+    };
+
+    assert!(
+        pack_nested_with(&nested, 3)
+            .expect("empty")
+            .levels
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_level_beam_width_of_zero_is_refused() {
+    let error = pack_nested_with(&dead_end(), 0).expect_err("zero is not a width");
+
+    assert_eq!(error.code(), "invalid_input");
+    assert!(
+        error
+            .to_string()
+            .contains("level_beam_width must be a positive integer"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_wide_beam_with_no_complete_candidate_returns_the_best_incomplete_chain() {
+    let nested = NestedPackingRequest {
+        levels: vec![
+            NestedLevel {
+                name: "carton".into(),
+                request: request(
+                    vec![cubes(4)],
+                    vec![
+                        Container {
+                            quantity: Some(1),
+                            ..sized_box("pair", 200, 100, 100)
+                        },
+                        Container {
+                            quantity: Some(1),
+                            ..sized_box("single", 100, 100, 100)
+                        },
+                    ],
+                ),
+            },
+            NestedLevel {
+                name: "pallet".into(),
+                request: request(vec![], vec![sized_box("tower", 100, 100, 400)]),
+            },
+        ],
+        beam_width: 0,
+    };
+
+    let result = pack_nested_with(&nested, 2).expect("an unpacked cube is a result");
+
+    assert_eq!(completeness(&result), [false]);
+    assert_eq!(result.levels[0].1.unpacked.len(), 1);
+}
+
+#[test]
+fn a_wide_beam_still_runs_a_level_with_its_own_items_after_an_incomplete_one() {
+    let nested = NestedPackingRequest {
+        levels: vec![
+            NestedLevel {
+                name: "cartons".into(),
+                request: request(
+                    vec![item("urn", 200)],
+                    vec![container("box", 100), container("crate", 150)],
+                ),
+            },
+            NestedLevel {
+                name: "pallet".into(),
+                request: request(vec![item("crate", 50)], vec![container("pallet", 500)]),
+            },
+        ],
+        beam_width: 0,
+    };
+
+    let result = pack_nested_with(&nested, 2).expect("each level is a valid request");
+
+    assert_eq!(completeness(&result), [false, true]);
+}
+
+#[test]
+fn a_handed_up_container_stays_upright() {
+    let result = pack_nested(&dead_end()).expect("the levels pack");
+    let carton = result.levels[0].1.containers[0].as_item();
+
+    assert_eq!(carton.allowed_rotations, Rotation::UPRIGHT.to_vec());
+    assert_eq!(carton.id, "long#1");
 }
 
 // ------------------------------------------------------------------ SolverRegistry

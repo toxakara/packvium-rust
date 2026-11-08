@@ -606,6 +606,26 @@ mod tests {
     }
 
     #[test]
+    fn a_number_never_equals_a_non_number() {
+        assert!(!read("1").py_eq(&read("\"1\"")));
+        assert!(!read("null").py_eq(&read("0")));
+    }
+
+    /// Text deserializers hand over owned strings (`serde_json::Value` does), and a value no
+    /// JSON document holds is refused naming what was expected.
+    #[test]
+    fn the_document_reader_takes_owned_strings_and_names_what_it_expects() {
+        let owned = serde_json::from_value::<Json>(serde_json::json!({"id": "a"})).unwrap();
+        assert!(owned.at("id").unwrap().is_str("a"));
+        let bytes = serde::de::value::BytesDeserializer::<serde::de::value::Error>::new(b"a");
+        let refused = Json::deserialize(bytes).unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "invalid type: byte array, expected a JSON value"
+        );
+    }
+
+    #[test]
     fn a_repeated_key_keeps_its_first_place_and_its_last_value() {
         let mut object = read("{\"a\": 1, \"b\": 2, \"a\": 3}");
         object.set("c", Json::Str("d".to_owned())).unwrap();

@@ -22,6 +22,7 @@ mod lattice;
 mod nonprintable;
 mod num;
 mod objective;
+mod placement_ids;
 mod pyfmt;
 mod spec;
 mod stacking;
@@ -212,6 +213,7 @@ fn validate(request: &Json, result: &Json) -> Res<Vec<Issue>> {
         &mut issues,
     )?;
     accounting::check_structure(&validated, &mut issues)?;
+    facts::check_currency(request, &validated, &mut issues)?;
     facts::check_algorithm_metrics(&validated, &mut issues)?;
     facts::check_effort_budget(request, &validated, &mut issues)?;
     facts::check_result_facts(&validated, &mut issues)?;
@@ -237,6 +239,7 @@ fn validate(request: &Json, result: &Json) -> Res<Vec<Issue>> {
     check_container_counts(&validated, configuration, &containers, &mut issues)?;
 
     objective::check_fixed_placements(request, &validated, unit, &mut issues)?;
+    placement_ids::check_placement_ids(result, &mut issues)?;
     objective::check_groups(request, &validated, &mut issues)?;
     objective::check_solver_selection(request, &validated, &mut issues)?;
     let inputs = objective::Inputs {

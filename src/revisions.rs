@@ -11,13 +11,16 @@
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::artifacts;
 use crate::canonical_json::{
     self, CanonicalJsonError, CanonicalJsonErrorCode, json_integer, json_spelling, spell_names,
 };
-use crate::fixed::{point_shape_problem, unknown_keys};
+use crate::fixed::{hull_item_types, point_shape_problem, unknown_keys};
+use crate::made_to_measure::{per_square_metre, surface_area};
+use crate::request_errors::orientation_refusal;
+use crate::units::{Length, Weight};
 
 pub const FORMAT: &str = "packvium-plan-revision/v1";
 
@@ -28,13 +31,13 @@ pub const EVENT_TYPES: [&str; 4] = [
     "placement_verified",
 ];
 
-const ORIENTATIONS: [&str; 6] = ["LWH", "LHW", "WLH", "WHL", "HLW", "HWL"];
-const PLACEMENT_FIELDS: [&str; 5] = [
+const PLACEMENT_FIELDS: [&str; 6] = [
     "item_type",
     "container_type",
     "container_instance",
     "position",
     "orientation",
+    "placement_id",
 ];
 
 /// The closed set of refusals, shared by all four engines.
@@ -153,17 +156,22 @@ pub fn derive_revision_json(
     // `require_revision` bounded the parent's number and sequences by 2^53 - 1, so neither
     // `+ 1` below can overflow.
     let first = last_sequence(&parent)? + 1;
+    let hulls = hull_item_types(parent["request"].get("items"));
     let recorded = events
         .iter()
         .zip(first..)
-        .map(|(event, sequence)| checked_event(event, sequence))
+        .map(|(event, sequence)| checked_event(event, sequence, &hulls))
         .collect::<RevisionResult<Vec<_>>>()?;
-    let request = apply_events(&parent["request"], &recorded)?;
+    let number = revision_number(&parent) + 1;
+    let request = stock_cut_boxes(
+        &apply_events(&parent["request"], &recorded)?,
+        &artifact,
+        number,
+    )?;
     let approved = json!({
         "artifact": digest(&artifact)?,
         "replay": artifact["provenance"]["replay"].clone(),
     });
-    let number = revision_number(&parent) + 1;
     canonical(&document(
         number,
         Value::String(digest(&parent)?),
@@ -189,6 +197,20 @@ pub fn apply_events_json(request_json: &str, events_json: &str) -> Result<String
         return refuse(RevisionErrorCode::InvalidEvent, "events are a JSON array");
     };
     canonical(&apply_events(&request, events)?)
+}
+
+/// `request_json` with every made-to-measure box that holds a fixed placement made a stock
+/// container, as canonical JSON: [`stock_cut_boxes`] on text.
+pub fn stock_cut_boxes_json(
+    request_json: &str,
+    artifact_json: &str,
+    revision: i64,
+) -> Result<String, RevisionError> {
+    canonical(&stock_cut_boxes(
+        &read(request_json)?,
+        &read(artifact_json)?,
+        revision,
+    )?)
 }
 
 /// Every way the chain fails to be what its root and events derive, without stopping at the
@@ -363,8 +385,8 @@ fn last_sequence(revision: &Value) -> RevisionResult<i64> {
     }
 }
 
-fn checked_event(raw: &Value, sequence: i64) -> RevisionResult<Value> {
-    require_shape(raw)?;
+fn checked_event(raw: &Value, sequence: i64, hulls: &BTreeSet<&str>) -> RevisionResult<Value> {
+    require_shape(raw, hulls)?;
     if integer(&raw["sequence"]) != Some(sequence) {
         return refuse(
             RevisionErrorCode::InvalidEvent,
@@ -386,7 +408,9 @@ fn event_fields(kind: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-fn require_shape(raw: &Value) -> RevisionResult<()> {
+/// An event of a known type carrying exactly its fields, each by its own rule. `hulls` names
+/// the request's hull item types, which alone may be placed in a signed orientation (1.10).
+fn require_shape(raw: &Value, hulls: &BTreeSet<&str>) -> RevisionResult<()> {
     let Some(event) = raw.as_object() else {
         return refuse(RevisionErrorCode::InvalidEvent, "an event is a JSON object");
     };
@@ -425,7 +449,7 @@ fn require_shape(raw: &Value) -> RevisionResult<()> {
     match kind {
         "item_missing" => validate_item_missing(event),
         "container_substituted" => validate_container_substituted(event),
-        _ => validate_placement(event),
+        _ => validate_placement(event, hulls),
     }
 }
 
@@ -454,7 +478,7 @@ fn validate_container_substituted(event: &Map<String, Value>) -> RevisionResult<
     )
 }
 
-fn validate_placement(event: &Map<String, Value>) -> RevisionResult<()> {
+fn validate_placement(event: &Map<String, Value>, hulls: &BTreeSet<&str>) -> RevisionResult<()> {
     let Some(placement) = event["placement"].as_object() else {
         return refuse(
             RevisionErrorCode::InvalidEvent,
@@ -471,17 +495,13 @@ fn validate_placement(event: &Map<String, Value>) -> RevisionResult<()> {
     let field = |name: &str| placement.get(name).unwrap_or(&Value::Null);
     require_name(field("item_type"), "placement.item_type")?;
     require_name(field("container_type"), "placement.container_type")?;
-    if !field("orientation")
+    let hull = field("item_type")
         .as_str()
-        .is_some_and(|orientation| ORIENTATIONS.contains(&orientation))
+        .is_some_and(|item_type| hulls.contains(item_type));
+    if let Some((_, detail)) =
+        orientation_refusal(field("orientation"), hull, "placement.orientation")
     {
-        return refuse(
-            RevisionErrorCode::InvalidEvent,
-            format!(
-                "placement.orientation must be one of {}",
-                spell_names(&ORIENTATIONS)
-            ),
-        );
+        return refuse(RevisionErrorCode::InvalidEvent, detail);
     }
     let instance = placement.get("container_instance").map_or(Some(1), integer);
     if instance.is_none_or(|instance| instance < 1) {
@@ -490,13 +510,24 @@ fn validate_placement(event: &Map<String, Value>) -> RevisionResult<()> {
             "placement.container_instance counts from 1",
         );
     }
-    match placement
+    if let Some(problem) = placement
         .get("position")
         .and_then(|position| point_shape_problem(position, "placement.position"))
     {
-        Some(problem) => refuse(RevisionErrorCode::InvalidEvent, problem),
-        None => Ok(()),
+        return refuse(RevisionErrorCode::InvalidEvent, problem);
     }
+    // Only its type is the event's to judge: whether it names this placement needs the
+    // request's unit, and is the engine's admission rule when the revision is solved (1.10).
+    if placement
+        .get("placement_id")
+        .is_some_and(|identifier| !(identifier.is_null() || identifier.is_string()))
+    {
+        return refuse(
+            RevisionErrorCode::InvalidEvent,
+            "placement.placement_id is a string",
+        );
+    }
+    Ok(())
 }
 
 fn require_name(value: &Value, field: &str) -> RevisionResult<()> {
@@ -513,9 +544,10 @@ fn require_name(value: &Value, field: &str) -> RevisionResult<()> {
 
 fn apply_events(request: &Value, events: &[Value]) -> RevisionResult<Value> {
     let mut derived = request.clone();
+    let hulls = hull_item_types(request.get("items"));
     let mut placement_index = PlacementIndex::new();
     for event in events {
-        require_shape(event)?;
+        require_shape(event, &hulls)?;
         if integer(&event["sequence"]).is_none() {
             return refuse(
                 RevisionErrorCode::InvalidEvent,
@@ -627,11 +659,11 @@ fn apply_placement(
     index: &mut PlacementIndex,
 ) -> RevisionResult<()> {
     let placement = &event["placement"];
-    let wanted = with_default_instance(placement);
+    let wanted = identity(placement);
     if !index.initialized {
         index.initialized = true;
         for entry in fixed_entries(request)? {
-            match canonical(&with_default_instance(entry)) {
+            match canonical(&identity(entry)) {
                 Ok(key) => {
                     index.keys.insert(key);
                 }
@@ -659,7 +691,7 @@ fn apply_placement(
     }
     // An uncanonicalizable direct-call value must keep the former first-match/error order.
     for entry in fixed_entries(request)? {
-        if same(&with_default_instance(entry), &wanted)? {
+        if same(&identity(entry), &wanted)? {
             return Ok(());
         }
     }
@@ -683,9 +715,12 @@ fn append_fixed(request: &mut Value, placement: &Value) {
     }
 }
 
-fn with_default_instance(placement: &Value) -> Value {
+/// What makes two fixed entries one box: everything but `placement_id`, which only restates
+/// the container and position (1.10), with the default instance spelled out.
+fn identity(placement: &Value) -> Value {
     let mut copy = placement.clone();
     if let Some(object) = copy.as_object_mut() {
+        object.remove("placement_id");
         object
             .entry("container_instance")
             .or_insert_with(|| json!(1));
@@ -772,11 +807,11 @@ fn verify_chain(revisions: &[Value], artifacts: Option<&[Value]>) -> RevisionRes
         let Some(parent) = parent else {
             continue;
         };
-        check_request(revision, parent, position, &mut issues)?;
-        if let Some(artifact) = artifacts
+        let artifact = artifacts
             .and_then(|artifacts| artifacts.get(position))
-            .filter(|artifact| !artifact.is_null())
-        {
+            .filter(|artifact| !artifact.is_null());
+        check_request(revision, parent, artifact, position, &mut issues)?;
+        if let Some(artifact) = artifact {
             check_artifact(revision, parent, artifact, position, &mut issues)?;
         }
     }
@@ -823,11 +858,29 @@ fn check_sequences(
 fn check_request(
     revision: &Value,
     parent: &Value,
+    artifact: Option<&Value>,
     position: usize,
     issues: &mut Vec<Issue>,
 ) -> RevisionResult<()> {
     let events = revision["events"].as_array().map_or(&[][..], Vec::as_slice);
-    match apply_events(&parent["request"], events) {
+    let derived = apply_events(&parent["request"], events);
+    let derived = match (derived, artifact) {
+        (Ok(derived), None) if holds_cut_boxes(&derived) => {
+            // The cut sizes live only in the approved artifact.
+            issues.push((
+                "artifact_required",
+                position,
+                "fixed items in a made-to-measure box are checked against the approved artifact"
+                    .into(),
+            ));
+            return Ok(());
+        }
+        (Ok(derived), Some(artifact)) if holds_cut_boxes(&derived) => {
+            stock_cut_boxes(&derived, artifact, revision_number(revision))
+        }
+        (derived, _) => derived,
+    };
+    match derived {
         Err(error) => issues.push((
             "request_mismatch",
             position,
@@ -877,6 +930,328 @@ fn check_artifact(
         ));
     }
     Ok(())
+}
+
+// ------------------------------------------------------------------------- cut-to-measure
+
+const SIDES: [&str; 3] = ["length", "width", "height"];
+
+/// `request` with every made-to-measure box that holds a fixed placement made a stock container
+///. The box was cut for the approved plan, so a replan cannot recut it: instance `n`
+/// of made-to-measure type `T` -- the `n`-th container of type `T` in the artifact, in result
+/// order -- becomes container `T@<revision>#<n>`, a copy of `T` without `made_to_measure`,
+/// quantity 1, at the cut inner and outer size, price and tare, each in ticks; it follows `T`
+/// in the container list. Its fixed placements move to its instance 1, and `T`'s own
+/// `quantity`, if stated, loses the boxes taken (`T` is dropped at zero). New boxes are still
+/// cut to measure. Pure; `O(C + F + A)` for containers, fixed placements and the artifact's
+/// containers, beside the copy.
+pub(crate) fn stock_cut_boxes(
+    request: &Value,
+    artifact: &Value,
+    revision: i64,
+) -> RevisionResult<Value> {
+    let mut derived = request.clone();
+    let (Some(fixed), Some(containers)) = (
+        derived["fixed_placements"].as_array(),
+        derived["containers"].as_array(),
+    ) else {
+        return Ok(derived);
+    };
+    let machines: HashMap<&str, &Value> = containers
+        .iter()
+        .filter(|entry| !entry["made_to_measure"].is_null())
+        .filter_map(|entry| Some((entry["id"].as_str()?, entry)))
+        .collect();
+    // Maps are lookup-only; request/lock order, never hash iteration, orders the output.
+    let mut named = HashSet::new();
+    let mut stocked: HashMap<&str, Vec<Value>> = HashMap::new();
+    let mut cuts = None;
+    let mut moved = Vec::with_capacity(fixed.len());
+    for entry in fixed {
+        let mut entry = entry.clone();
+        if let Some(machine_id) = entry
+            .as_object()
+            .and_then(|map| map.get("container_type"))
+            .and_then(Value::as_str)
+            .filter(|id| machines.contains_key(id))
+            .map(str::to_owned)
+        {
+            let instance = entry.get("container_instance").map_or(Some(1), integer);
+            let stock_id = format!(
+                "{machine_id}@{revision}#{}",
+                instance.map_or_else(|| "None".to_owned(), |n| n.to_string())
+            );
+            if named.insert(stock_id.clone()) {
+                let inner = cut_inner(
+                    cuts.get_or_insert_with(|| cut_boxes(artifact)),
+                    &machine_id,
+                    instance,
+                )?;
+                let (machine_key, machine) = machines
+                    .get_key_value(machine_id.as_str())
+                    .expect("a machine was found above");
+                let box_ = stock_box(request, machine, &stock_id, inner)?;
+                stocked.entry(machine_key).or_default().push(box_);
+            }
+            entry["container_type"] = Value::String(stock_id);
+            entry["container_instance"] = json!(1);
+            // A stated id named the cut box's instance of the machine, which this request no
+            // longer has; admission would refuse it as a mismatch.
+            if let Some(object) = entry.as_object_mut() {
+                object.remove("placement_id");
+            }
+        }
+        moved.push(entry);
+    }
+    if named.is_empty() {
+        return Ok(derived);
+    }
+    let existing: HashSet<&str> = containers
+        .iter()
+        .filter_map(|container| container["id"].as_str())
+        .collect();
+    if let Some(clash) = named
+        .iter()
+        .map(String::as_str)
+        .filter(|id| existing.contains(id))
+        .min()
+    {
+        return refuse(
+            RevisionErrorCode::EventConflict,
+            format!(
+                "a container is already named {}",
+                json_spelling(&Value::String(clash.to_owned()))
+            ),
+        );
+    }
+    let mut rebuilt = Vec::with_capacity(containers.len() + named.len());
+    for container in containers {
+        let boxes = container["id"].as_str().and_then(|id| stocked.get(id));
+        let Some(boxes) = boxes.filter(|boxes| !boxes.is_empty()) else {
+            rebuilt.push(container.clone());
+            continue;
+        };
+        let taken = boxes.len() as i64;
+        match container
+            .get("quantity")
+            .filter(|quantity| !quantity.is_null())
+            .and_then(integer)
+        {
+            Some(quantity) if quantity <= taken => {}
+            Some(quantity) => {
+                let mut kept = container.clone();
+                kept["quantity"] = json!(quantity - taken);
+                rebuilt.push(kept);
+            }
+            None => rebuilt.push(container.clone()),
+        }
+        rebuilt.extend(boxes.iter().cloned());
+    }
+    derived["fixed_placements"] = Value::Array(moved);
+    derived["containers"] = Value::Array(rebuilt);
+    Ok(derived)
+}
+
+/// Index raw shapes in artifact order; only selected dimensions are parsed. `O(A)`.
+fn cut_boxes(artifact: &Value) -> HashMap<&str, Vec<&Value>> {
+    let mut cuts: HashMap<&str, Vec<&Value>> = HashMap::new();
+    if let (Some(orders), Some(shapes)) = (
+        artifact["work_order"]["containers"].as_array(),
+        artifact["geometry"]["containers"].as_array(),
+    ) {
+        for (order, shape) in orders.iter().zip(shapes) {
+            if let Some(machine_id) = order["container_type"].as_str() {
+                cuts.entry(machine_id).or_default().push(shape);
+            }
+        }
+    }
+    cuts
+}
+
+/// The selected box's ticks, read only when it is stocked. Expected `O(1)`.
+fn cut_inner(
+    cuts: &HashMap<&str, Vec<&Value>>,
+    machine_id: &str,
+    instance: Option<i64>,
+) -> RevisionResult<[i64; 3]> {
+    if let Some(instance) = instance
+        && instance >= 1
+        && let Some(shape) = cuts
+            .get(machine_id)
+            .and_then(|shapes| shapes.get(usize::try_from(instance - 1).unwrap_or(usize::MAX)))
+    {
+        let mut sides = [0_i64; 3];
+        for (axis, side) in SIDES.into_iter().enumerate() {
+            sides[axis] = artifact_ticks(shape, side)?;
+        }
+        return Ok(sides);
+    }
+    refuse(
+        RevisionErrorCode::InvalidArtifact,
+        format!(
+            "the approved plan holds no {machine_id} instance {}",
+            instance.map_or_else(|| "null".to_owned(), |n| n.to_string())
+        ),
+    )
+}
+
+fn artifact_ticks(shape: &Value, axis: &str) -> RevisionResult<i64> {
+    shape["inner_dimensions"][axis]
+        .as_str()
+        .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|text| text.parse::<i64>().ok())
+        .filter(|ticks| *ticks <= canonical_json::MAX_EXACT_MAGNITUDE as i64)
+        .map_or_else(
+            || {
+                refuse(
+                    RevisionErrorCode::InvalidArtifact,
+                    format!("a cut box's {axis} is not a tick count"),
+                )
+            },
+            Ok,
+        )
+}
+
+/// The stock container a cut box becomes, priced as `Container::fabricate` prices it.
+fn stock_box(
+    request: &Value,
+    machine: &Value,
+    stock_id: &str,
+    inner: [i64; 3],
+) -> RevisionResult<Value> {
+    let units = &request["units"];
+    if !units.is_null() && !units.is_object() {
+        return refuse(
+            RevisionErrorCode::InvalidRevision,
+            "a made-to-measure container's units is not an object",
+        );
+    }
+    let unit = match &units["length"] {
+        Value::Null => "mm",
+        Value::String(unit) => unit,
+        _ => {
+            return refuse(
+                RevisionErrorCode::InvalidRevision,
+                "a made-to-measure container's units.length is not a string",
+            );
+        }
+    };
+    let spec = &machine["made_to_measure"];
+    if !spec.is_object() {
+        return refuse(
+            RevisionErrorCode::InvalidRevision,
+            "a made-to-measure container's made_to_measure is not an object",
+        );
+    }
+    let allowance = &spec["outer_allowance"];
+    if !allowance.is_null() && !allowance.is_object() {
+        return refuse(
+            RevisionErrorCode::InvalidRevision,
+            "a made-to-measure container's outer_allowance is not an object",
+        );
+    }
+    let unreadable = |field: &str| {
+        RevisionError::new(
+            RevisionErrorCode::InvalidRevision,
+            format!("a made-to-measure container's {field} is not a measure"),
+        )
+    };
+    let length = |value: &Value, field: &str| {
+        Length::parse(value, unit)
+            .map(|length| length.0)
+            .map_err(|_| unreadable(field))
+    };
+    let weight = |value: &Value, field: &str| -> RevisionResult<i128> {
+        if value.is_null() {
+            return Ok(0);
+        }
+        Weight::parse(value, "g")
+            .map(|weight| i128::from(weight.0))
+            .map_err(|_| unreadable(field))
+    };
+    let mut outer = inner;
+    for (axis, side) in SIDES.into_iter().enumerate() {
+        let side_allowance = &allowance[side];
+        if !side_allowance.is_null() {
+            outer[axis] += length(side_allowance, "outer_allowance")?;
+        }
+    }
+    let area = surface_area(inner);
+    let price = i128::from(stock_integer(
+        &spec["cost_per_square_metre_minor"],
+        "cost_per_square_metre_minor",
+    )?);
+    let tare = weight(&machine["tare_weight"], "tare_weight")?
+        + per_square_metre(
+            weight(&spec["tare_per_square_metre"], "tare_per_square_metre")?,
+            area,
+        );
+    let cost = i128::from(stock_integer(&machine["cost_minor"], "cost_minor")?)
+        + per_square_metre(price, area);
+    let mut box_ = machine.clone();
+    let fields = box_
+        .as_object_mut()
+        .expect("a machine is a container object");
+    fields.remove("made_to_measure");
+    fields.insert("id".into(), Value::String(stock_id.to_owned()));
+    fields.insert("quantity".into(), json!(1));
+    fields.insert("inner_dimensions".into(), tick_box(inner));
+    fields.insert("outer_dimensions".into(), tick_box(outer));
+    // Past `i64` the price is past 2^53 - 1 too, so the canonical form refuses it either way.
+    fields.insert(
+        "cost_minor".into(),
+        json!(i64::try_from(cost).unwrap_or(i64::MAX)),
+    );
+    fields.insert(
+        "tare_weight".into(),
+        json!({"value": tare.to_string(), "unit": "ticks"}),
+    );
+    Ok(box_)
+}
+
+fn stock_integer(value: &Value, name: &str) -> RevisionResult<i64> {
+    if value.is_null() {
+        return Ok(0);
+    }
+    integer(value).ok_or_else(|| {
+        RevisionError::new(
+            RevisionErrorCode::InvalidRevision,
+            format!("a made-to-measure container's {name} is not an integer"),
+        )
+    })
+}
+
+fn tick_box(sides: [i64; 3]) -> Value {
+    Value::Object(
+        SIDES
+            .into_iter()
+            .zip(sides)
+            .map(|(axis, side)| {
+                (
+                    axis.to_owned(),
+                    json!({"value": side.to_string(), "unit": "ticks"}),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Whether a fixed placement names a made-to-measure container type.
+fn holds_cut_boxes(request: &Value) -> bool {
+    let (Some(containers), Some(fixed)) = (
+        request["containers"].as_array(),
+        request["fixed_placements"].as_array(),
+    ) else {
+        return false;
+    };
+    let machines: Vec<&Value> = containers
+        .iter()
+        .filter(|entry| entry.is_object() && !entry["made_to_measure"].is_null())
+        .map(|entry| &entry["id"])
+        .collect();
+    fixed
+        .iter()
+        .any(|entry| entry.is_object() && machines.iter().any(|id| **id == entry["container_type"]))
 }
 
 // -------------------------------------------------------------------------------- values

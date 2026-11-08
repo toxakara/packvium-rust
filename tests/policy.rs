@@ -472,3 +472,23 @@ fn a_satisfied_routing_rule_cites_nothing() {
     assert_eq!(unpacked["reason"], "no_compatible_container_dimensions");
     assert_eq!(unpacked["details"], json!([]));
 }
+
+#[test]
+fn a_routing_rule_an_offered_container_satisfies_is_not_the_reason_stock_ran_out() {
+    // Both cartons carry the rule's tag and the one pallet carries the tag it requires, but
+    // holds only one of them. The search leaves the second out, and the rule -- satisfied by
+    // the pallet on offer -- is not cited for it: the inventory is.
+    let rules = json!([{
+        "id": "cold-chain", "version": 1, "effective_at": AS_OF, "priority": 10,
+        "require_container_tag": {"item_tag": "food", "container_tag": "reefer"},
+    }]);
+    let cartons = json!([{
+        "id": "carton", "quantity": 2, "tags": ["food"],
+        "dimensions": {"length": "300", "width": "300", "height": "200"},
+    }]);
+    let result = pack(&request(rules, cartons, pallet(1, json!(["reefer"]))));
+    let unpacked = result["unpacked_items"].as_array().expect("an array");
+    assert_eq!(unpacked.len(), 1);
+    assert_eq!(unpacked[0]["reason"], "container_inventory_exhausted");
+    assert_eq!(unpacked[0]["details"], json!([]));
+}

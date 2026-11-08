@@ -133,6 +133,9 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
                 // A lattice sized against the machine maximum describes no box cut to
                 // measure; the general search runs the rung chain (D12).
                 || container.made_to_measure.is_some()
+                // The lattice rests every floor cell on the whole floor; a pallet's frame
+                // bears weight only on its deck, which the per-candidate check reads.
+                || container.deck.is_some()
         })
     {
         return None;
@@ -144,7 +147,8 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
     let mut remaining = item.quantity;
     let mut containers = Vec::new();
     let mut metrics = SolverMetrics::default();
-    let mut sequence = 0;
+    // Numbered per container type, as every other solver and engine does (`quad#1`, `pair#1`).
+    let mut sequences: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     let nesting = item.nesting_height.unwrap_or_default().0;
 
     // Per-unit capacity depends only on (item, container spec), both fixed for the
@@ -258,7 +262,11 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
         );
         *available -= 1;
         {
-            sequence += 1;
+            let sequence = {
+                let count = sequences.entry(container.id.as_str()).or_default();
+                *count += 1;
+                *count
+            };
             let clearance = request.config.clearance.0;
             let total = capacity.min(remaining);
             // The fast path counts the whole lattice in one step, so it is taken only when the
@@ -450,6 +458,7 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
         optimality: None,
         objective: request.config.objective.clone(),
         catalog_versions_used: Vec::new(),
+        currency: None,
     })
 }
 
@@ -530,6 +539,8 @@ mod tests {
                 preloaded: Vec::new(),
                 deformable_boundary: None,
                 made_to_measure: None,
+                pallet_overhang_limit: None,
+                deck: None,
             }],
             config: PackingConfig {
                 profile: SolverProfile::Fast,
@@ -538,6 +549,7 @@ mod tests {
             output_length_unit: "mm".into(),
             output_weight_unit: "g".into(),
             catalog_versions_used: Vec::new(),
+            currency: None,
             fixed_placements: Vec::new(),
             fixed_containers: Vec::new(),
         }
@@ -605,6 +617,8 @@ mod tests {
                 preloaded: Vec::new(),
                 deformable_boundary: None,
                 made_to_measure: None,
+                pallet_overhang_limit: None,
+                deck: None,
             },
         );
         let result = try_grid(&req, &no_deadline()).expect("grid should apply");
@@ -660,6 +674,8 @@ mod tests {
                 preloaded: Vec::new(),
                 deformable_boundary: None,
                 made_to_measure: None,
+                pallet_overhang_limit: None,
+                deck: None,
             },
         );
         let result = try_grid(&req, &no_deadline()).expect("grid should apply");

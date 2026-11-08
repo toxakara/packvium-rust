@@ -241,3 +241,27 @@ fn an_item_no_container_tags_admit_is_proven_unplaceable() {
     );
     assert_eq!(result["summary"]["packed_item_count"], 1);
 }
+
+/// Only a container that takes the item on every structural count is asked about its
+/// limits. Here the one it fits is tagged for another load and the one tagged for it is too
+/// small, so no limit is behind the gap and the exact search's own reason stands.
+#[test]
+fn an_item_no_single_container_admits_on_every_count_keeps_the_search_reason() {
+    let result = solve(
+        json!([cube(
+            "chilled",
+            1,
+            "50",
+            json!({ "eligible_container_tags": ["dry"] })
+        )]),
+        json!([
+            container("cold", ["100", "100", "100"], json!({ "tags": ["cold"] })),
+            container("dry", ["10", "10", "10"], json!({ "tags": ["dry"] })),
+        ]),
+        json!({}),
+    );
+    assert_eq!(
+        reasons(&result),
+        vec![("exact_search_incomplete".to_owned(), "observed".to_owned())]
+    );
+}

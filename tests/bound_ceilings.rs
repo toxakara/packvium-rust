@@ -30,6 +30,7 @@ fn instance(volume: i128) -> Instance {
         volume,
         weight: 0,
         shrinks: false,
+        value: 0,
     }
 }
 
@@ -175,6 +176,7 @@ fn computing_from_engine_objects_matches_the_reduced_form() {
             volume: item.dimensions.volume(),
             weight: i128::from(item.weight.0),
             shrinks: false,
+            value: 0,
         }; 2],
         &[ContainerType {
             usable: container.inner_dimensions.volume(),

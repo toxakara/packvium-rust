@@ -24,6 +24,7 @@ use serde_json::Value;
 use crate::artifacts::{
     ArtifactError, ArtifactErrorCode, FORMAT, canonical_artifact_json, read_document,
 };
+use crate::canonical_json::MAX_EXACT_MAGNITUDE;
 
 pub const CSV_COLUMNS: [&str; 18] = [
     "record",
@@ -335,15 +336,44 @@ fn unplaced_section(out: &mut String, entries: &[Value]) -> ExportResult<()> {
 /// rendering: `0.5 + 1` would print `1.5` in one engine and be refused in another.
 fn ordinal(index: &Value) -> ExportResult<String> {
     if let Some(signed) = index.as_i64() {
-        return Ok((i128::from(signed) + 1).to_string());
+        return exact_decimal(i128::from(signed) + 1);
     }
     if let Some(unsigned) = index.as_u64() {
-        return Ok((u128::from(unsigned) + 1).to_string());
+        return exact_decimal(i128::from(unsigned) + 1);
+    }
+    if is_whole_beyond_exact(index) {
+        return Err(beyond_exact(index));
     }
     Err(ArtifactError::new(
         ArtifactErrorCode::InvalidValue,
         format!("container index {index} is not an integer"),
     ))
+}
+
+/// An integer in decimal, refused past 2^53 - 1: JavaScript has already rounded such a value
+/// while parsing, so its decimal would differ.
+fn exact_decimal(value: i128) -> ExportResult<String> {
+    if value.unsigned_abs() > u128::from(MAX_EXACT_MAGNITUDE) {
+        return Err(ArtifactError::new(
+            ArtifactErrorCode::NumberOutOfRange,
+            format!("{value} is beyond what every engine holds exactly"),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// A whole number past `u64`, which the JSON reader holds as a float.
+fn is_whole_beyond_exact(value: &Value) -> bool {
+    value.as_f64().is_some_and(|number| {
+        number.is_finite() && number.fract() == 0.0 && number.abs() > MAX_EXACT_MAGNITUDE as f64
+    })
+}
+
+fn beyond_exact(value: &Value) -> ArtifactError {
+    ArtifactError::new(
+        ArtifactErrorCode::NumberOutOfRange,
+        format!("{value} is beyond what every engine holds exactly"),
+    )
 }
 
 fn push_line(out: &mut String, line: &str) {
@@ -358,9 +388,13 @@ fn rendering(value: &Value) -> ExportResult<Cow<'_, str>> {
     match value {
         Value::Null => Ok(Cow::Borrowed("")),
         Value::String(text) => Ok(Cow::Borrowed(text)),
-        Value::Number(number) if number.is_i64() || number.is_u64() => {
-            Ok(Cow::Owned(number.to_string()))
+        Value::Number(number) if number.is_i64() => {
+            exact_decimal(i128::from(number.as_i64().unwrap_or_default())).map(Cow::Owned)
         }
+        Value::Number(number) if number.is_u64() => {
+            exact_decimal(i128::from(number.as_u64().unwrap_or_default())).map(Cow::Owned)
+        }
+        other if is_whole_beyond_exact(other) => Err(beyond_exact(other)),
         other => Err(ArtifactError::new(
             ArtifactErrorCode::InvalidValue,
             format!("{other} has no single rendering in a work order"),
@@ -637,6 +671,40 @@ mod tests {
             artifact["work_order"]["containers"][0]["container_index"] = index;
             let error = export_work_order_html(&artifact.to_string()).unwrap_err();
             assert_eq!(error.code(), "invalid_value");
+        }
+    }
+
+    #[test]
+    fn a_container_number_javascript_cannot_hold_is_refused_rather_than_printed() {
+        // The sheet shows the index plus one, so 2^53 - 1 is already one past the ceiling, and
+        // a whole number past u64 arrives as a float.
+        let mut artifact: Value = serde_json::from_str(&ordered()).unwrap();
+        for index in [
+            json!(9_007_199_254_740_991_u64),
+            json!(u64::MAX),
+            serde_json::from_str::<Value>("1e20").unwrap(),
+        ] {
+            artifact["work_order"]["containers"][0]["container_index"] = index.clone();
+            let error = export_work_order_html(&artifact.to_string()).unwrap_err();
+            assert_eq!(error.code(), "number_out_of_range", "{index}");
+        }
+        artifact["work_order"]["containers"][0]["container_index"] =
+            json!(9_007_199_254_740_990_u64);
+        let html = export_work_order_html(&artifact.to_string()).unwrap();
+        assert!(html.contains("<h2>Container 9007199254740991: "), "{html}");
+    }
+
+    #[test]
+    fn any_printed_integer_javascript_cannot_hold_is_refused() {
+        let mut artifact: Value = serde_json::from_str(&ordered()).unwrap();
+        for sequence in [
+            json!(-9_007_199_254_740_992_i64),
+            json!(9_007_199_254_740_992_u64),
+            serde_json::from_str::<Value>("1e20").unwrap(),
+        ] {
+            artifact["work_order"]["containers"][0]["lines"][0]["sequence"] = sequence.clone();
+            let error = export_csv(&artifact.to_string()).unwrap_err();
+            assert_eq!(error.code(), "number_out_of_range", "{sequence}");
         }
     }
 

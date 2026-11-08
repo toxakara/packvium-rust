@@ -1,6 +1,7 @@
 use crate::contact_graph::ContactGraph;
 use crate::geometry::Point;
 use crate::model::{PackedContainer, PackingRequest, PackingResult, Placement};
+use crate::pallet_overhang::{Deck, floor_support};
 use crate::units::Weight;
 use crate::validation::IndependentValidator;
 use std::collections::BTreeSet;
@@ -59,10 +60,10 @@ fn refreshed_top_loads(mut placements: Vec<Placement>) -> Vec<Placement> {
     placements
 }
 
-fn support_ratio(existing: &[Placement], placement: &Placement) -> f64 {
+fn support_ratio(existing: &[Placement], placement: &Placement, deck: Option<Deck>) -> f64 {
     let box_ = placement.envelope_box();
     if box_.origin.z == 0 {
-        return 1.0;
+        return floor_support(deck, box_).1;
     }
     if placement.instance.item.nesting_height.is_none() {
         let area = existing
@@ -128,7 +129,11 @@ fn attempt_move(
             y: point.y + offset.y,
             z: point.z + offset.z,
         };
-        relocated.support_ratio = support_ratio(&destination.placements, &relocated);
+        relocated.support_ratio = support_ratio(
+            &destination.placements,
+            &relocated,
+            destination.container.deck,
+        );
         relocated.top_load = Weight(0);
 
         let mut trial = containers.to_vec();
@@ -327,6 +332,8 @@ mod tests {
             preloaded: Vec::new(),
             deformable_boundary: None,
             made_to_measure: None,
+            pallet_overhang_limit: None,
+            deck: None,
         }
     }
 
@@ -361,6 +368,7 @@ mod tests {
             optimality: None,
             objective: "default".into(),
             catalog_versions_used: Vec::new(),
+            currency: None,
         }
     }
 
@@ -376,6 +384,7 @@ mod tests {
             output_length_unit: "ticks".into(),
             output_weight_unit: "ticks".into(),
             catalog_versions_used: Vec::new(),
+            currency: None,
             fixed_placements: Vec::new(),
             fixed_containers: Vec::new(),
         };
@@ -469,6 +478,7 @@ mod tests {
             output_length_unit: "ticks".into(),
             output_weight_unit: "ticks".into(),
             catalog_versions_used: Vec::new(),
+            currency: None,
             fixed_placements: Vec::new(),
             fixed_containers: Vec::new(),
         };
@@ -510,7 +520,7 @@ mod tests {
             placement(&nested, 3, 0, 10),
         ];
 
-        assert_eq!(support_ratio(&placements[..1], &placements[1]), 1.0);
+        assert_eq!(support_ratio(&placements[..1], &placements[1], None), 1.0);
         assert_eq!(
             refreshed_top_loads(placements)
                 .iter()
@@ -538,6 +548,7 @@ mod tests {
                 output_length_unit: "ticks".into(),
                 output_weight_unit: "ticks".into(),
                 catalog_versions_used: Vec::new(),
+                currency: None,
                 fixed_placements: Vec::new(),
                 fixed_containers: Vec::new(),
             };
@@ -628,6 +639,7 @@ mod tests {
             output_length_unit: "ticks".into(),
             output_weight_unit: "ticks".into(),
             catalog_versions_used: Vec::new(),
+            currency: None,
             fixed_placements: Vec::new(),
             fixed_containers: Vec::new(),
         };

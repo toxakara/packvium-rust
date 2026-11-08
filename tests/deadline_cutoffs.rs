@@ -86,6 +86,7 @@ fn request(profile: SolverProfile, solvers: &[&str]) -> PackingRequest {
         output_length_unit: "mm".into(),
         output_weight_unit: "g".into(),
         catalog_versions_used: Vec::new(),
+        currency: None,
         fixed_placements: Vec::new(),
         fixed_containers: Vec::new(),
     }

@@ -67,7 +67,7 @@ fn main() {
         {"sequence": 1, "type": "placement_locked", "placement": {
             "item_type": "cube", "container_type": "tote", "container_instance": 1,
             "position": {"x": position("x"), "y": position("y"), "z": position("z")},
-            "orientation": loaded["orientation"]}},
+            "orientation": loaded["orientation"], "placement_id": loaded["placement_id"]}},
         {"sequence": 2, "type": "item_missing", "item_type": "slab", "quantity": 1}
     ]);
     let revision = derive_revision_json(&root, &approved, &events.to_string())
@@ -83,6 +83,7 @@ fn main() {
         &text(&revision_value["approved"]["artifact"])[..23],
         text(&revision_value["approved"]["replay"]["level"])
     );
+    println!("  locked by its id:    {}", text(&loaded["placement_id"]));
     println!(
         "  slabs still to pack: {}",
         revision_value["request"]["items"][1]["quantity"]
@@ -147,6 +148,87 @@ fn main() {
     println!("  An edited request no longer equals what its parent's request and its own events");
     println!("  produce, and any later revision would stop naming it as a parent. An event that");
     println!("  contradicts the request is refused by name rather than applied as a best guess.");
+
+    cut_to_measure();
+}
+
+/// A box cut to measure, a void-fill reserve, and the revision that keeps the cut box.
+const CUT_REQUEST: &str = r#"{
+  "units": {"length": "mm"},
+  "configuration": {"effort_budget": {"max_search_nodes": 20000}, "time_limit_ms": 60000},
+  "items": [
+    {"id": "cube", "quantity": 2, "weight": "1 kg",
+     "dimensions": {"length": "100", "width": "100", "height": "100"}}
+  ],
+  "containers": [
+    {"id": "machine", "quantity": 2, "void_fill_reserve_ratio": 0.3,
+     "inner_dimensions": {"length": "410", "width": "410", "height": "410"},
+     "made_to_measure": {"minimum": {"length": "60", "width": "60", "height": "60"},
+       "increment": {"length": "25", "width": "25", "height": "25"},
+       "cost_per_square_metre_minor": 1000, "tare_per_square_metre": "500",
+       "outer_allowance": {"length": "3", "width": "3", "height": "3"}}}
+  ]
+}"#;
+
+fn cut_to_measure() {
+    section("5. A box cut to measure is stocked, not cut again");
+    let root = root_revision_json(CUT_REQUEST).unwrap_or_else(|error| fail(error.message()));
+    let root_value = parse(&root);
+    let approved = approve(&root_value["request"]);
+    let first = pack(&root_value["request"]);
+    let cut = &first["containers"][0];
+    println!(
+        "  cut: {} at {} x {} x {} mm, holding {} cube(s), 30% kept for void fill",
+        text(&cut["id"]),
+        text(&cut["inner_dimensions"]["length"]["value"]),
+        text(&cut["inner_dimensions"]["width"]["value"]),
+        text(&cut["inner_dimensions"]["height"]["value"]),
+        cut["placements"].as_array().map_or(0, Vec::len)
+    );
+    let loaded = &cut["placements"][0];
+    let events = json!([{"sequence": 1, "type": "placement_locked", "placement": {
+        "item_type": "cube", "container_type": "machine", "container_instance": 1,
+        "position": {"x": loaded["position"]["x"]["value"], "y": loaded["position"]["y"]["value"],
+                     "z": loaded["position"]["z"]["value"]},
+        "orientation": loaded["orientation"], "placement_id": loaded["placement_id"]}}]);
+    let revision = derive_revision_json(&root, &approved, &events.to_string())
+        .unwrap_or_else(|error| fail(error.message()));
+    let revision_value = parse(&revision);
+    for container in revision_value["request"]["containers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let kind = if container.get("made_to_measure").is_some() {
+            "cut to measure"
+        } else {
+            "stock, at the size already cut"
+        };
+        println!(
+            "  derived container {:<12} quantity {}, {kind}",
+            text(&container["id"]),
+            container["quantity"]
+        );
+    }
+    let artifacts = json!([null, parse(&approved)]).to_string();
+    let chain = format!("[{root},{revision}]");
+    println!(
+        "  chain with the approved artifact: {}",
+        codes(&verify_revision_chain_json(&chain, Some(&artifacts)))
+    );
+    println!(
+        "  chain without it:                 {}",
+        codes(&verify_revision_chain_json(&chain, None))
+    );
+    println!();
+    println!("  Cut tight, the two cubes would get 210 x 110 x 110 mm, which leaves 21% free: too");
+    println!("  little for a 30% void-fill reserve, so the box is cut from the envelope it was");
+    println!("  packed in instead.");
+    println!();
+    println!("  The locked cube's box already exists, so the next plan may not cut a new one for");
+    println!("  it: the revision turns it into a stock container named after the revision, one");
+    println!("  fewer box is left on the machine, and any new box is still cut to measure. Its");
+    println!("  size comes from the approved artifact, which is why the audit asks for it.");
 }
 
 /// Solve a request and wrap the answer as the artifact the dock works from.

@@ -54,39 +54,15 @@ impl Dimensions {
         }
     }
 
+    /// The box a rotation turns this one into: each container axis takes the declared side
+    /// the code names. A box ignores the signs -- a mirrored or turned-over box is the same box.
     pub fn rotated(self, rotation: Rotation) -> Self {
-        let (length, width, height) = (self.length, self.width, self.height);
-        match rotation {
-            Rotation::Lwh => Self {
-                length,
-                width,
-                height,
-            },
-            Rotation::Lhw => Self {
-                length,
-                width: height,
-                height: width,
-            },
-            Rotation::Wlh => Self {
-                length: width,
-                width: length,
-                height,
-            },
-            Rotation::Whl => Self {
-                length: width,
-                width: height,
-                height: length,
-            },
-            Rotation::Hlw => Self {
-                length: height,
-                width: length,
-                height: width,
-            },
-            Rotation::Hwl => Self {
-                length: height,
-                width,
-                height: length,
-            },
+        let sides = [self.length, self.width, self.height];
+        let [x, y, z] = rotation.source_axes();
+        Self {
+            length: sides[x],
+            width: sides[y],
+            height: sides[z],
         }
     }
 
@@ -130,6 +106,14 @@ pub enum ShapeType {
     Compressible,
 }
 
+/// One of the 24 proper rotations of an item, in canonical table order (1.10).
+///
+/// The six legacy codes come first and are the whole vocabulary of a box. Each keeps the matrix
+/// it has always had: an even permutation carries no sign, an odd one negates x, so all six are
+/// proper rotations. The 18 signed codes after them spell the sign out per container axis --
+/// `-L-W+H` is the half-turn about the vertical -- and only a `convex_hull` may name one,
+/// because on a box each is a legacy box under another name. Declaration order is the table
+/// order, which is the only order codes are ever ranked by; they are never compared as text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum Rotation {
     #[serde(rename = "LWH")]
@@ -144,9 +128,77 @@ pub enum Rotation {
     Hlw,
     #[serde(rename = "HWL")]
     Hwl,
+    #[serde(rename = "+L-W-H")]
+    PlNwNh,
+    #[serde(rename = "-L+W-H")]
+    NlPwNh,
+    #[serde(rename = "-L-W+H")]
+    NlNwPh,
+    #[serde(rename = "+L-H+W")]
+    PlNhPw,
+    #[serde(rename = "+L+H-W")]
+    PlPhNw,
+    #[serde(rename = "-L-H-W")]
+    NlNhNw,
+    #[serde(rename = "+W-L+H")]
+    PwNlPh,
+    #[serde(rename = "+W+L-H")]
+    PwPlNh,
+    #[serde(rename = "-W-L-H")]
+    NwNlNh,
+    #[serde(rename = "+W-H-L")]
+    PwNhNl,
+    #[serde(rename = "-W+H-L")]
+    NwPhNl,
+    #[serde(rename = "-W-H+L")]
+    NwNhPl,
+    #[serde(rename = "+H-L-W")]
+    PhNlNw,
+    #[serde(rename = "-H+L-W")]
+    NhPlNw,
+    #[serde(rename = "-H-L+W")]
+    NhNlPw,
+    #[serde(rename = "+H-W+L")]
+    PhNwPl,
+    #[serde(rename = "+H+W-L")]
+    PhPwNl,
+    #[serde(rename = "-H-W-L")]
+    NhNwNl,
 }
 
+/// Per table row: the code, the declared side (L = 0, W = 1, H = 2) each container axis x, y, z
+/// takes its extent from, and the sign that axis carries. Every row has determinant +1.
+type RotationRow = (Rotation, &'static str, [usize; 3], [i64; 3]);
+
+const ROTATION_TABLE: [RotationRow; 24] = [
+    (Rotation::Lwh, "LWH", [0, 1, 2], [1, 1, 1]),
+    (Rotation::Lhw, "LHW", [0, 2, 1], [-1, 1, 1]),
+    (Rotation::Wlh, "WLH", [1, 0, 2], [-1, 1, 1]),
+    (Rotation::Whl, "WHL", [1, 2, 0], [1, 1, 1]),
+    (Rotation::Hlw, "HLW", [2, 0, 1], [1, 1, 1]),
+    (Rotation::Hwl, "HWL", [2, 1, 0], [-1, 1, 1]),
+    (Rotation::PlNwNh, "+L-W-H", [0, 1, 2], [1, -1, -1]),
+    (Rotation::NlPwNh, "-L+W-H", [0, 1, 2], [-1, 1, -1]),
+    (Rotation::NlNwPh, "-L-W+H", [0, 1, 2], [-1, -1, 1]),
+    (Rotation::PlNhPw, "+L-H+W", [0, 2, 1], [1, -1, 1]),
+    (Rotation::PlPhNw, "+L+H-W", [0, 2, 1], [1, 1, -1]),
+    (Rotation::NlNhNw, "-L-H-W", [0, 2, 1], [-1, -1, -1]),
+    (Rotation::PwNlPh, "+W-L+H", [1, 0, 2], [1, -1, 1]),
+    (Rotation::PwPlNh, "+W+L-H", [1, 0, 2], [1, 1, -1]),
+    (Rotation::NwNlNh, "-W-L-H", [1, 0, 2], [-1, -1, -1]),
+    (Rotation::PwNhNl, "+W-H-L", [1, 2, 0], [1, -1, -1]),
+    (Rotation::NwPhNl, "-W+H-L", [1, 2, 0], [-1, 1, -1]),
+    (Rotation::NwNhPl, "-W-H+L", [1, 2, 0], [-1, -1, 1]),
+    (Rotation::PhNlNw, "+H-L-W", [2, 0, 1], [1, -1, -1]),
+    (Rotation::NhPlNw, "-H+L-W", [2, 0, 1], [-1, 1, -1]),
+    (Rotation::NhNlPw, "-H-L+W", [2, 0, 1], [-1, -1, 1]),
+    (Rotation::PhNwPl, "+H-W+L", [2, 1, 0], [1, -1, 1]),
+    (Rotation::PhPwNl, "+H+W-L", [2, 1, 0], [1, 1, -1]),
+    (Rotation::NhNwNl, "-H-W-L", [2, 1, 0], [-1, -1, -1]),
+];
+
 impl Rotation {
+    /// The six legacy codes: an item's default list, and every box a cuboid can make.
     pub const ALL: [Self; 6] = [
         Self::Lwh,
         Self::Lhw,
@@ -155,16 +207,102 @@ impl Rotation {
         Self::Hlw,
         Self::Hwl,
     ];
+    /// The legacy codes `keep_upright` leaves of the default list.
     pub const UPRIGHT: [Self; 2] = [Self::Lwh, Self::Wlh];
+    /// All 24 proper rotations in table order; the 18 past `ALL` need a hull.
+    pub const EVERY: [Self; 24] = [
+        Self::Lwh,
+        Self::Lhw,
+        Self::Wlh,
+        Self::Whl,
+        Self::Hlw,
+        Self::Hwl,
+        Self::PlNwNh,
+        Self::NlPwNh,
+        Self::NlNwPh,
+        Self::PlNhPw,
+        Self::PlPhNw,
+        Self::NlNhNw,
+        Self::PwNlPh,
+        Self::PwPlNh,
+        Self::NwNlNh,
+        Self::PwNhNl,
+        Self::NwPhNl,
+        Self::NwNhPl,
+        Self::PhNlNw,
+        Self::NhPlNw,
+        Self::NhNlPw,
+        Self::PhNwPl,
+        Self::PhPwNl,
+        Self::NhNwNl,
+    ];
+
+    /// What a signed code on anything but a hull is refused with, wherever it is named.
+    pub const SIGNED_NEEDS_A_HULL: &'static str =
+        "a signed rotation code requires shape_type convex_hull";
+
+    /// This code's position in the table, `0..24`; the legacy codes are `0..6`.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    fn row(self) -> &'static RotationRow {
+        &ROTATION_TABLE[self.index()]
+    }
 
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Lwh => "LWH",
-            Self::Lhw => "LHW",
-            Self::Wlh => "WLH",
-            Self::Whl => "WHL",
-            Self::Hlw => "HLW",
-            Self::Hwl => "HWL",
+        self.row().1
+    }
+
+    /// The declared side each container axis x, y, z takes its extent from.
+    pub fn source_axes(self) -> [usize; 3] {
+        self.row().2
+    }
+
+    /// The sign each container axis carries; a box ignores it, a hull does not.
+    pub fn signs(self) -> [i64; 3] {
+        self.row().3
+    }
+
+    pub fn is_signed(self) -> bool {
+        self.index() >= Self::ALL.len()
+    }
+
+    /// Whether the item's own height stays vertical and pointing up: z takes `+H`.
+    pub fn is_upright(self) -> bool {
+        self.source_axes()[2] == 2 && self.signs()[2] == 1
+    }
+
+    /// The code spelled `code`, from the whole table. O(24).
+    pub fn from_code(code: &str) -> Option<Self> {
+        ROTATION_TABLE
+            .iter()
+            .find(|row| row.1 == code)
+            .map(|row| row.0)
+    }
+
+    /// The codes an item may name: all 24 for a hull, the six legacy codes otherwise.
+    pub fn vocabulary(hull: bool) -> &'static [Self] {
+        if hull { &Self::EVERY } else { &Self::ALL }
+    }
+
+    /// The vocabulary's codes in table order, for the refusals that list it.
+    pub fn vocabulary_codes(hull: bool) -> Vec<&'static str> {
+        Self::vocabulary(hull)
+            .iter()
+            .map(|rotation| rotation.as_str())
+            .collect()
+    }
+
+    /// Why `code` cannot orient an item of this shape, or `None` when it can: a signed code
+    /// beside a non-hull is a rule broken (`invalid_value`), anything outside the item's
+    /// vocabulary an unknown word (`not_allowed`). O(24).
+    pub fn refusal_reason(code: Option<&str>, hull: bool) -> Option<&'static str> {
+        let rotation = code.and_then(Self::from_code);
+        match rotation {
+            Some(rotation) if !hull && rotation.is_signed() => Some("invalid_value"),
+            Some(_) => None,
+            None => Some("not_allowed"),
         }
     }
 }

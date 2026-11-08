@@ -5,11 +5,11 @@ use super::geometry::{Cuboid, solids_overlap};
 use super::json::{Json, Ordered, Res};
 use super::num::{Ratio, abs, add, ceil_div, floor_div, mul, mul_div, py_mod, sub, sum};
 use super::pyfmt::{int_tuple, list, py_repr, py_str, str_repr, tuple};
-use super::spec::{ContainerSpec, ItemSpec, rotation_axes};
+use super::spec::{ContainerSpec, ItemSpec, MachineSpec, rotation_axes};
 use super::stacking::{
-    Entry, Envelopes, SQUARE_METRE_TICKS, check_crush, check_route_removal_order,
-    check_stack_density, check_stack_top_load, check_support_and_load, entries, occupied_volume,
-    placed_hull, propagate_load, support_graph, valid_nesting,
+    Entry, Envelopes, SQUARE_METRE_TICKS, check_crush, check_deck_support,
+    check_route_removal_order, check_stack_density, check_stack_top_load, check_support_and_load,
+    entries, occupied_volume, placed_hull, propagate_load, support_graph, valid_nesting,
 };
 use super::{Issue, Label, MalformedResult};
 
@@ -59,6 +59,34 @@ pub(crate) fn achieved_extent(packed: &Json, clearance: i128) -> Res<[i128; 3]> 
     Ok(extent.unwrap_or([0, 0, 0]))
 }
 
+/// The deck grown by the overhang the placements use past each of its edges.
+fn pallet_footprint(packed: &Json, deck: [i128; 4], clearance: i128) -> Res<(i128, i128)> {
+    let [x, y, length, width] = deck;
+    let (mut low_x, mut low_y, mut high_x, mut high_y) = (x, y, add(x, length)?, add(y, width)?);
+    for placement in packed.at("placements")?.list("placements")? {
+        let envelope = envelope(placement, clearance)?;
+        low_x = low_x.min(envelope.x);
+        low_y = low_y.min(envelope.y);
+        high_x = high_x.max(envelope.x2);
+        high_y = high_y.max(envelope.y2);
+    }
+    Ok((sub(high_x, low_x)?, sub(high_y, low_y)?))
+}
+
+/// What a carrier measures: a bag's package; a pallet's declared footprint or its
+/// grown deck, the larger per axis; else the declared outer, else inner size.
+pub(crate) fn billed_size(packed: &Json, spec: &ContainerSpec, clearance: i128) -> Res<[i128; 3]> {
+    if spec.flat_bag {
+        return achieved_extent(packed, clearance);
+    }
+    let Some(deck) = spec.deck else {
+        return Ok(spec.outer.unwrap_or(spec.inner));
+    };
+    let (length, width) = pallet_footprint(packed, deck, clearance)?;
+    let base = spec.outer.unwrap_or([deck[2], deck[3], spec.inner[2]]);
+    Ok([base[0].max(length), base[1].max(width), base[2]])
+}
+
 /// `achieved_dimensions` is present exactly when the container declares a soft size, and
 /// equals the tight extent; a flat bag's extent must pass the girth rule.
 pub(crate) fn check_achieved_extent(
@@ -78,7 +106,10 @@ pub(crate) fn check_achieved_extent(
         }
         return packed_id.verify();
     }
-    let [a, b, c] = achieved_extent(packed, clearance)?;
+    let [mut a, mut b, c] = achieved_extent(packed, clearance)?;
+    if let Some(deck) = spec.deck {
+        (a, b) = pallet_footprint(packed, deck, clearance)?;
+    }
     let stated: Option<Vec<Json>> = if reported.is_dict() {
         let empty = Json::Dict(Vec::new());
         Some(
@@ -100,11 +131,18 @@ pub(crate) fn check_achieved_extent(
             ),
         ));
     }
-    if spec.flat_bag && (add(a, c)? > spec.inner[0] || add(b, c)? > spec.inner[1]) {
+    if spec.flat_bag
+        && (add(a, c)? > spec.inner[0] || add(b, c)? > add(spec.inner[1], spec.side_gusset)?)
+    {
+        let gusset = if spec.side_gusset > 0 {
+            format!(", side gusset {}", spec.side_gusset)
+        } else {
+            String::new()
+        };
         issues.push(Issue::new(
             "bag_girth_exceeded",
             format!(
-                "{packed_id}: a + c = {}, b + c = {}, flat size {} x {}",
+                "{packed_id}: a + c = {}, b + c = {}, flat size {} x {}{gusset}",
                 add(a, c)?,
                 add(b, c)?,
                 spec.inner[0],
@@ -179,6 +217,55 @@ fn nested_ticks(block: &Json, key: &str) -> Res<Json> {
     })
 }
 
+/// The reported box, when it is a reserve cut larger than the tight one: the tight
+/// box breaks the void-fill reserve, and the reported one is on the machine grid between the
+/// tight box and the maximum. That it keeps the reserve is the ordinary reserve check's. Reads
+/// the reported used volume, which `used_volume_mismatch` holds to the placements. `O(1)`.
+fn reserve_cut(
+    packed: &Json,
+    spec: &ContainerSpec,
+    machine: &MachineSpec,
+    tight: [i128; 3],
+    reported: Option<&[Json]>,
+) -> Res<Option<[i128; 3]>> {
+    if spec.void_fill_reserve_ratio.compare_int(0)? == std::cmp::Ordering::Equal {
+        return Ok(None);
+    }
+    let Some(reported) = reported else {
+        return Ok(None);
+    };
+    let mut sides = [0_i128; 3];
+    for (axis, side) in reported.iter().enumerate() {
+        let Json::Int(side) = side else {
+            return Ok(None);
+        };
+        let on_grid = tight[axis] <= *side
+            && *side <= spec.inner[axis]
+            && py_mod(sub(*side, machine.minimum[axis])?, machine.increment[axis])? == 0;
+        if !on_grid {
+            return Ok(None);
+        }
+        sides[axis] = *side;
+    }
+    let Json::Str(used) = packed.get_null("used_volume_ticks3")? else {
+        return Ok(None);
+    };
+    if used.is_empty() || !used.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let volume = mul(mul(tight[0], tight[1])?, tight[2])?;
+    let scaled = ratio_ppm(spec.void_fill_reserve_ratio);
+    let reserved = add(
+        mul(floor_div(volume, SCORE_SCALE)?, scaled)?,
+        floor_div(mul(py_mod(volume, SCORE_SCALE)?, scaled)?, SCORE_SCALE)?,
+    )?;
+    // A decimal past `i128` is past every usable volume.
+    let exceeds = used
+        .parse::<i128>()
+        .map_or(true, |used| used > volume - reserved);
+    Ok(exceeds.then_some(sides))
+}
+
 /// Recompute a made-to-measure container's box from its placements alone and return the spec
 /// every later check uses: the recomputed box, never the reported one.
 pub(crate) fn check_made_to_measure(
@@ -230,6 +317,12 @@ pub(crate) fn check_made_to_measure(
         ));
     }
     let reported_inner = reported_ticks(packed.get_null("inner_dimensions")?)?;
+    if !matches_ints(reported_inner.as_deref(), &fabricated)
+        && let Some(cut) =
+            reserve_cut(packed, spec, machine, fabricated, reported_inner.as_deref())?
+    {
+        fabricated = cut;
+    }
     if !matches_ints(reported_inner.as_deref(), &fabricated) {
         issues.push(Issue::new(
             "fabricated_dimensions_mismatch",
@@ -394,6 +487,9 @@ pub(crate) fn check_container(
     check_pairs(&envelopes, &packed_id, issues)?;
     let graph = support_graph(&envelopes)?;
     check_support_and_load(&envelopes, &graph, global_support, issues)?;
+    if let Some(deck) = spec.deck {
+        check_deck_support(&envelopes, deck, global_support, issues)?;
+    }
     let loads = propagate_load(&envelopes, &graph)?;
     check_stack_top_load(&envelopes, &loads, issues);
     if let Some(max_density) = spec.max_stack_density {

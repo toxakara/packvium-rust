@@ -11,25 +11,27 @@
 //! rules it skips. The check is the ordinary `IndependentValidator` run over the fixed set
 //! alone, without item accounting, because the free items have not been placed yet.
 
-use crate::canonical_json::{json_integer, json_spelling, spell_names};
+use crate::canonical_json::{MAX_EXACT_MAGNITUDE, json_integer, json_spelling, spell_names};
 use crate::contact_graph::ContactGraph;
 use crate::error::{PackError, PackResult, RequestError};
-use crate::geometry::Point;
-use crate::model::*;
+use crate::geometry::{Point, Rotation, ShapeType};
+use crate::model::{placement_id, *};
+use crate::pallet_overhang::{Deck, floor_support};
+use crate::request_errors::orientation_refusal;
 use crate::solvers::calculate_top_loads;
 use crate::units::{MeasureKind, Weight, measure_ticks};
 use crate::validation::IndependentValidator;
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-const ORIENTATIONS: [&str; 6] = ["LWH", "LHW", "WLH", "WHL", "HLW", "HWL"];
 const REQUIRED: [&str; 3] = ["item_type", "container_type", "orientation"];
-const FIELDS: [&str; 5] = [
+const FIELDS: [&str; 6] = [
     "item_type",
     "container_type",
     "orientation",
     "container_instance",
     "position",
+    "placement_id",
 ];
 const AXES: [&str; 3] = ["x", "y", "z"];
 
@@ -38,15 +40,19 @@ const AXES: [&str; 3] = ["x", "y", "z"];
 /// and a list is not a position. An absent or null field is no fixed placements. A position's
 /// coordinates are parsed in the request's length `unit`, so a negative or unparsable one is
 /// refused here, by its pointer, rather than as an anonymous parse failure later.
+/// `hull_types` names the item types that are hulls, the only ones a signed orientation may
+/// fix (1.10).
 pub(crate) fn require_fixed_placement_shapes<'a>(
     raw: Option<&'a Value>,
     unit: &str,
+    hull_types: &BTreeSet<&str>,
 ) -> PackResult<&'a [Value]> {
     let Some(raw) = raw.filter(|raw| !raw.is_null()) else {
         return Ok(&[]);
     };
     let Some(entries) = raw.as_array() else {
         return Err(malformed(Fault {
+            reason: "malformed",
             detail: "fixed_placements is a list".into(),
             field: "/fixed_placements".into(),
         }));
@@ -54,27 +60,47 @@ pub(crate) fn require_fixed_placement_shapes<'a>(
     for (index, entry) in entries.iter().enumerate() {
         let place = format!("fixed_placements[{index}]");
         let field = format!("/fixed_placements/{index}");
-        if let Some(fault) = entry_shape_fault(entry, &place, &field, unit) {
+        if let Some(fault) = entry_shape_fault(entry, &place, &field, unit, hull_types) {
             return Err(malformed(fault));
         }
     }
     Ok(entries)
 }
 
-/// Why a value is refused: the message, and the JSON Pointer of the value at fault.
+/// The ids of the requested item types that are `convex_hull`, read from the JSON items as
+/// written; anything that is not an item object names no hull. O(items).
+pub(crate) fn hull_item_types(items: Option<&Value>) -> BTreeSet<&str> {
+    items
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("shape_type").and_then(Value::as_str) == Some("convex_hull"))
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .collect()
+}
+
+/// Why a value is refused: the reason, the message, and the JSON Pointer of the value at fault.
 struct Fault {
+    reason: &'static str,
     detail: String,
     field: String,
 }
 
 fn fault(detail: String, field: &str) -> Option<Fault> {
     Some(Fault {
+        reason: "malformed",
         detail,
         field: field.to_owned(),
     })
 }
 
-fn entry_shape_fault(entry: &Value, place: &str, field: &str, unit: &str) -> Option<Fault> {
+fn entry_shape_fault(
+    entry: &Value,
+    place: &str,
+    field: &str,
+    unit: &str,
+    hull_types: &BTreeSet<&str>,
+) -> Option<Fault> {
     let Some(map) = entry.as_object() else {
         return fault(format!("{place} is an object"), field);
     };
@@ -101,17 +127,8 @@ fn entry_shape_fault(entry: &Value, place: &str, field: &str, unit: &str) -> Opt
             &format!("{field}/{name}"),
         );
     }
-    if !map["orientation"]
-        .as_str()
-        .is_some_and(|orientation| ORIENTATIONS.contains(&orientation))
-    {
-        return fault(
-            format!(
-                "{place}.orientation must be one of {}",
-                spell_names(&ORIENTATIONS)
-            ),
-            &format!("{field}/orientation"),
-        );
+    if let Some(fault) = orientation_fault(&map["orientation"], map, place, field, hull_types) {
+        return Some(fault);
     }
     if map
         .get("container_instance")
@@ -122,11 +139,99 @@ fn entry_shape_fault(entry: &Value, place: &str, field: &str, unit: &str) -> Opt
             &format!("{field}/container_instance"),
         );
     }
-    let position = map.get("position")?;
-    let place = format!("{place}.position");
-    let field = format!("{field}/position");
-    point_shape_fault(position, &place, &field)
-        .or_else(|| coordinate_fault(position, &place, &field, unit))
+    if let Some(position) = map.get("position") {
+        let place = format!("{place}.position");
+        let field = format!("{field}/position");
+        if let Some(fault) = point_shape_fault(position, &place, &field)
+            .or_else(|| coordinate_fault(position, &place, &field, unit))
+        {
+            return Some(fault);
+        }
+    }
+    placement_id_fault(map, place, field, unit)
+}
+
+/// A fixed placement's optional `placement_id` (1.10) restates the id its result placement
+/// will carry, the canonical JSON of `[<container_type>#<container_instance>, x, y, z,
+/// <item_type>, <orientation>]` with the position in ticks; null is absent. A non-string is
+/// `malformed`, like every other shape error here; a string naming another placement is
+/// `invalid_value`. Only called on an entry whose other fields are admitted. O(1).
+fn placement_id_fault(
+    map: &Map<String, Value>,
+    place: &str,
+    field: &str,
+    unit: &str,
+) -> Option<Fault> {
+    let value = map.get("placement_id").filter(|value| !value.is_null())?;
+    let field = format!("{field}/placement_id");
+    let Some(reported) = value.as_str() else {
+        return fault(format!("{place}.placement_id is a string"), &field);
+    };
+    let expected = expected_placement_id(map, unit)?;
+    (reported != expected).then(|| Fault {
+        reason: "invalid_value",
+        detail: format!(
+            "{place}.placement_id must be {}",
+            json_spelling(&Value::String(expected))
+        ),
+        field,
+    })
+}
+
+/// The id an admitted entry's result placement carries, or `None` when a coordinate is past
+/// 2^53 - 1: such a coordinate has no canonical spelling, and no container holds it, so
+/// admission refuses the entry as `outside_container` and the id is not judged.
+fn expected_placement_id(map: &Map<String, Value>, unit: &str) -> Option<String> {
+    let instance = map
+        .get("container_instance")
+        .map_or(Some(1), json_integer)?;
+    let position = map.get("position");
+    let mut ticks = [0_i64; 3];
+    for (tick, axis) in ticks.iter_mut().zip(AXES) {
+        if let Some(value) = position.and_then(|position| position.get(axis)) {
+            let exact = coordinate_ticks(value, unit)?;
+            if exact > i128::from(MAX_EXACT_MAGNITUDE) {
+                return None;
+            }
+            *tick = i64::try_from(exact).ok()?;
+        }
+    }
+    Some(placement_id(
+        &format!("{}#{instance}", map["container_type"].as_str()?),
+        Point {
+            x: ticks[0],
+            y: ticks[1],
+            z: ticks[2],
+        },
+        map["item_type"].as_str()?,
+        map["orientation"].as_str()?,
+    ))
+}
+
+/// A fixed orientation from its item's vocabulary (1.10): an unknown code is `malformed` with
+/// the vocabulary listed -- six codes for a box, byte-identical to every release before -- and
+/// a signed code fixing a non-hull is `invalid_value`. Whether the item allows it is
+/// `require_known`'s rule. O(1).
+fn orientation_fault(
+    orientation: &Value,
+    map: &Map<String, Value>,
+    place: &str,
+    field: &str,
+    hull_types: &BTreeSet<&str>,
+) -> Option<Fault> {
+    let hull = map["item_type"]
+        .as_str()
+        .is_some_and(|item_type| hull_types.contains(item_type));
+    let (reason, detail) = orientation_refusal(orientation, hull, &format!("{place}.orientation"))?;
+    Some(Fault {
+        reason: if reason == "not_allowed" {
+            "malformed"
+        } else {
+            reason
+        },
+        detail,
+        field: format!("{field}/orientation"),
+    })
 }
 
 /// Why `point` is not an object of `x`, `y` and `z` measures, if it is not. Units, and what
@@ -192,7 +297,7 @@ fn coordinate_ticks(value: &Value, unit: &str) -> Option<i128> {
 }
 
 fn malformed(fault: Fault) -> PackError {
-    RequestError::fixed_placement("malformed", fault.field, fault.detail).into()
+    RequestError::fixed_placement(fault.reason, fault.field, fault.detail).into()
 }
 
 /// The keys of `map` outside `allowed`, sorted by code point as every engine sorts them.
@@ -217,6 +322,10 @@ pub(crate) fn admit(request: &PackingRequest) -> PackResult<Vec<PackedContainer>
     if request.fixed_placements.is_empty() {
         return Ok(Vec::new());
     }
+    for (index, entry) in request.fixed_placements.iter().enumerate() {
+        require_signed_on_a_hull(request, entry, index)?;
+        require_derived_placement_id(entry, index)?;
+    }
     for entry in &request.fixed_placements {
         require_known(request, entry)?;
     }
@@ -228,7 +337,7 @@ pub(crate) fn admit(request: &PackingRequest) -> PackResult<Vec<PackedContainer>
         .map(|((position, sequence), placements)| PackedContainer {
             container: request.containers[position].clone(),
             sequence,
-            placements: with_support_and_loads(placements),
+            placements: with_support_and_loads(placements, request.containers[position].deck),
             lattice_summary: None,
             lattice_items: Vec::new(),
         })
@@ -243,6 +352,59 @@ pub(crate) fn admit(request: &PackingRequest) -> PackResult<Vec<PackedContainer>
 /// A fixed set that is well formed but cannot hold as a packing on its own.
 fn refusal(detail: String) -> PackError {
     RequestError::fixed_placement("cannot_hold", "/fixed_placements", detail).into()
+}
+
+/// A library caller's fixed placement held to the JSON path's vocabulary rule (1.10): a
+/// signed orientation fixes only a hull, refused at its own pointer before any other
+/// admission rule, as the JSON shape check refuses it. O(items).
+fn require_signed_on_a_hull(
+    request: &PackingRequest,
+    entry: &FixedPlacement,
+    index: usize,
+) -> PackResult<()> {
+    let hull = request
+        .items
+        .iter()
+        .any(|item| item.id == entry.item_id && item.shape_type == ShapeType::ConvexHull);
+    if hull || !entry.rotation.is_signed() {
+        return Ok(());
+    }
+    Err(RequestError::fixed_placement(
+        "invalid_value",
+        format!("/fixed_placements/{index}/orientation"),
+        format!(
+            "fixed_placements[{index}].orientation: {}",
+            Rotation::SIGNED_NEEDS_A_HULL
+        ),
+    )
+    .into())
+}
+
+/// A library caller's `placement_id` held to the JSON path's rule (1.10): when given, it is
+/// the id the entry's result placement will carry. A coordinate past 2^53 - 1 is left to the
+/// `outside_container` refusal, as on the JSON path. O(1).
+fn require_derived_placement_id(entry: &FixedPlacement, index: usize) -> PackResult<()> {
+    let Some(reported) = &entry.placement_id else {
+        return Ok(());
+    };
+    let position = entry.position;
+    let farthest = position.x.max(position.y).max(position.z);
+    if i128::from(farthest) > i128::from(MAX_EXACT_MAGNITUDE) {
+        return Ok(());
+    }
+    let expected = entry.derived_placement_id();
+    if *reported == expected {
+        return Ok(());
+    }
+    Err(RequestError::fixed_placement(
+        "invalid_value",
+        format!("/fixed_placements/{index}/placement_id"),
+        format!(
+            "fixed_placements[{index}].placement_id must be {}",
+            json_spelling(&Value::String(expected))
+        ),
+    )
+    .into())
 }
 
 fn require_known(request: &PackingRequest, entry: &FixedPlacement) -> PackResult<()> {
@@ -388,10 +550,18 @@ fn require_contiguous_instances(
 ///
 /// Support is measured against every other fixed item in the container, not only the ones
 /// listed before it: the set is one arrangement, and listing order is not physics.
-fn with_support_and_loads(mut placements: Vec<Placement>) -> Vec<Placement> {
+fn with_support_and_loads(mut placements: Vec<Placement>, deck: Option<Deck>) -> Vec<Placement> {
     let graph = ContactGraph::from_placements(&placements);
     let ratios = (0..placements.len())
-        .map(|index| graph.support_ratio(&placements, index))
+        .map(|index| {
+            let box_ = placements[index].envelope_box();
+            if box_.origin.z == 0 {
+                // A pallet's floor bears weight on its deck alone.
+                floor_support(deck, box_).1
+            } else {
+                graph.support_ratio(&placements, index)
+            }
+        })
         .collect::<Vec<_>>();
     for (placement, ratio) in placements.iter_mut().zip(ratios) {
         placement.support_ratio = ratio;

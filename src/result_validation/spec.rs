@@ -5,15 +5,13 @@ use std::collections::BTreeSet;
 
 use super::MalformedResult;
 use super::container::ratio_ppm;
-use super::geometry::{Cuboid, ROTATIONS, Vertex};
+use super::geometry::{BOX_ROTATIONS, Cuboid, ROTATIONS, Vertex, is_upright};
 use super::json::{EMPTY_LIST, Json, Ordered, Res};
-use super::num::{Ratio, mul};
+use super::num::{Ratio, add, mul};
 use super::units::{LENGTH, WEIGHT, dimensions, ratio_of, to_ticks};
 
 /// The six axis-aligned exit directions a placement could be slid out through.
 pub(crate) const EXIT_DIRECTIONS: [&str; 6] = ["+x", "-x", "+y", "-y", "+z", "-z"];
-
-const UPRIGHT_ROTATIONS: [&str; 2] = ["LWH", "WLH"];
 
 #[derive(Clone, Debug)]
 pub(crate) struct ItemSpec {
@@ -98,8 +96,14 @@ pub(crate) struct ContainerSpec {
     pub(crate) rate_table: Json,
     pub(crate) access_directions: Vec<&'static str>,
     pub(crate) flat_bag: bool,
+    /// 1.10: a gusseted bag's side gusset depth G in ticks, which widens the width girth to
+    /// b + c <= W + G; 0 for a flat bag and every rigid container.
+    pub(crate) side_gusset: i128,
     pub(crate) reports_achieved_extent: bool,
     pub(crate) made_to_measure: Option<MachineSpec>,
+    /// The weight-bearing deck `(x, y, length, width)` inside a pallet's solving
+    /// frame, which `inner` then is; `None` for every other container.
+    pub(crate) deck: Option<[i128; 4]>,
 }
 
 impl ContainerSpec {
@@ -110,17 +114,22 @@ impl ContainerSpec {
 
 /// `ROTATIONS[orientation]`.
 pub(crate) fn rotation_axes(orientation: &str) -> Res<[usize; 3]> {
+    rotation_of(orientation).map(|(axes, _)| axes)
+}
+
+/// `(ROTATIONS[orientation], ROTATION_SIGNS[orientation])`: what a hull is turned by.
+pub(crate) fn rotation_of(orientation: &str) -> Res<([usize; 3], [i128; 3])> {
     ROTATIONS
         .iter()
-        .find(|(name, _)| *name == orientation)
-        .map(|(_, axes)| *axes)
+        .find(|(name, _, _)| *name == orientation)
+        .map(|(_, axes, signs)| (*axes, *signs))
         .ok_or_else(|| MalformedResult::shape(format!("unknown orientation {orientation:?}")))
 }
 
 /// `orientation in ROTATIONS`, for any JSON value; an unhashable one is Python's `TypeError`.
 pub(crate) fn is_rotation(orientation: &Json) -> Res<bool> {
     orientation.hash_key()?;
-    Ok(matches!(orientation, Json::Str(name) if ROTATIONS.iter().any(|(code, _)| code == name)))
+    Ok(matches!(orientation, Json::Str(name) if ROTATIONS.iter().any(|(code, _, _)| code == name)))
 }
 
 /// `frozenset(value)` of a request's tag list. The contract's tags are strings.
@@ -139,6 +148,28 @@ fn optional<T>(raw: &Json, key: &str, read: impl FnOnce(&Json) -> Res<T>) -> Res
     }
 }
 
+/// The codes an item may be placed in: its list, or the six legacy codes, narrowed to the
+/// upright ones under `keep_upright`. A signed code counts only on a hull -- the engines refuse
+/// it anywhere else -- so a box placed in one reads as a forbidden rotation (1.10).
+fn allowed_rotations(raw: &Json, keep_upright: bool) -> Res<Vec<Json>> {
+    let mut rotations = match raw.get_null("allowed_rotations")? {
+        Json::Null => BOX_ROTATIONS.map(Json::str_of).to_vec(),
+        listed => listed.list("allowed_rotations")?.to_vec(),
+    };
+    if !raw
+        .get("shape_type")?
+        .is_some_and(|shape| shape.is_str("convex_hull"))
+    {
+        rotations.retain(
+            |code| matches!(code, Json::Str(name) if BOX_ROTATIONS.contains(&name.as_str())),
+        );
+    }
+    if keep_upright {
+        rotations.retain(|code| matches!(code, Json::Str(name) if is_upright(name)));
+    }
+    Ok(rotations)
+}
+
 pub(crate) fn parse_items(request: &Json, unit: &str) -> Res<Ordered<ItemSpec>> {
     let mut items = Ordered::default();
     for (index, raw) in request
@@ -151,14 +182,12 @@ pub(crate) fn parse_items(request: &Json, unit: &str) -> Res<Ordered<ItemSpec>> 
         let keep_upright = raw.flag("keep_upright", false, &owner)?;
         let stackable = raw.flag("stackable", true, &owner)?;
         let must_be_on_floor = raw.flag("must_be_on_floor", false, &owner)?;
-        let rotations = match raw.get_null("allowed_rotations")? {
-            Json::Null if keep_upright => UPRIGHT_ROTATIONS.map(Json::str_of).to_vec(),
-            Json::Null => ROTATIONS
-                .iter()
-                .map(|(code, _)| Json::str_of(code))
-                .collect(),
-            listed => listed.list("allowed_rotations")?.to_vec(),
-        };
+        let rotations = allowed_rotations(raw, keep_upright)?;
+        if rotations.is_empty() {
+            return Err(MalformedResult::contract(format!(
+                "{owner}.allowed_rotations must allow at least one rotation after keep_upright"
+            )));
+        }
         let id = raw.at("id")?;
         let spec = ItemSpec {
             id: id.text("an item id")?.to_owned(),
@@ -223,9 +252,11 @@ pub(crate) fn parse_items(request: &Json, unit: &str) -> Res<Ordered<ItemSpec>> 
 pub(crate) fn parse_containers(request: &Json, unit: &str) -> Res<Ordered<ContainerSpec>> {
     let mut containers = Ordered::default();
     for raw in request.at("containers")?.list("request.containers")? {
+        let (inner, deck) =
+            frame_and_deck(dimensions(raw.at("inner_dimensions")?, unit)?, raw, unit)?;
         let spec = ContainerSpec {
             id: raw.at("id")?.clone(),
-            inner: dimensions(raw.at("inner_dimensions")?, unit)?,
+            inner,
             access_directions: access_directions(raw)?,
             outer: optional(raw, "outer_dimensions", |value| dimensions(value, unit))?,
             cost_minor: raw.get_or("cost_minor", &Json::Int(0))?.int("cost_minor")?,
@@ -258,15 +289,55 @@ pub(crate) fn parse_containers(request: &Json, unit: &str) -> Res<Ordered<Contai
             })?,
             rate_table: raw.get_null("rate_table")?.clone(),
             flat_bag: !raw.get_null("deformable_boundary")?.is_null(),
+            side_gusset: side_gusset(raw.get_null("deformable_boundary")?, unit)?,
             reports_achieved_extent: !raw.get_null("deformable_boundary")?.is_null()
-                || !raw.get_null("made_to_measure")?.is_null(),
+                || !raw.get_null("made_to_measure")?.is_null()
+                || deck.is_some(),
             made_to_measure: optional(raw, "made_to_measure", |machine| {
                 parse_machine(machine, unit)
             })?,
+            deck,
         };
         containers.insert(raw.at("id")?, spec)?;
     }
     Ok(containers)
+}
+
+/// A pallet's solving frame and the deck inside it, else the declared size.
+/// A gusseted bag's side gusset depth in ticks, else 0.
+fn side_gusset(boundary: &Json, unit: &str) -> Res<i128> {
+    if boundary.is_null() {
+        return Ok(0);
+    }
+    optional(boundary, "side_gusset_depth", |depth| {
+        to_ticks(depth, unit, LENGTH)
+    })
+    .map(Option::unwrap_or_default)
+}
+
+fn frame_and_deck(
+    declared: [i128; 3],
+    raw: &Json,
+    unit: &str,
+) -> Res<([i128; 3], Option<[i128; 4]>)> {
+    let Some((overhang_x, overhang_y)) = optional(raw, "pallet_overhang_limit", |limit| {
+        Ok((
+            to_ticks(limit.at("length")?, unit, LENGTH)?,
+            to_ticks(limit.at("width")?, unit, LENGTH)?,
+        ))
+    })?
+    else {
+        return Ok((declared, None));
+    };
+    let frame = [
+        add(declared[0], mul(2, overhang_x)?)?,
+        add(declared[1], mul(2, overhang_y)?)?,
+        declared[2],
+    ];
+    Ok((
+        frame,
+        Some([overhang_x, overhang_y, declared[0], declared[1]]),
+    ))
 }
 
 fn access_directions(raw: &Json) -> Res<Vec<&'static str>> {

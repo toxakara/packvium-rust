@@ -794,7 +794,7 @@ fn stacking_groups_make_the_block_solver_delegate() {
 /// docs/POLICY-RULES.md; the extreme-point search used to refuse one anyway.
 fn bleach_in_a_food_box(profile: &str, solvers: Value) -> Value {
     solve(json!({
-        "units": {"length": "mm", "weight": "kg"},
+        "units": {"length": "mm"},
         "configuration": {"solver_profile": profile, "solvers": solvers},
         "items": [
             {"id": "bleach", "weight": "1", "incompatible_tags": ["food"],
@@ -889,6 +889,15 @@ fn a_negative_seed_is_its_python_residue_and_never_the_default() {
         without_seed_echo(default)
     );
     assert_eq!(without_seed_echo(negative), without_seed_echo(residue));
+}
+
+/// A seed past `i64::MAX` is a JSON integer every engine reads, and only its residue
+/// modulo 2^31 steers the shuffle: `(2^64 - 1) % 2^31 == 2^31 - 1`.
+#[test]
+fn a_seed_past_i64_is_its_residue_and_never_the_default() {
+    let vast = seeded_mixed_load(json!(u64::MAX));
+    let residue = seeded_mixed_load(json!(2_147_483_647_i64));
+    assert_eq!(without_seed_echo(vast), without_seed_echo(residue));
 }
 
 /// (audit S10): with a clearance the axle-balanced origin is an envelope origin.

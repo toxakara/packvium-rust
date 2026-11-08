@@ -10,7 +10,7 @@ body:
     id: package-version
     attributes:
       label: Package and version
-      placeholder: "packvium 1.9.0 (Rust)"
+      placeholder: "packvium 1.10.0 (Rust)"
     validations:
       required: true
   - type: textarea

@@ -155,10 +155,6 @@ fn each_refused_combination_is_named() {
             json!({"obstacles": [{"id": "post", "dimensions": mm(10, 10, 10)}]}),
             "container.made_to_measure+obstacles",
         ),
-        (
-            json!({"void_fill_reserve_ratio": 0.5}),
-            "container.made_to_measure+void_fill_reserve_ratio",
-        ),
     ] {
         match pack_json(&request(extra, json!({})).to_string()) {
             Err(PackError::UnsupportedFeature(message)) => {
@@ -183,6 +179,8 @@ fn each_refused_combination_is_named() {
         json!({"obstacles": [], "void_fill_reserve_ratio": 0}),
         json!({}),
     ));
+    // A reserve is kept in the box that ships, no longer refused.
+    pack(&request(json!({"void_fill_reserve_ratio": 0.5}), json!({})));
 }
 
 #[test]
@@ -322,6 +320,7 @@ fn a_library_machine_is_held_to_the_rules_a_request_is() {
             output_length_unit: "mm".into(),
             output_weight_unit: "g".into(),
             catalog_versions_used: Vec::new(),
+            currency: None,
             fixed_placements: Vec::new(),
             fixed_containers: Vec::new(),
         })
@@ -336,5 +335,103 @@ fn a_library_machine_is_held_to_the_rules_a_request_is() {
     assert_eq!(
         result.containers[0].container.inner_dimensions,
         support::cube(side)
+    );
+}
+
+/// The result validator's codes for `result`, edited by `edit`, against `data`.
+fn validator_codes(data: &Value, result: &Value, edit: impl FnOnce(&mut Value)) -> Vec<String> {
+    let mut result = result.clone();
+    edit(&mut result);
+    packvium_core::validate_json(&data.to_string(), &result.to_string())
+        .expect("the result is readable")
+        .into_iter()
+        .map(|issue| issue.code)
+        .collect()
+}
+
+fn side_ticks(mm: i64) -> Value {
+    json!({"ticks": mm * 16_000, "unit": "mm", "value": mm.to_string()})
+}
+
+#[test]
+fn a_reserve_the_tight_box_breaks_is_kept_by_cutting_the_rung() {
+    // 8 cubes of 1e6 mm^3 under half a reserve: the tight 210 mm box holds 4.63e6 usable, so
+    // the trial cuts the 260 mm rung it was solved in instead.
+    let data = request(
+        json!({"void_fill_reserve_ratio": 0.5}),
+        json!({"solver_profile": "balanced"}),
+    );
+    let result = pack(&data);
+    let packed = &result["containers"][0];
+    assert_eq!(value(&packed["inner_dimensions"], "length"), "260");
+    assert_eq!(value(&packed["outer_dimensions"], "length"), "263");
+    assert_eq!(value(&packed["achieved_dimensions"], "length"), "200");
+    assert!(validator_codes(&data, &result, |_| {}).is_empty());
+    // A larger box on the grid is still a reserve cut: only what it then prices is wrong.
+    let larger = validator_codes(&data, &result, |result| {
+        result["containers"][0]["inner_dimensions"]["length"] = side_ticks(285);
+    });
+    assert!(
+        !larger.contains(&"fabricated_dimensions_mismatch".to_owned()),
+        "{larger:?}"
+    );
+    // Off the grid, or past the machine, it is not.
+    for side in [261, 1535] {
+        let codes = validator_codes(&data, &result, |result| {
+            result["containers"][0]["inner_dimensions"]["length"] = side_ticks(side);
+        });
+        assert!(
+            codes.contains(&"fabricated_dimensions_mismatch".to_owned()),
+            "{side}: {codes:?}"
+        );
+    }
+    // Without a reserve, or with a used volume the tight box holds, the tight box is the cut.
+    let mut unreserved = data.clone();
+    unreserved["containers"][0]["void_fill_reserve_ratio"] = json!(0);
+    let codes = validator_codes(&unreserved, &result, |_| {});
+    assert!(
+        codes.contains(&"fabricated_dimensions_mismatch".to_owned()),
+        "{codes:?}"
+    );
+    let codes = validator_codes(&data, &result, |result| {
+        result["containers"][0]["used_volume_ticks3"] = json!("1");
+    });
+    assert!(
+        codes.contains(&"fabricated_dimensions_mismatch".to_owned()),
+        "{codes:?}"
+    );
+    let codes = validator_codes(&data, &result, |result| {
+        result["containers"][0]["used_volume_ticks3"] = json!(1);
+    });
+    assert!(
+        codes.contains(&"fabricated_dimensions_mismatch".to_owned()),
+        "{codes:?}"
+    );
+}
+
+#[test]
+fn the_reserve_fixture_validates_and_scores_its_golden() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../../conformance");
+    // A Linux gate copies only conformance/scene/, so the directory alone proves nothing.
+    if !root.join("fixtures").is_dir() {
+        eprintln!(
+            "skipping shared reserve golden comparison: the corpus lives in the workspace only"
+        );
+        return;
+    }
+    let read = |kind: &str| -> Value {
+        let path = root
+            .join(kind)
+            .join("feature-made-to-measure-void-fill-reserve.json");
+        serde_json::from_str(&std::fs::read_to_string(path).expect("the file exists"))
+            .expect("the file is JSON")
+    };
+    let (fixture, golden) = (read("fixtures"), read("golden"));
+    let result = pack(&fixture);
+    assert!(validator_codes(&fixture, &result, |_| {}).is_empty());
+    assert_eq!(result["score"], golden["score"]);
+    assert_eq!(
+        result["containers"][0]["inner_dimensions"],
+        golden["containers"][0]["inner_dimensions"]
     );
 }

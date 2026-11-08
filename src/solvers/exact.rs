@@ -36,6 +36,12 @@ pub fn pack_exact_one(
             .containers
             .iter()
             .any(|container| container.made_to_measure.is_some())
+        // A pallet's answer is the deck-first trial's, which tries the deck before the
+        // overhang; a search of the frame alone overhangs a load the deck holds.
+        || request
+            .containers
+            .iter()
+            .any(|container| container.deck.is_some())
     {
         return None;
     }
@@ -231,6 +237,7 @@ pub fn pack_exact_one(
             optimality: None,
             objective: request.config.objective.clone(),
             catalog_versions_used: Vec::new(),
+            currency: None,
         };
 
         let replace = best_result.as_ref().is_none_or(|best| {
@@ -336,10 +343,7 @@ fn exact_item_profile(
 pub(super) fn occupied_item_volume(item: &Item) -> i128 {
     if item.shape_type == ShapeType::ConvexHull
         && let Some(vertices) = &item.hull_vertices
-        && let Some(shape) = crate::hull::shape_for(
-            vertices,
-            crate::hull::source_axes(crate::geometry::Rotation::Lwh),
-        )
+        && let Some(shape) = crate::hull::shape_for(vertices, crate::geometry::Rotation::Lwh)
     {
         return shape.volume;
     }
@@ -1311,6 +1315,77 @@ mod tests {
         let result = exact(&request, &stepping(60_000)).expect("an answer");
         assert!(result.containers.is_empty());
         assert_eq!(result.unpacked.len(), 2);
+    }
+
+    #[test]
+    fn a_search_that_finished_before_the_clock_passed_reads_the_deadline_but_keeps_its_reasons() {
+        // `time_limit_reached` says the deadline was past when the start ended, as
+        // `global_deadline_reached` (which requires it) does in every engine; it does not say
+        // the clock cut work. Here a search that finished every container keeps `best_found`
+        // and the reason it proved, `exact_search_incomplete`, never a `time_limit`.
+        let request = cubes(
+            4,
+            serde_json::json!([crate_of("short", "20"), crate_of("long", "30")]),
+        );
+        let finished_late = (2..400)
+            .filter_map(|limit_ms| exact(&request, &stepping(limit_ms)))
+            .find(|result| {
+                result.algorithm.time_limit_reached
+                    && result.status != crate::model::PackingStatus::TimeLimit
+            })
+            .expect("some limit falls between the last container's end and the final clock read");
+        assert_eq!(finished_late.status, crate::model::PackingStatus::BestFound);
+        assert!(
+            finished_late
+                .unpacked
+                .iter()
+                .all(|item| item.reason == "exact_search_incomplete")
+        );
+    }
+
+    #[test]
+    fn wherever_the_clock_runs_out_every_cut_off_item_is_named_a_time_limit() {
+        // Each clock read advances a millisecond, so sweeping the limit stops the search at
+        // every point it reads the clock: inside the candidate loop, at a container's end and
+        // between containers.
+        let request = cubes(
+            4,
+            serde_json::json!([crate_of("short", "20"), crate_of("long", "30")]),
+        );
+        let mut cut_off = 0;
+        for limit_ms in 2..400 {
+            let Some(result) = exact(&request, &stepping(limit_ms)) else {
+                continue;
+            };
+            assert_eq!(result.unpacked.len() + result.packed_item_count(), 4);
+            // A search that finished every container before the clock ran out keeps its own
+            // reasons even when the final clock read is past the limit.
+            if result.status != crate::model::PackingStatus::TimeLimit {
+                continue;
+            }
+            cut_off += 1;
+            assert!(result.algorithm.time_limit_reached);
+            assert!(!result.algorithm.effort_limit_reached);
+            assert!(
+                result
+                    .unpacked
+                    .iter()
+                    .all(|item| item.reason == "time_limit"),
+                "{limit_ms}: {:?}",
+                result.unpacked
+            );
+        }
+        assert!(cut_off > 0);
+    }
+
+    #[test]
+    fn an_empty_problem_floors_at_the_empty_answer() {
+        let request = cubes(1, serde_json::json!([crate_of("box", "20")]));
+        let empty = ContainerState::new(request.containers[0].clone(), 1);
+        assert_eq!(
+            optimistic_completion_score(&empty, &[], &[], &request.config),
+            score_solution(&[], &[], &request.config)
+        );
     }
 
     #[test]

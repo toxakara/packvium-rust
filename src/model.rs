@@ -1,9 +1,11 @@
 use std::rc::Rc;
 
+use crate::canonical_json;
 use crate::compression;
 use crate::geometry::{Aabb, Dimensions, Point, Rotation, ShapeType};
 use crate::hull::{self, HullShape, Vertex};
 use crate::made_to_measure::MadeToMeasure;
+use crate::pallet_overhang::{Deck, OverhangLimit};
 use crate::units::{Length, Weight};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -205,7 +207,7 @@ impl Placement {
             return None;
         }
         let vertices = item.hull_vertices.as_ref()?;
-        hull::shape_for(vertices, hull::source_axes(self.rotation))
+        hull::shape_for(vertices, self.rotation)
     }
 }
 
@@ -224,7 +226,7 @@ pub fn occupied_volume(placement: &Placement) -> i128 {
     let item = &placement.instance.item;
     if item.shape_type == ShapeType::ConvexHull
         && let Some(vertices) = &item.hull_vertices
-        && let Some(shape) = hull::shape_for(vertices, hull::source_axes(placement.rotation))
+        && let Some(shape) = hull::shape_for(vertices, placement.rotation)
     {
         // A route or clearance may make collision use the conservative envelope. Physical
         // volume remains the authored hull and must not inherit that collision fallback.
@@ -517,6 +519,9 @@ pub struct RateTable {
     pub prices_minor: Vec<i64>,
     pub minimum_charge_minor: i64,
     pub fuel_surcharge_permille: i64,
+    /// The ISO 4217 code the prices are in, when the table states one; admission holds it
+    /// equal to the request's currency. It never enters the charge.
+    pub currency: Option<String>,
 }
 
 impl RateTable {
@@ -588,6 +593,11 @@ pub struct Container {
     /// Cut to measure by an on-demand box machine whose largest box is `inner_dimensions`
     ///. A packed result carries the fabricated box instead.
     pub made_to_measure: Option<MadeToMeasure>,
+    /// How far a load may pass this deck's edges (`pallet_overhang.rs`).
+    pub pallet_overhang_limit: Option<OverhangLimit>,
+    /// The deck inside a solving frame. Set only by the solving frame, which widens
+    /// `inner_dimensions` to the frame and drops the limit, so a frame is never widened twice.
+    pub deck: Option<Deck>,
 }
 
 /// How a deformable container conforms to its contents.
@@ -599,9 +609,25 @@ pub struct Container {
 /// package's cross-section is at least as long as that section's perimeter. The extents only
 /// grow as boxes are added, so a verdict never flips and any subset of an admitted set is
 /// admitted (docs/DEFORMABLE-CONTAINERS.md).
+///
+/// `GussetedBag` (1.10) has side gussets of depth `G` folded into each long edge: the tube
+/// round the package's `y-z` section is `2(W + G)` long instead of `2W`, so the width sum
+/// becomes `b + c <= W + G`. The length sum is unchanged (no bottom gusset in 1.10), and
+/// `G = 0` would be the flat bag. `G` is positive and at most `W`, which `pack` checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeformableBoundary {
     FlatBag,
+    GussetedBag { side_gusset_depth: Length },
+}
+
+impl DeformableBoundary {
+    /// The side gusset depth `G` in ticks; 0 for a flat bag.
+    pub fn side_gusset_ticks(self) -> i64 {
+        match self {
+            Self::FlatBag => 0,
+            Self::GussetedBag { side_gusset_depth } => side_gusset_depth.0,
+        }
+    }
 }
 
 impl Container {
@@ -633,20 +659,46 @@ impl Container {
             preloaded: Vec::new(),
             deformable_boundary: None,
             made_to_measure: None,
+            pallet_overhang_limit: None,
+            deck: None,
         }
     }
 
+    /// The inner size the caller declared: a solving frame's deck, else `inner_dimensions`.
+    pub fn declared_inner(&self) -> Dimensions {
+        match self.deck {
+            None => self.inner_dimensions,
+            Some(deck) => Dimensions {
+                length: Length(deck.length),
+                width: Length(deck.width),
+                height: self.inner_dimensions.height,
+            },
+        }
+    }
+
+    /// Whether this container is a bag of either kind: its boundary conforms to its contents.
     pub fn is_flat_bag(&self) -> bool {
-        self.deformable_boundary == Some(DeformableBoundary::FlatBag)
+        self.deformable_boundary.is_some()
+    }
+
+    /// The width girth limit `W + G` (`W` for a flat bag); computed once per search so the
+    /// per-candidate check stays two additions and two comparisons. `O(1)`.
+    pub fn girth_width_limit(&self) -> i64 {
+        let gusset = self
+            .deformable_boundary
+            .map_or(0, DeformableBoundary::side_gusset_ticks);
+        self.inner_dimensions.width.0.saturating_add(gusset)
     }
 
     /// Whether a package of these extents passes both girth sums; the frame is the caller's.
     /// Always true for a rigid container. Coordinates are `i64`, so the sums need no wider type.
     pub fn girth_admits(&self, extent: [i64; 3]) -> bool {
-        let [a, b, c] = extent;
         !self.is_flat_bag()
-            || (a.saturating_add(c) <= self.inner_dimensions.length.0
-                && b.saturating_add(c) <= self.inner_dimensions.width.0)
+            || girth_within(
+                extent,
+                self.inner_dimensions.length.0,
+                self.girth_width_limit(),
+            )
     }
 
     /// Whether one box of these dimensions, alone at the origin, fits this container empty.
@@ -654,6 +706,12 @@ impl Container {
         dimensions.fits_inside(self.inner_dimensions)
             && self.girth_admits([dimensions.length.0, dimensions.width.0, dimensions.height.0])
     }
+}
+
+/// `a + c <= length_limit` and `b + c <= width_limit`: the two girth sums against limits the
+/// caller computed once (`girth_width_limit`). `O(1)`.
+pub(crate) fn girth_within([a, b, c]: [i64; 3], length_limit: i64, width_limit: i64) -> bool {
+    a.saturating_add(c) <= length_limit && b.saturating_add(c) <= width_limit
 }
 
 /// `[max x2, max y2, max z2]` over the envelopes, `[0, 0, 0]` for none. `O(p)`.
@@ -681,12 +739,49 @@ pub struct FixedPlacement {
     pub container_instance: usize,
     pub position: Point,
     pub rotation: Rotation,
+    /// Optional restatement of the placement's id, as a result reports it; when given it must
+    /// equal [`FixedPlacement::derived_placement_id`] (1.10).
+    pub placement_id: Option<String>,
 }
 
 impl FixedPlacement {
     pub fn packed_container_id(&self) -> String {
         format!("{}#{}", self.container_id, self.container_instance)
     }
+
+    /// The `placement_id` the result placement of this entry carries.
+    pub fn derived_placement_id(&self) -> String {
+        placement_id(
+            &self.packed_container_id(),
+            self.position,
+            &self.item_id,
+            self.rotation.as_str(),
+        )
+    }
+}
+
+/// A placement's cross-language id (1.10): the RFC 8785 canonical JSON text of
+/// `[container id, x, y, z, item type, orientation]`, with the physical position in ticks.
+/// Two valid placements never share that tuple -- the same solid in the same place would
+/// coincide -- and canonical JSON spells any id with no grammar of its own to escape. A
+/// position is below its container's side, itself at most 2^53 - 1 ticks, so `i64`'s decimal
+/// is the canonical spelling; a Rust string holds no lone surrogate, so none needs escaping.
+/// O(length of the ids).
+pub(crate) fn placement_id(
+    container_id: &str,
+    position: Point,
+    item_type: &str,
+    orientation: &str,
+) -> String {
+    let mut id = String::with_capacity(container_id.len() + item_type.len() + 48);
+    id.push('[');
+    canonical_json::write_string(container_id, &mut id);
+    id.push_str(&format!(",{},{},{},", position.x, position.y, position.z));
+    canonical_json::write_string(item_type, &mut id);
+    id.push(',');
+    canonical_json::write_string(orientation, &mut id);
+    id.push(']');
+    id
 }
 
 #[derive(Clone, Debug)]
@@ -697,6 +792,8 @@ pub struct PackingRequest {
     pub output_length_unit: String,
     pub output_weight_unit: String,
     pub catalog_versions_used: Vec<Value>,
+    /// The ISO 4217 code the request's money is in, echoed on the result; never scored.
+    pub currency: Option<String>,
     /// Items already in a known place before the solve, as the request states them.
     pub fixed_placements: Vec<FixedPlacement>,
     /// `fixed_placements` resolved by admission: the containers they name, in opening
@@ -1067,8 +1164,12 @@ impl PackedContainer {
 
     /// The largest envelope `x2`, `y2` and `z2` of its placements: a flat bag's conformed
     /// package, or a made-to-measure box's extent before it is rounded onto the
-    /// machine grid; `None` for any other container. `O(p)`.
+    /// machine grid; a pallet's deck grown by the overhang it used, at its load's
+    /// height; `None` for any other container. `O(p)`.
     pub fn achieved_dimensions(&self) -> Option<Dimensions> {
+        if let Some(deck) = self.container.deck {
+            return Some(deck.achieved_dimensions(&self.placements));
+        }
         (self.container.is_flat_bag() || self.container.made_to_measure.is_some()).then(|| {
             let [a, b, c] = envelope_extent(&self.placements);
             Dimensions {
@@ -1079,8 +1180,12 @@ impl PackedContainer {
         })
     }
 
-    /// What a carrier measures: a bag's achieved package, else the declared outer size.
+    /// What a carrier measures: a bag's achieved package, a pallet's footprint grown by its
+    /// overhang, else the declared outer size.
     pub fn billed_dimensions(&self) -> Dimensions {
+        if let Some(deck) = self.container.deck {
+            return deck.billed_dimensions(&self.container, &self.placements);
+        }
         let achieved = self
             .container
             .is_flat_bag()
@@ -1093,13 +1198,16 @@ impl PackedContainer {
     }
 
     /// Turns an already-packed container into an item for multi-level nesting.
+    ///
+    /// The item stays upright -- turned only about the vertical axis -- as Python's and
+    /// PHP's `as_item` keep it: a packed carton is not laid on its side.
     pub fn as_item(&self) -> Item {
         Item {
             id: self.id(),
             dimensions: self.billed_dimensions(),
             weight: self.gross_weight(),
             quantity: 1,
-            allowed_rotations: Rotation::ALL.to_vec(),
+            allowed_rotations: Rotation::UPRIGHT.to_vec(),
             stackable: true,
             must_be_on_floor: false,
             max_top_load: None,
@@ -1775,6 +1883,8 @@ pub struct PackingResult {
     pub optimality: Option<ResultFact>,
     pub objective: String,
     pub catalog_versions_used: Vec<Value>,
+    /// The request's currency, echoed; absent when the request declared none.
+    pub currency: Option<String>,
 }
 
 impl PackingResult {
@@ -1917,6 +2027,10 @@ impl PackingResult {
             "warnings": self.warnings.clone(),
             "alternatives": Value::Null,
         });
+        // Absent unless the request declared one, so every other request keeps its bytes.
+        if let Some(currency) = &self.currency {
+            document["currency"] = Value::from(currency.clone());
+        }
         document["unpacked_items"] = Value::Array(
             self.unpacked
                 .iter()
@@ -1937,11 +2051,18 @@ impl PackingResult {
 
 /// One packed container as JSON.
 fn container_json(packed: &PackedContainer, length_unit: &str, weight_unit: &str) -> Value {
+    let container_id = packed.id();
     let placements = packed
         .placements
         .iter()
         .map(|placement| {
             let mut serialized = serde_json::json!({
+                "placement_id": placement_id(
+                    &container_id,
+                    placement.position,
+                    &placement.instance.item.id,
+                    placement.rotation.as_str(),
+                ),
                 "item_id": placement.instance.id(),
                 "item_type": placement.instance.item.id.clone(),
                 "position": placement.position.to_json(length_unit),
@@ -1960,13 +2081,14 @@ fn container_json(packed: &PackedContainer, length_unit: &str, weight_unit: &str
         .collect::<Vec<_>>();
 
     let mut serialized = serde_json::json!({
-        "id": packed.id(),
+        "id": container_id,
         "container_type": packed.container.id.clone(),
-        "inner_dimensions": packed.container.inner_dimensions.to_json(length_unit),
+        // A pallet reports the size it was declared at, not its solving frame.
+        "inner_dimensions": packed.container.declared_inner().to_json(length_unit),
         "outer_dimensions": packed
             .container
             .outer_dimensions
-            .unwrap_or(packed.container.inner_dimensions)
+            .unwrap_or_else(|| packed.container.declared_inner())
             .to_json(length_unit),
         "payload_weight": packed.payload_weight().to_json(weight_unit),
         "gross_weight": packed.gross_weight().to_json(weight_unit),
@@ -2328,6 +2450,116 @@ mod tests {
             occupied_volume(&placement),
             SIDE as i128 * SIDE as i128 * SIDE as i128 / 2
         );
+    }
+
+    /// A load too heavy to express as a pressure, and a ratio the boundary never admits,
+    /// both leave the item at its uncompressed box rather than at a wrapped height.
+    #[test]
+    fn an_unmeasurable_compression_reports_the_uncompressed_volume() {
+        let mut overloaded = placed(compressible_cube(250_000, 100), (0, 0, 0));
+        overloaded.top_load = Weight(i64::MAX);
+        assert_eq!(occupied_volume(&overloaded), overloaded.dimensions.volume());
+        let mut out_of_range = placed(compressible_cube(2_000_000, 100), (0, 0, 0));
+        out_of_range.top_load = Weight(Weight::TICKS_PER_KG);
+        assert_eq!(
+            occupied_volume(&out_of_range),
+            out_of_range.dimensions.volume()
+        );
+    }
+
+    fn trailer(axles: Option<[Axle; 2]>, tare: Weight) -> Container {
+        Container {
+            id: "trailer".into(),
+            inner_dimensions: Dimensions {
+                length: Length(SIDE * 10),
+                width: Length(SIDE),
+                height: Length(SIDE),
+            },
+            outer_dimensions: None,
+            tare_weight: tare,
+            max_payload: None,
+            cost_minor: 0,
+            quantity: None,
+            obstacles: Vec::new(),
+            tags: BTreeSet::new(),
+            max_items: None,
+            metadata: BTreeMap::new(),
+            axles,
+            void_fill_reserve_ppm: 0,
+            tag_limits: BTreeMap::new(),
+            max_stack_density: None,
+            rate_table: None,
+            access_directions: Vec::new(),
+            preloaded: Vec::new(),
+            deformable_boundary: None,
+            made_to_measure: None,
+            pallet_overhang_limit: None,
+            deck: None,
+        }
+    }
+
+    /// Axles at both ends of the deck, the front one limited to `front_limit` ticks.
+    fn axles(front_limit: i64) -> Option<[Axle; 2]> {
+        Some([
+            Axle {
+                position: Length(0),
+                max_load: Some(Weight(front_limit)),
+            },
+            Axle {
+                position: Length(SIDE * 10),
+                max_load: None,
+            },
+        ])
+    }
+
+    /// The candidate box `axle_overloaded` is asked about weighs on the axles exactly as the
+    /// incremental `AxleBase` check says it does, at the front of the deck and at the back.
+    #[test]
+    fn a_candidate_box_loads_the_axles_as_the_incremental_check_does() {
+        let container = trailer(axles(400), Weight(0));
+        let base = AxleBase::new(&container, &[]).expect("axles");
+        for (x, overloaded) in [(0, true), (SIDE * 9, false)] {
+            let candidate = cube_at((x, 0, 0), SIDE);
+            assert_eq!(
+                axle_overloaded(&container, &[], Some((Weight(1_000), candidate))),
+                overloaded,
+                "at {x}"
+            );
+            assert_eq!(base.overloaded(Weight(1_000), candidate), overloaded);
+        }
+    }
+
+    #[test]
+    fn without_axles_no_origin_is_balanced_and_any_item_that_fits_is_admitted() {
+        let flat = trailer(None, Weight(0));
+        assert!(axle_balanced_origins(&flat, &[], Weight(1_000), SIDE).is_empty());
+        assert!(axle_admits_alone(&flat, Weight(1_000), SIDE));
+        assert!(!axle_admits_alone(&flat, Weight(1_000), SIDE * 11));
+    }
+
+    /// A weightless item changes no reaction, so whether it is admitted alone is whether the
+    /// empty container's tare already overloads an axle.
+    #[test]
+    fn a_weightless_item_is_admitted_alone_unless_the_tare_overloads_an_axle() {
+        assert!(axle_admits_alone(
+            &trailer(axles(400), Weight(100)),
+            Weight(0),
+            SIDE
+        ));
+        assert!(!axle_admits_alone(
+            &trailer(axles(400), Weight(1_000)),
+            Weight(0),
+            SIDE
+        ));
+    }
+
+    #[test]
+    fn a_nested_pair_that_only_touches_shares_no_space() {
+        let lower = placed(item("cup", ShapeType::RigidCuboid, None), (0, 0, 0));
+        let touching = placed(item("cup", ShapeType::RigidCuboid, None), (0, 0, SIDE));
+        assert_eq!(nested_overlap(&lower, &touching), 0);
+        let sunk = placed(item("cup", ShapeType::RigidCuboid, None), (0, 0, SIDE - 30));
+        assert_eq!(nested_overlap(&lower, &sunk), 30 * i128::from(SIDE * SIDE));
     }
 
     #[test]

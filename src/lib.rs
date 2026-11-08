@@ -19,6 +19,7 @@ mod hull;
 mod made_to_measure;
 mod model;
 mod nested;
+mod pallet_overhang;
 mod policy;
 mod rebalance;
 mod request_errors;
@@ -48,7 +49,10 @@ pub use model::{
     PackingStatus, Placement, ReasonProof, RejectionObservation, ResultFact, SolverMetrics,
     SolverProfile, StartRecord, UnpackedItem, aggregate_termination,
 };
-pub use nested::{NestedLevel, NestedPackingRequest, NestedPackingResult, pack_nested};
+pub use nested::{
+    NestedLevel, NestedPackingRequest, NestedPackingResult, pack_nested, pack_nested_with,
+};
+pub use pallet_overhang::{Deck, OverhangLimit};
 pub use policy::{PolicyConstraint, PolicyRule, PolicyRuleSet, RuleForm, ShipmentContext};
 pub use rebalance::{RebalanceResult, WeightMove, rebalance_weight};
 pub use result_validation::{

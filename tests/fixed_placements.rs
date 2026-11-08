@@ -394,6 +394,8 @@ fn domain(quantity: usize, weight_g: i64, boxes: usize) -> PackingRequest {
         preloaded: Vec::new(),
         deformable_boundary: None,
         made_to_measure: None,
+        pallet_overhang_limit: None,
+        deck: None,
     };
     PackingRequest {
         items: vec![item],
@@ -405,6 +407,7 @@ fn domain(quantity: usize, weight_g: i64, boxes: usize) -> PackingRequest {
         output_length_unit: "mm".into(),
         output_weight_unit: "g".into(),
         catalog_versions_used: Vec::new(),
+        currency: None,
         fixed_placements: Vec::new(),
         fixed_containers: Vec::new(),
     }
@@ -421,6 +424,7 @@ fn at(x: i64, y: i64, z: i64, instance: usize) -> FixedPlacement {
             z: z * MM,
         },
         rotation: Rotation::Lwh,
+        placement_id: None,
     }
 }
 

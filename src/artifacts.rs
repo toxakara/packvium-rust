@@ -190,7 +190,9 @@ fn build_artifact(request: &Value, result: &Value, orders: &Value) -> ArtifactRe
             "loading orders are a JSON object keyed by container index",
         ));
     }
-    let plan = execution::build_plan(result, orders)
+    // v1 is closed and its plan predates `placement_id` (1.10); the id is recoverable from
+    // what v1 carries (docs/OPERATIONAL-ARTIFACTS.md).
+    let plan = execution::build_plan(result, orders, execution::PlacementIds::Omitted)
         .map_err(|error| ArtifactError::new(ArtifactErrorCode::InvalidPlanInput, error.0))?;
 
     let containers = list(result.get("containers"), "result.containers")?;

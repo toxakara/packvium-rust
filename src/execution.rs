@@ -123,6 +123,37 @@ pub(crate) fn placement_reference(container_index: usize, placement: &Value) -> 
     }))
 }
 
+/// Whether a plan's placement references copy the result's `placement_id` (1.10). The
+/// operational artifact v1 is closed, so the plan it embeds omits them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlacementIds {
+    Copied,
+    Omitted,
+}
+
+/// `placement_reference` plus the result placement's `placement_id` (1.10), copied rather
+/// than derived, when the result carries one. A canonical projection (a golden) has no ids,
+/// so its plan keeps the bytes it always had.
+fn step_reference(
+    container_index: usize,
+    placement: &Value,
+    ids: PlacementIds,
+) -> PlanResult<Value> {
+    let mut reference = placement_reference(container_index, placement)?;
+    let identifier = match (ids, placement.get("placement_id")) {
+        (PlacementIds::Omitted, _) | (_, None) => return Ok(reference),
+        (PlacementIds::Copied, Some(identifier)) => identifier,
+    };
+    if identifier.as_str().is_none_or(str::is_empty) {
+        return fail(format!(
+            "placement_id {} is not a non-empty string",
+            value_text::repr(identifier)
+        ));
+    }
+    reference["placement_id"] = identifier.clone();
+    Ok(reference)
+}
+
 /// The operator sequence for one container, or an honest absence of one.
 ///
 /// The engines compute a loading order from geometry this adapter never sees, so it is
@@ -132,11 +163,12 @@ fn steps(
     container_index: usize,
     placements: &[Value],
     loading_order: Option<&[i64]>,
+    ids: PlacementIds,
 ) -> PlanResult<(String, Vec<Value>)> {
     let Some(order) = loading_order else {
         let mut listed = Vec::with_capacity(placements.len());
         for placement in placements {
-            listed.push(json!({"placement": placement_reference(container_index, placement)?}));
+            listed.push(json!({"placement": step_reference(container_index, placement, ids)?}));
         }
         return Ok(("unavailable".to_string(), listed));
     };
@@ -150,7 +182,7 @@ fn steps(
     for (step, index) in order.iter().enumerate() {
         ordered.push(json!({
             "sequence": step + 1,
-            "placement": placement_reference(container_index, &placements[*index as usize])?,
+            "placement": step_reference(container_index, &placements[*index as usize], ids)?,
         }));
     }
     Ok(("loading".to_string(), ordered))
@@ -255,7 +287,7 @@ pub fn build_plan_json(result_json: &str, loading_orders_json: &str) -> PlanResu
             ));
         }
     };
-    let plan = build_plan(&result, &orders)?;
+    let plan = build_plan(&result, &orders, PlacementIds::Copied)?;
     canonical_json::to_canonical_string(&plan).or_else(|error| {
         fail(format!(
             "the plan has no canonical spelling: {}",
@@ -268,7 +300,7 @@ pub fn build_plan_json(result_json: &str, loading_orders_json: &str) -> PlanResu
 ///
 /// O(P + U + A·S) for P placements, U unplaced items and A alternatives of S score terms, plus
 /// O(L log L) to check a loading order of length L is a permutation.
-pub(crate) fn build_plan(result: &Value, orders: &Value) -> PlanResult<Value> {
+pub(crate) fn build_plan(result: &Value, orders: &Value, ids: PlacementIds) -> PlanResult<Value> {
     if result.get("status").is_none_or(Value::is_null) {
         return fail("a result without a status is not a validated result");
     }
@@ -291,7 +323,7 @@ pub(crate) fn build_plan(result: &Value, orders: &Value) -> PlanResult<Value> {
             None | Some(Value::Null) => None,
             Some(value) => Some(loading_order(index, value, placements.len())?),
         };
-        let (kind, listed) = steps(index, placements, order.as_deref())?;
+        let (kind, listed) = steps(index, placements, order.as_deref(), ids)?;
         plan_containers.push(json!({
             "container_index": index,
             "facts": {

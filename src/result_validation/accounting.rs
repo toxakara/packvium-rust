@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 
 use super::Issue;
-use super::geometry::ROTATIONS;
+use super::geometry::BOX_ROTATIONS;
 use super::json::{EMPTY_STR, Json, Ordered, Res};
 use super::num::{add, mul};
 use super::pyfmt::{py_repr, py_str, str_repr};
@@ -196,15 +196,15 @@ pub(crate) fn check_accounting(
     Ok(())
 }
 
-/// Whether one envelope of this size fits the empty container: its frame and, for a flat bag,
-/// both girth sums with the envelope alone at the origin.
+/// Whether one envelope of this size fits the empty container: its frame and, for a bag, both
+/// girth sums with the envelope alone at the origin, the width one widened by a side gusset.
 pub(crate) fn fits_empty(container: &ContainerSpec, size: [i128; 3]) -> Res<bool> {
     if (0..3).any(|axis| size[axis] > container.inner[axis]) {
         return Ok(false);
     }
     Ok(!container.flat_bag
         || (add(size[0], size[2])? <= container.inner[0]
-            && add(size[1], size[2])? <= container.inner[1]))
+            && add(size[1], size[2])? <= add(container.inner[1], container.side_gusset)?))
 }
 
 /// `any(_fits_empty(container, rotated envelope) for container ... for rotation ...)`,
@@ -308,10 +308,7 @@ fn check_proven_reason(
     issues: &mut Vec<Issue>,
 ) -> Res<()> {
     let own = &spec.allowed_rotations;
-    let every: Vec<Json> = ROTATIONS
-        .iter()
-        .map(|(code, _)| Json::str_of(code))
-        .collect();
+    let every: Vec<Json> = BOX_ROTATIONS.map(Json::str_of).to_vec();
     let every = &every;
     let invalid = |detail: String| Issue::new("invalid_proven_reason", detail);
 

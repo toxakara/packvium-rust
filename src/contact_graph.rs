@@ -510,6 +510,31 @@ mod tests {
         assert_eq!(graph.children(0), &[1024]);
     }
 
+    /// A box of no height sits on its own top plane, and must not be found supporting
+    /// itself there; it still rests on what is below it and carries what is above it.
+    #[test]
+    fn a_flat_box_is_never_its_own_supporter() {
+        let mut flat = box_at(0, 0, 10);
+        flat.dimensions.height = Length(0);
+        let boxes = vec![box_at(0, 0, 0), flat, box_at(0, 0, 10)];
+        let graph = ContactGraph::new(&boxes);
+        assert_eq!(
+            graph.supporters(1),
+            [ContactEdge {
+                index: 0,
+                area: 100
+            }]
+        );
+        assert_eq!(
+            graph
+                .supporters(2)
+                .iter()
+                .map(|edge| edge.index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
     #[test]
     fn broad_phase_edges_match_an_exact_pairwise_scan() {
         let boxes = vec![

@@ -17,6 +17,7 @@
 //! headroom. Every product below is therefore plain `i128` and there is no second path to
 //! keep in step with the first.
 
+use crate::geometry::Rotation;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -134,14 +135,16 @@ impl HullShape {
 
 /// How many rotated hulls stay resident, before the memo is dropped and refilled.
 ///
-/// A request is bounded by its distinct hull items times the six orientations, so this holds
+/// A request is bounded by its distinct hull items times the orientations they allow (at most
+/// 24), so this holds
 /// far more than any request the solver is sized for. Bounded rather than growing for the
 /// life of the process: the point of the memo is to spend less, not to spend it elsewhere.
 const SHAPE_CACHE_ENTRIES: usize = 1024;
 
-/// An item's authored vertices with the orientation asked of them -- the whole of what
-/// determines a rotated hull, and therefore the memo's key.
-type ShapeKey = (Vec<Vertex>, [usize; 3]);
+/// An item's authored vertices with the orientation asked of them, as its table index -- the
+/// whole of what determines a rotated hull, and therefore the memo's key. The full code, not
+/// its permutation: four codes share each permutation and turn a hull four different ways.
+type ShapeKey = (Vec<Vertex>, usize);
 
 thread_local! {
     static SHAPE_CACHE: RefCell<BTreeMap<ShapeKey, Option<Rc<HullShape>>>> =
@@ -162,15 +165,13 @@ thread_local! {
 ///
 /// An `Rc` rather than a clone because the hot callers want a borrow: cloning three `Vec`s per
 /// collision test would hand back a good part of what the memo saves.
-pub fn shape_for(vertices: &[Vertex], source_axes: [usize; 3]) -> Option<Rc<HullShape>> {
-    let key = (vertices.to_vec(), source_axes);
+pub fn shape_for(vertices: &[Vertex], rotation: Rotation) -> Option<Rc<HullShape>> {
+    let key = (vertices.to_vec(), rotation.index());
     SHAPE_CACHE.with(|cache| {
         if let Some(found) = cache.borrow().get(&key) {
             return found.clone();
         }
-        let built = HullShape::of(&rotate(vertices, source_axes))
-            .ok()
-            .map(Rc::new);
+        let built = HullShape::of(&rotate(vertices, rotation)).ok().map(Rc::new);
         let mut cache = cache.borrow_mut();
         if cache.len() >= SHAPE_CACHE_ENTRIES {
             cache.clear();
@@ -224,44 +225,19 @@ pub fn validate(vertices: &[Vertex]) -> Result<Vec<Vertex>, DegenerateHull> {
     ))
 }
 
-/// Reorient a hull the way `Dimensions::rotated` reorients its box, never mirroring it.
+/// Reorient a hull by one of the 24 proper rotations, never mirroring it (1.10).
 ///
-/// Three of the six rotations are odd permutations of the coordinate axes. On a cuboid that is
-/// invisible; on a hull a bare permutation returns the item's mirror image, a shape the caller
-/// does not own. One axis therefore changes sign when the permutation is odd, which makes all
-/// six proper rotations. Vertices come back translated so the rotated hull's bounding box
-/// starts at the origin, which is the frame every placement position is expressed in.
-pub fn source_axes(rotation: crate::geometry::Rotation) -> [usize; 3] {
-    use crate::geometry::Rotation;
-    match rotation {
-        Rotation::Lwh => [0, 1, 2],
-        Rotation::Lhw => [0, 2, 1],
-        Rotation::Wlh => [1, 0, 2],
-        Rotation::Whl => [1, 2, 0],
-        Rotation::Hlw => [2, 0, 1],
-        Rotation::Hwl => [2, 1, 0],
-    }
-}
-
-pub fn rotate(vertices: &[Vertex], source_axes: [usize; 3]) -> Vec<Vertex> {
-    let mut inversions = 0;
-    for first in 0..3 {
-        for second in first + 1..3 {
-            if source_axes[first] > source_axes[second] {
-                inversions += 1;
-            }
-        }
-    }
-    let sign = if inversions % 2 == 1 { -1 } else { 1 };
+/// `v'[i] = s[i] * v[src[i]]` with the code's source axes and signs. A bare permutation would
+/// hand back the item's mirror image for an odd permutation -- a shape the caller does not
+/// own -- which is why the legacy odd codes negate x and every signed code has determinant
+/// +1. Vertices come back translated so the rotated hull's bounding box starts at the origin,
+/// which is the frame every placement position is expressed in. O(v).
+pub fn rotate(vertices: &[Vertex], rotation: Rotation) -> Vec<Vertex> {
+    let axes = rotation.source_axes();
+    let signs = rotation.signs();
     let turned: Vec<Vertex> = vertices
         .iter()
-        .map(|vertex| {
-            [
-                sign * vertex[source_axes[0]],
-                vertex[source_axes[1]],
-                vertex[source_axes[2]],
-            ]
-        })
+        .map(|vertex| std::array::from_fn(|axis| signs[axis] * vertex[axes[axis]]))
         .collect();
     let mut low = [i64::MAX; 3];
     for vertex in &turned {
@@ -560,6 +536,28 @@ mod tests {
     }
 
     #[test]
+    fn a_degenerate_hull_reads_as_its_reason() {
+        let error = validate(&cube(10)[..3]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("a convex hull needs at least {MINIMUM_VERTICES} vertices, got 3")
+        );
+    }
+
+    /// Past its bound the memo starts over rather than growing, and a shape asked for after
+    /// that is still the right shape.
+    #[test]
+    fn the_shape_memo_is_bounded_and_stays_correct_past_its_bound() {
+        for side in 1..=SHAPE_CACHE_ENTRIES as i64 + 1 {
+            let shape = shape_for(&cube(side), Rotation::Lwh).expect("a cube is a hull");
+            assert_eq!(shape.volume, i128::from(side).pow(3));
+        }
+        let held = SHAPE_CACHE.with(|cache| cache.borrow().len());
+        assert!(held < SHAPE_CACHE_ENTRIES, "{held} entries held");
+        assert_eq!(shape_for(&cube(2), Rotation::Lwh).unwrap().volume, 8);
+    }
+
+    #[test]
     fn the_documented_ten_tick_cube_boundary() {
         let shape = HullShape::of(&cube(10)).unwrap();
         assert!(collide(&shape, [0, 0, 0], &shape, [9, 0, 0]), "9 overlaps");
@@ -647,8 +645,9 @@ mod tests {
         assert!(!collide(&shape, [0, 0, 0], &shape, [2 * side, 0, 0]));
     }
 
-    /// A bare coordinate permutation would mirror the shape for three of the six rotations.
-    /// The signed volume of four of its vertices is the cheapest witness that none does.
+    /// A bare coordinate permutation would mirror the shape for three of the six legacy
+    /// rotations, and a wrong sign pattern for half the signed ones. The signed volume of four
+    /// of its vertices is the cheapest witness that none of the 24 does.
     #[test]
     fn every_rotation_keeps_the_wedge_a_wedge() {
         let source = wedge(10);
@@ -659,16 +658,13 @@ mod tests {
             )
         };
         let reference = signed(&source).signum();
-        for axes in [
-            [0, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
-        ] {
-            let turned = rotate(&source, axes);
-            assert_eq!(signed(&turned).signum(), reference, "{axes:?} mirrored it");
+        for rotation in Rotation::EVERY {
+            let turned = rotate(&source, rotation);
+            assert_eq!(
+                signed(&turned).signum(),
+                reference,
+                "{rotation:?} mirrored it"
+            );
         }
     }
 
@@ -741,10 +737,16 @@ mod tests {
             [12, 9, 0],
             [4, 3, 7],
         ];
-        for axes in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
-            let fresh = HullShape::of(&rotate(&vertices, axes)).unwrap();
-            let first = shape_for(&vertices, axes).expect("a valid hull");
-            let second = shape_for(&vertices, axes).expect("the same hull again");
+        for rotation in [
+            Rotation::Lwh,
+            Rotation::Hlw,
+            Rotation::Whl,
+            Rotation::NlNwPh,
+            Rotation::PlNwNh,
+        ] {
+            let fresh = HullShape::of(&rotate(&vertices, rotation)).unwrap();
+            let first = shape_for(&vertices, rotation).expect("a valid hull");
+            let second = shape_for(&vertices, rotation).expect("the same hull again");
             assert_eq!(*first, fresh);
             assert_eq!(*second, fresh);
         }

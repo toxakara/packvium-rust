@@ -10,7 +10,7 @@ use super::geometry::{Cuboid, Vertex, hull_volume, rotate_hull};
 use super::json::{Json, Ordered, Res, sort_py};
 use super::num::{Ratio, add, ceil_div, floor_div, mul, mul_div, sub};
 use super::pyfmt::{fixed6, list, py_repr, py_str};
-use super::spec::{EXIT_DIRECTIONS, ItemSpec, rotation_axes};
+use super::spec::{EXIT_DIRECTIONS, ItemSpec, is_rotation, rotation_of};
 use super::units::{TICKS_PER_KG, TICKS_PER_MM};
 use super::{Issue, Label};
 
@@ -228,6 +228,56 @@ pub(crate) fn check_support_and_load(
                     py_str(item_id),
                     descendants.len()
                 ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A floor placement on a pallet rests on its overlap with the deck alone, judged
+/// by the ratio and centre-of-gravity rule a supporting item would be. `O(p)`.
+pub(crate) fn check_deck_support(
+    envelopes: &Envelopes<'_>,
+    deck: [i128; 4],
+    global_support: Ratio,
+    issues: &mut Vec<Issue>,
+) -> Res<()> {
+    let [x, y, length, width] = deck;
+    let surface = Cuboid::new(x, y, -1, length, width, 1)?;
+    for (item_id, entry) in entries(envelopes) {
+        let Some(spec) = entry.spec else { continue };
+        let envelope = &entry.envelope;
+        if envelope.z != 0 {
+            continue;
+        }
+        let required = if global_support.compare(spec.minimum_support_ratio)? == Ordering::Less {
+            spec.minimum_support_ratio
+        } else {
+            global_support
+        };
+        if required.compare_int(0)? != Ordering::Greater {
+            continue;
+        }
+        let dx = sub(envelope.x2.min(add(x, length)?), envelope.x.max(x))?;
+        let dy = sub(envelope.y2.min(add(y, width)?), envelope.y.max(y))?;
+        let area = if dx > 0 && dy > 0 { mul(dx, dy)? } else { 0 };
+        let item_id = py_str(item_id);
+        if area < required_support_area(envelope.base_area, ratio_ppm(required))? {
+            let ratio = Ratio::new(area, envelope.base_area)?;
+            issues.push(Issue::new(
+                "insufficient_support",
+                format!(
+                    "{item_id}: {} < {} on the deck",
+                    fixed6(ratio.to_f64()),
+                    fixed6(required.to_f64())
+                ),
+            ));
+        } else if mul(area, 2)? <= envelope.base_area
+            && !centroid_supported(envelope, std::iter::once(&surface))?
+        {
+            issues.push(Issue::new(
+                "centre_of_gravity_unsupported",
+                format!("{item_id}: centroid outside the deck"),
             ));
         }
     }
@@ -670,8 +720,9 @@ pub(crate) fn occupied_volume(
         if spec.is_convex_hull()
             && let Some(vertices) = &spec.hull_vertices
         {
-            let axes = rotation_axes(placement.at("orientation")?.text("orientation")?)?;
-            return hull_volume(&rotate_hull(vertices, axes)?);
+            // A proper rotation keeps the volume, so the authored vertices answer for every
+            // orientation -- an unknown one included.
+            return hull_volume(vertices);
         }
     }
     let solid = placed_hull(entry_envelope, placement, spec)?;
@@ -698,7 +749,11 @@ pub(crate) fn placed_hull(
     if !spec.is_convex_hull() || spec.stop_index.is_some() {
         return Ok(envelope.vertices());
     }
-    let axes = rotation_axes(placement.at("orientation")?.text("orientation")?)?;
+    let orientation = placement.at("orientation")?;
+    if !is_rotation(orientation)? {
+        return Ok(envelope.vertices());
+    }
+    let (axes, signs) = rotation_of(orientation.text("orientation")?)?;
     let rotated = [
         spec.dimensions[axes[0]],
         spec.dimensions[axes[1]],
@@ -707,7 +762,7 @@ pub(crate) fn placed_hull(
     if [envelope.length, envelope.width, envelope.height] != rotated {
         return Ok(envelope.vertices());
     }
-    rotate_hull(vertices, axes)?
+    rotate_hull(vertices, axes, signs)?
         .into_iter()
         .map(|[x, y, z]| {
             Ok([

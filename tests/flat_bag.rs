@@ -151,6 +151,8 @@ fn bag_container() -> Container {
         preloaded: Vec::new(),
         deformable_boundary: Some(DeformableBoundary::FlatBag),
         made_to_measure: None,
+        pallet_overhang_limit: None,
+        deck: None,
     }
 }
 
@@ -185,7 +187,7 @@ fn a_malformed_bag_is_refused_with_its_pointer() {
             json!({"deformable_boundary": {"kind": "pouch"}}),
             "/deformable_boundary/kind",
             "not_allowed",
-            "must be one of [\"flat_bag\"]",
+            "must be one of [\"flat_bag\",\"gusseted_bag\"]",
         ),
         (
             json!({"deformable_boundary": {"kind": "flat_bag", "seam": 1}}),

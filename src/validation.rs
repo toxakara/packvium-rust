@@ -170,7 +170,20 @@ impl IndependentValidator {
                     .max(request.config.minimum_support_ratio);
                 let support_area = support_graph.support_area(index);
                 let base_area = placement.envelope_dimensions.base_area();
-                if !support_area_sufficient(
+                // A pallet's floor bears weight on its deck alone, by the same rule.
+                let deck_refusal = packed
+                    .container
+                    .deck
+                    .filter(|_| placement.envelope_origin.z == 0)
+                    .and_then(|deck| deck.refusal(placement.envelope_box(), required));
+                if let Some(code) = deck_refusal {
+                    let code = if code == "insufficient_support" {
+                        "support"
+                    } else {
+                        code
+                    };
+                    issue(&mut issues, code, &id);
+                } else if !support_area_sufficient(
                     placement.envelope_origin.z,
                     support_area,
                     base_area,
@@ -626,6 +639,8 @@ mod tests {
                 preloaded: Vec::new(),
                 deformable_boundary: None,
                 made_to_measure: None,
+                pallet_overhang_limit: None,
+                deck: None,
             },
             sequence: 1,
             placements,
@@ -642,6 +657,7 @@ mod tests {
             output_length_unit: "ticks".into(),
             output_weight_unit: "ticks".into(),
             catalog_versions_used: Vec::new(),
+            currency: None,
             fixed_placements: Vec::new(),
             fixed_containers: Vec::new(),
         };
@@ -658,6 +674,7 @@ mod tests {
             optimality: None,
             objective: "default".into(),
             catalog_versions_used: Vec::new(),
+            currency: None,
         };
         IndependentValidator.validate(&request, &result)
     }
@@ -696,6 +713,35 @@ mod tests {
         packed.placements[2].instance.item.incompatible_tags = ["alkali".into()].into();
         assert!(incompatibilities(packed).is_empty());
         assert!(incompatibilities(nested_container(3, None, None)).is_empty());
+    }
+
+    #[test]
+    fn validator_names_an_axle_the_gross_load_overloads() {
+        let axles = |front_limit: i64| {
+            Some([
+                crate::model::Axle {
+                    position: Length(0),
+                    max_load: Some(Weight(front_limit)),
+                },
+                crate::model::Axle {
+                    position: Length(10),
+                    max_load: None,
+                },
+            ])
+        };
+        let axle_issues = |front_limit: i64| {
+            let mut packed = nested_container(1, None, None);
+            packed.container.axles = axles(front_limit);
+            validate_nested(packed)
+                .issues
+                .into_iter()
+                .filter(|issue| issue.code == "axle_overloaded")
+                .map(|issue| issue.message)
+                .collect::<Vec<_>>()
+        };
+        // A one-kilogram tote centred between the axles puts half its weight on each.
+        assert_eq!(axle_issues(1), ["gross axle limit exceeded"]);
+        assert!(axle_issues(Weight::TICKS_PER_KG / 2).is_empty());
     }
 
     #[test]

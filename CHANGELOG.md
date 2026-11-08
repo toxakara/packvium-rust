@@ -4,6 +4,76 @@ What changed in `packvium` on crates.io, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0]
+
+Pallets may overhang their deck, mailers may have gussets, a hull turns 24 ways, every
+placement has an id, a request may name its currency, and three more objectives state a lower
+bound. Some public structs and enums grew, so a struct literal or an exhaustive `match` needs an
+edit (see Changed); `units` refuses keys it used to ignore.
+
+### Added
+
+- **`container.pallet_overhang_limit` is honoured**, where 1.9 refused it: a load may pass the
+  deck by the stated length at each end and width at each side. Positions are measured from
+  the corner of the overhang zone; only the deck bears weight, so a floor placement's
+  `support_ratio` is the share of its base on the deck; the packed pallet reports
+  `achieved_dimensions` and is billed and handed up at the larger of its declared footprint and
+  that size. Beside `access_directions`, `axles`, `made_to_measure`, `obstacles`, a non-zero
+  `void_fill_reserve_ratio` or an item's `stop_index` it is `unsupported_feature`. New types
+  `OverhangLimit` and `Deck`.
+- **Gusseted bags:** `deformable_boundary.kind: "gusseted_bag"` with `side_gusset_depth`
+  admits `b + c <= W + G`; `DeformableBoundary::GussetedBag { side_gusset_depth }`.
+- **24 rotations for a `convex_hull` item:** 18 signed codes such as `-L-W+H` after the six
+  legacy ones, accepted only on a hull (on a box, `invalid_value`). `Rotation::EVERY`,
+  `is_signed`, `is_upright`, `from_code` and `vocabulary`.
+- **`placement_id` on every placement**, the canonical JSON of
+  `[container id, x, y, z, item_type, orientation]` in ticks. `fixed_placements[]` and a
+  revision's locked or verified placement may quote it; `validate_json` reports
+  `placement_id_mismatch` and `duplicate_placement_id`.
+- **`currency`** on the request and on `rate_table`, three capital letters, echoed on the
+  result; a rate table without a request currency or in another one is `invalid_request`, and
+  `validate_json` reports `currency_mismatch`. It never enters the score.
+- **Lower bounds for `maximum_value`, `open_dimension_height` and `maximum_volume`**, so
+  `optimality.lower_bound` and the gap are stated under every objective but the two carrier
+  ones.
+- **`pack_nested_with(&request, level_beam_width)`** carries the `k` best chains from level to
+  level and lets the outermost level choose; a width of 1 is `pack_nested`.
+- **A made-to-measure box may keep a `void_fill_reserve_ratio`**; when the box cut tight
+  would break it, the box is cut from the envelope it was packed in.
+- **Revisions stock the boxes a plan already cut:** a locked or verified placement in a
+  made-to-measure box becomes a stock container `<type>@<revision>#<n>` at its cut size, and
+  `verify_revision_chain_json` reports `artifact_required` without the approved artifact.
+  New `revisions::stock_cut_boxes_json`.
+
+### Changed
+
+- **Source change for struct literals and exhaustive matches.** `PackingRequest`, `RateTable`
+  and `PackingResult` gained `currency: Option<String>`; `FixedPlacement` gained
+  `placement_id: Option<String>`; `Container` gained `pallet_overhang_limit` and `deck`;
+  `DeformableBoundary` gained `GussetedBag`; `Rotation` gained 18 variants. None is
+  `#[non_exhaustive]`: add the fields to a struct literal (or build a `Container` with
+  `..Container::new(...)`), and give a `match` over `Rotation` or `DeformableBoundary` a
+  wildcard arm. Callers of `pack_json` are unaffected.
+- **`units` refuses every key but `length`**: `invalid_request` / `not_allowed` at
+  `/units/<key>`. A request that sent `units.weight` must write the unit on each weight.
+- **Every container is numbered per type** on the grid lattice and the block loader too:
+  `pair#1`, `large#1` where 1.9 could say `pair#2` or `large#10`.
+- **A nested chain keeps a handed-up container upright**, so a nested answer can change where
+  laying a carton on its side was the only way it fitted.
+- **Artifact exports refuse an integer past `2^53 - 1`** with `number_out_of_range`, instead of
+  clamping a container index.
+
+### Fixed
+
+- **An explicit rotation list emptied by `keep_upright` is refused at `allowed_rotations`**,
+  with the same named request error the independent validator checks.
+- **Stocking cut boxes indexes artifact lookups once** and reports malformed consumed
+  machine fields as structured `invalid_revision` errors.
+- **Nested beams keep fixed placements across container offers and handoffs** instead of
+  aborting when a different carried branch cannot supply a locked item or container.
+- **The standalone crate test suite handles absent workspace-only nested scenes**; its
+  dedicated nested and fixed-lock regression tests still run.
+
 ## [1.9.0]
 
 No API change, but admission is stricter: some requests 1.8 accepted are now refused (see the
